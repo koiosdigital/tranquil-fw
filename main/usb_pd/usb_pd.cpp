@@ -1,54 +1,106 @@
 #include "usb_pd.h"
 
-#include "stusb4500.h"
 #include "esp_log.h"
-#include "esp_err.h"
 #include "esp_system.h"
-
-#include "math.h"
+#include <cmath>
 
 static const char* TAG = "usb_pd";
 
-STUSB4500 stusb;
-
-void stusb_init() {
-    esp_err_t ret = stusb.begin();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize STUSB4500: %s", esp_err_to_name(ret));
-        esp_restart(); // Restart if initialization fails
+UsbPdController::UsbPdController(const UsbPdConfig& config) {
+    last_error_ = stusb_.begin();
+    if (last_error_ != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize STUSB4500: %s", esp_err_to_name(last_error_));
+        return;
     }
 
-    // Check existing NVM PDOs against desired set (5V/3A, 15V/3A, 20V/5A)
-    const float desired_voltages[3] = { 5.0f, 15.0f, 20.0f };
-    const float desired_currents[3] = { 3.0f, 3.0f, 5.0f };
-    bool need_nvm_init = false;
+    last_error_ = configure_pdos(config);
+    if (last_error_ != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to configure PDOs: %s", esp_err_to_name(last_error_));
+        return;
+    }
 
-    // Read NVM to check current configuration
-    ret = stusb.readNVM();
-    if (ret == ESP_OK) {
-        for (int i = 1; i <= 3; ++i) {
-            float voltage = stusb.getVoltage(i);
-            float current = stusb.getCurrent(i);
-            if (fabs(voltage - desired_voltages[i - 1]) > 0.1f || fabs(current - desired_currents[i - 1]) > 0.1f) {
-                need_nvm_init = true;
+    initialized_ = true;
+    ESP_LOGI(TAG, "USB-PD controller initialized successfully");
+}
+
+UsbPdController::~UsbPdController() {
+    if (initialized_) {
+        stusb_.end();
+        initialized_ = false;
+    }
+}
+
+UsbPdController::UsbPdController(UsbPdController&& other) noexcept
+    : stusb_(std::move(other.stusb_))
+    , initialized_(other.initialized_)
+    , last_error_(other.last_error_) {
+    other.initialized_ = false;
+}
+
+UsbPdController& UsbPdController::operator=(UsbPdController&& other) noexcept {
+    if (this != &other) {
+        if (initialized_) {
+            stusb_.end();
+        }
+        stusb_ = std::move(other.stusb_);
+        initialized_ = other.initialized_;
+        last_error_ = other.last_error_;
+        other.initialized_ = false;
+    }
+    return *this;
+}
+
+esp_err_t UsbPdController::configure_pdos(const UsbPdConfig& config) {
+    // Read current NVM configuration
+    esp_err_t ret = stusb_.readNVM();
+    bool need_nvm_update = (ret != ESP_OK);
+
+    if (!need_nvm_update) {
+        // Check if current configuration matches desired
+        for (int i = 0; i < config.pdo_count; ++i) {
+            float voltage = stusb_.getVoltage(i + 1);
+            float current = stusb_.getCurrent(i + 1);
+
+            if (std::fabs(voltage - config.pdos[i].voltage) > 0.1f ||
+                std::fabs(current - config.pdos[i].current) > 0.1f) {
+                need_nvm_update = true;
                 break;
             }
         }
     }
-    else {
-        need_nvm_init = true;
+
+    if (need_nvm_update) {
+        ESP_LOGI(TAG, "Updating NVM with PDO configuration");
+
+        for (int i = 0; i < config.pdo_count; ++i) {
+            stusb_.setVoltage(i + 1, config.pdos[i].voltage);
+            stusb_.setCurrent(i + 1, config.pdos[i].current);
+        }
+
+        stusb_.setPdoNumber(config.pdo_count);
+        stusb_.setUsbCommCapable(config.usb_comm_capable);
+        stusb_.setExternalPower(config.external_power);
+        stusb_.writeNVM();
+
+        ESP_LOGI(TAG, "NVM updated: %d PDOs configured", config.pdo_count);
+    } else {
+        ESP_LOGI(TAG, "NVM configuration already matches desired settings");
     }
 
-    if (need_nvm_init) {
-        stusb.setVoltage(1, 5.0f);
-        stusb.setCurrent(1, 3.0f);
-        stusb.setVoltage(2, 15.0f);
-        stusb.setCurrent(2, 3.0f);
-        stusb.setVoltage(3, 20.0f);
-        stusb.setCurrent(3, 5.0f);
-        stusb.setPdoNumber(3);
-        stusb.setUsbCommCapable(true);
-        stusb.setExternalPower(true);
-        stusb.writeNVM();
+    return ESP_OK;
+}
+
+UsbPdController& UsbPdController::instance() {
+    static UsbPdController controller;
+    return controller;
+}
+
+// Legacy compatibility function
+void stusb_init() {
+    auto& controller = UsbPdController::instance();
+    if (!controller.is_initialized()) {
+        ESP_LOGE(TAG, "USB-PD initialization failed: %s",
+                 esp_err_to_name(controller.get_last_error()));
+        esp_restart();
     }
 }

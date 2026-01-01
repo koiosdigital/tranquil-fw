@@ -10,7 +10,6 @@
 #include "esp_log.h"
 
 #include "kd_common.h"
-#include "kd_ntp.h"
 #include "kd_pixdriver.h"
 
 #include "RobotMotionAPI.h"
@@ -33,8 +32,6 @@ extern "C" void app_main(void)
     //use protocomm security version 0
     kd_common_set_provisioning_pop_token_format(ProvisioningPOPTokenFormat_t::NONE);
     kd_common_init();
-
-    KdNTP::init();
 
     ManifestManager::initialize();
     PatternPlayer::initialize();
