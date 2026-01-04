@@ -1,0 +1,16 @@
+idf_component_register(
+    SRCS
+        "src/stepper_driver.cpp"
+        "src/homing_controller.cpp"
+        "src/motion_controller.cpp"
+    INCLUDE_DIRS
+        "include"
+    PRIV_INCLUDE_DIRS
+        "src"
+    REQUIRES
+        driver
+        esp_timer
+        freertos
+        esp_system
+        tmcstepper
+)

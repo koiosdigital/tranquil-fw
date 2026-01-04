@@ -12,15 +12,16 @@
 #include "kd_common.h"
 #include "kd_pixdriver.h"
 
-#include "RobotMotionAPI.h"
+#include "sand_table.h"
 #include "ManifestManager.h"
-#include "PatternPlayer.h"
-#include "PlaylistPlayer.h"
+#include "SandTablePlayer.h"
 
 #include "api.h"
 #include "usb_pd.h"
 
 static const char* TAG = "main";
+
+static sand_table::MotionController* g_motion_controller = nullptr;
 
 extern "C" void app_main(void)
 {
@@ -34,8 +35,21 @@ extern "C" void app_main(void)
     kd_common_init();
 
     ManifestManager::initialize();
-    PatternPlayer::initialize();
-    PlaylistPlayer::initialize();
+
+    // Initialize motion controller
+    g_motion_controller = new sand_table::MotionController();
+    auto init_result = g_motion_controller->init();
+    if (init_result.is_err()) {
+        ESP_LOGE(TAG, "Failed to initialize motion controller");
+    } else {
+        auto start_result = g_motion_controller->start();
+        if (start_result.is_err()) {
+            ESP_LOGE(TAG, "Failed to start motion controller");
+        }
+    }
+
+    // Initialize player with motion controller
+    SandTablePlayer::initialize(g_motion_controller);
 
     PixelDriver::initialize(60); // 60Hz update rate
 
@@ -51,8 +65,11 @@ extern "C" void app_main(void)
 
     api_init();
 
-    RobotMotionSystem::init();
-    RobotMotionSystem::homeAllAxes();
+    // Home the motion system
+    auto home_result = g_motion_controller->home();
+    if (home_result.is_err()) {
+        ESP_LOGE(TAG, "Homing failed");
+    }
 
     vTaskSuspend(NULL);
 }

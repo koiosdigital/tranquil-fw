@@ -52,14 +52,14 @@ UsbPdController& UsbPdController::operator=(UsbPdController&& other) noexcept {
 
 esp_err_t UsbPdController::configure_pdos(const UsbPdConfig& config) {
     // Read current NVM configuration
-    esp_err_t ret = stusb_.readNVM();
+    esp_err_t ret = stusb_.read_nvm();
     bool need_nvm_update = (ret != ESP_OK);
 
     if (!need_nvm_update) {
         // Check if current configuration matches desired
         for (int i = 0; i < config.pdo_count; ++i) {
-            float voltage = stusb_.getVoltage(i + 1);
-            float current = stusb_.getCurrent(i + 1);
+            float voltage = stusb_.get_voltage(i + 1);
+            float current = stusb_.get_current(i + 1);
 
             if (std::fabs(voltage - config.pdos[i].voltage) > 0.1f ||
                 std::fabs(current - config.pdos[i].current) > 0.1f) {
@@ -73,14 +73,14 @@ esp_err_t UsbPdController::configure_pdos(const UsbPdConfig& config) {
         ESP_LOGI(TAG, "Updating NVM with PDO configuration");
 
         for (int i = 0; i < config.pdo_count; ++i) {
-            stusb_.setVoltage(i + 1, config.pdos[i].voltage);
-            stusb_.setCurrent(i + 1, config.pdos[i].current);
+            stusb_.set_voltage(i + 1, config.pdos[i].voltage);
+            stusb_.set_current(i + 1, config.pdos[i].current);
         }
 
-        stusb_.setPdoNumber(config.pdo_count);
-        stusb_.setUsbCommCapable(config.usb_comm_capable);
-        stusb_.setExternalPower(config.external_power);
-        stusb_.writeNVM();
+        stusb_.set_pdo_number(config.pdo_count);
+        stusb_.set_usb_comm_capable(config.usb_comm_capable);
+        stusb_.set_external_power(config.external_power);
+        stusb_.write_nvm();
 
         ESP_LOGI(TAG, "NVM updated: %d PDOs configured", config.pdo_count);
     } else {

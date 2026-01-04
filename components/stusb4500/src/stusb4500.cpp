@@ -1,1388 +1,1047 @@
 #include "stusb4500.h"
 #include "sdkconfig.h"
 #include "esp_log.h"
-#include "esp_err.h"
 #include "soc/gpio_num.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include <string.h>
+
+#include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <vector>
 
-static const char* TAG = "STUSB4500";
+namespace {
+constexpr const char* TAG = "STUSB4500";
 
-// Default NVM values from SparkFun library (working configuration)
-const uint8_t STUSB4500::default_nvm_sectors[5][8] = {
+// CC Status register bit masks
+constexpr uint8_t kCcStatusCc1Mask = 0x03;
+constexpr uint8_t kCcStatusCc2Mask = 0x0C;
+constexpr uint8_t kCcStatusCc2Shift = 2;
+constexpr uint8_t kCcStatusConnectResult = 0x10;
+constexpr uint8_t kCcStatusLooking4Connection = 0x20;
+
+// PD TypeC Status register bit masks
+constexpr uint8_t kPdTypecHandshakeCheck = 0x80;
+constexpr uint8_t kPdTypecFsmStateMask = 0x1F;
+
+// PRT Status register bit masks
+constexpr uint8_t kPrtHwResetReceived = 0x01;
+constexpr uint8_t kPrtSoftResetReceived = 0x02;
+constexpr uint8_t kPrtDataRole = 0x04;
+constexpr uint8_t kPrtPowerRole = 0x08;
+constexpr uint8_t kPrtPdContract = 0x10;
+constexpr uint8_t kPrtStartupPower = 0x20;
+constexpr uint8_t kPrtMsgReceived = 0x40;
+constexpr uint8_t kPrtMsgSent = 0x80;
+
+// VSAFE0V threshold
+constexpr uint8_t kVsafe0vThreshold = 0x01;
+
+// I2C timeouts
+constexpr uint32_t kI2cTimeoutMs = 250;
+constexpr uint32_t kNvmDefaultTimeoutMs = 100;
+constexpr uint32_t kNvmWriteTimeoutMs = 500;
+} // namespace
+
+namespace stusb {
+
+// Default NVM values from SparkFun library
+const STUSB4500::NvmSectors STUSB4500::kDefaultNvmSectors = {{
     {0x00, 0x00, 0xB0, 0xAA, 0x00, 0x45, 0x00, 0x00},
     {0x10, 0x40, 0x9C, 0x1C, 0xFF, 0x01, 0x3C, 0xDF},
     {0x02, 0x40, 0x0F, 0x00, 0x32, 0x00, 0xFC, 0xF1},
     {0x00, 0x19, 0x56, 0xAF, 0xF5, 0x35, 0x5F, 0x00},
     {0x00, 0x4B, 0x90, 0x21, 0x43, 0x00, 0x40, 0xFB}
-};
+}};
 
-STUSB4500::STUSB4500()
-    : i2c_bus_handle(nullptr)
-    , device_handle(nullptr)
-    , device_address(0x28)
-    , is_initialized(false)
-    , nvm_sectors_read(false)
-{
-    memset(nvm_sectors, 0, sizeof(nvm_sectors));
-}
-
-STUSB4500::~STUSB4500()
-{
+STUSB4500::~STUSB4500() {
     end();
 }
 
-esp_err_t STUSB4500::begin(uint8_t device_address)
+STUSB4500::STUSB4500(STUSB4500&& other) noexcept
+    : i2c_bus_handle_(other.i2c_bus_handle_)
+    , device_handle_(other.device_handle_)
+    , device_address_(other.device_address_)
+    , is_initialized_(other.is_initialized_)
+    , nvm_sectors_read_(other.nvm_sectors_read_)
+    , nvm_sectors_(other.nvm_sectors_)
 {
-    if (is_initialized) {
-        ESP_LOGW(TAG, "STUSB4500 already initialized");
+    other.i2c_bus_handle_ = nullptr;
+    other.device_handle_ = nullptr;
+    other.is_initialized_ = false;
+    other.nvm_sectors_read_ = false;
+}
+
+STUSB4500& STUSB4500::operator=(STUSB4500&& other) noexcept {
+    if (this != &other) {
+        end();
+        i2c_bus_handle_ = other.i2c_bus_handle_;
+        device_handle_ = other.device_handle_;
+        device_address_ = other.device_address_;
+        is_initialized_ = other.is_initialized_;
+        nvm_sectors_read_ = other.nvm_sectors_read_;
+        nvm_sectors_ = other.nvm_sectors_;
+
+        other.i2c_bus_handle_ = nullptr;
+        other.device_handle_ = nullptr;
+        other.is_initialized_ = false;
+        other.nvm_sectors_read_ = false;
+    }
+    return *this;
+}
+
+esp_err_t STUSB4500::begin(uint8_t device_address) {
+    if (is_initialized_) {
+        ESP_LOGW(TAG, "Already initialized");
         return ESP_OK;
     }
 
-    this->device_address = device_address;
-    esp_err_t ret = ESP_OK;
+    device_address_ = device_address;
 
     // Configure I2C master bus
-    i2c_master_bus_config_t i2c_bus_config = {
+    const i2c_master_bus_config_t bus_config = {
         .i2c_port = CONFIG_STUSB4500_I2C_PORT,
-        .sda_io_num = (gpio_num_t)CONFIG_STUSB4500_SDA_PIN,
-        .scl_io_num = (gpio_num_t)CONFIG_STUSB4500_SCL_PIN,
+        .sda_io_num = static_cast<gpio_num_t>(CONFIG_STUSB4500_SDA_PIN),
+        .scl_io_num = static_cast<gpio_num_t>(CONFIG_STUSB4500_SCL_PIN),
         .clk_source = I2C_CLK_SRC_DEFAULT,
         .glitch_ignore_cnt = 7,
         .intr_priority = 0,
     };
 
-    ret = i2c_new_master_bus(&i2c_bus_config, &i2c_bus_handle);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to create I2C master bus: %s", esp_err_to_name(ret));
+    if (auto ret = i2c_new_master_bus(&bus_config, &i2c_bus_handle_); ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to create I2C bus: %s", esp_err_to_name(ret));
         return ret;
     }
 
-    // Configure STUSB4500 device
-    i2c_device_config_t device_cfg = {
+    // Configure device
+    const i2c_device_config_t device_config = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = this->device_address,
-        .scl_speed_hz = 100000, // 100kHz
+        .device_address = device_address_,
+        .scl_speed_hz = 100000,
     };
 
-    ret = i2c_master_bus_add_device(i2c_bus_handle, &device_cfg, &device_handle);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to add STUSB4500 device to I2C bus: %s", esp_err_to_name(ret));
-        i2c_del_master_bus(i2c_bus_handle);
-        i2c_bus_handle = nullptr;
+    if (auto ret = i2c_master_bus_add_device(i2c_bus_handle_, &device_config, &device_handle_); ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to add device: %s", esp_err_to_name(ret));
+        i2c_del_master_bus(i2c_bus_handle_);
+        i2c_bus_handle_ = nullptr;
         return ret;
     }
 
-    uint8_t device_id = 0;
-    ret = ESP_ERR_INVALID_RESPONSE;
-
-    for (int attempt = 0; attempt < 3; attempt++) {
-        ret = readDeviceId(&device_id);
-        if (ret == ESP_OK && device_id != 0) {
+    // Verify device ID with retries
+    std::optional<uint8_t> device_id;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        device_id = read_device_id();
+        if (device_id && *device_id != 0) {
             break;
         }
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 
-    if (ret != ESP_OK || device_id == 0) {
-        end();
-        return ret != ESP_OK ? ret : ESP_ERR_NOT_FOUND;
-    }
-
-    if (device_id != STUSB4500_EVAL_DEVICE_ID && device_id != STUSB4500_PROD_DEVICE_ID) {
-        ESP_LOGE(TAG, "Invalid device ID: 0x%02X (expected 0x%02X or 0x%02X)",
-            device_id, STUSB4500_EVAL_DEVICE_ID, STUSB4500_PROD_DEVICE_ID);
+    if (!device_id || *device_id == 0) {
         end();
         return ESP_ERR_NOT_FOUND;
     }
 
-    ret = clearAlertStatus();
-    is_initialized = true;
+    if (*device_id != device::kEvalDeviceId && *device_id != device::kProdDeviceId) {
+        ESP_LOGE(TAG, "Invalid device ID: 0x%02X", *device_id);
+        end();
+        return ESP_ERR_NOT_FOUND;
+    }
 
-    ESP_LOGI(TAG, "initialized successfully (Device ID: 0x%02X)", device_id);
+    clear_alert_status();
+    is_initialized_ = true;
+    ESP_LOGI(TAG, "Initialized (Device ID: 0x%02X)", *device_id);
 
-    if (!nvm_sectors_read) {
-        ret = readNVM();
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to read NVM on initialization: %s", esp_err_to_name(ret));
-        }
+    // Load NVM on initialization
+    if (auto ret = read_nvm(); ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to read NVM: %s", esp_err_to_name(ret));
     }
 
     return ESP_OK;
 }
 
-esp_err_t STUSB4500::end()
-{
-    if (!is_initialized) {
+esp_err_t STUSB4500::end() noexcept {
+    if (!is_initialized_) {
         return ESP_OK;
     }
 
-    if (device_handle != nullptr) {
-        i2c_master_bus_rm_device(device_handle);
-        device_handle = nullptr;
+    if (device_handle_) {
+        i2c_master_bus_rm_device(device_handle_);
+        device_handle_ = nullptr;
     }
 
-    if (i2c_bus_handle != nullptr) {
-        i2c_del_master_bus(i2c_bus_handle);
-        i2c_bus_handle = nullptr;
+    if (i2c_bus_handle_) {
+        i2c_del_master_bus(i2c_bus_handle_);
+        i2c_bus_handle_ = nullptr;
     }
 
-    is_initialized = false;
-    nvm_sectors_read = false;
+    is_initialized_ = false;
+    nvm_sectors_read_ = false;
     return ESP_OK;
 }
 
-esp_err_t STUSB4500::readDeviceId(uint8_t* device_id)
-{
-    if (device_id == nullptr) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    return i2cReadRegister(STUSB4500_REG_DEVICE_ID, device_id);
+std::optional<uint8_t> STUSB4500::read_device_id() {
+    return i2c_read_register(reg::kDeviceId);
 }
 
-esp_err_t STUSB4500::readNVM()
-{
-    if (!is_initialized) {
+esp_err_t STUSB4500::read_nvm() {
+    if (!is_initialized_) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    esp_err_t ret = nvmEnterReadMode();
-    if (ret != ESP_OK) {
+    if (auto ret = nvm_enter_read_mode(); ret != ESP_OK) {
         return ret;
     }
 
-    // Read all 5 sectors (same as SparkFun library)
-    for (uint8_t i = 0; i < 5; i++) {
-        ret = nvmReadSector(i, nvm_sectors[i]);
-        if (ret != ESP_OK) {
-            nvmExitTestMode();
+    for (uint8_t i = 0; i < nvm::kSectorCount; ++i) {
+        if (auto ret = nvm_read_sector(i, nvm_sectors_[i].data()); ret != ESP_OK) {
+            nvm_exit_test_mode();
             return ret;
         }
     }
 
-    ret = nvmExitTestMode();
-    if (ret != ESP_OK) {
+    if (auto ret = nvm_exit_test_mode(); ret != ESP_OK) {
         return ret;
     }
 
-    nvm_sectors_read = true;
-
-    loadPdoSettingsFromNVM();
-
+    nvm_sectors_read_ = true;
+    load_pdo_settings_from_nvm();
     return ESP_OK;
 }
 
-esp_err_t STUSB4500::writeNVM(bool use_defaults)
-{
-    if (!is_initialized) {
+esp_err_t STUSB4500::write_nvm(bool use_defaults) {
+    if (!is_initialized_) {
         return ESP_ERR_INVALID_STATE;
     }
-
-    esp_err_t ret;
 
     if (use_defaults) {
-        // Copy default values to our buffer
-        memcpy(nvm_sectors, default_nvm_sectors, sizeof(nvm_sectors));
-    }
-    else if (!nvm_sectors_read) {
-        // Must read NVM first if we don't have current values
-        ret = readNVM();
-        if (ret != ESP_OK) {
+        nvm_sectors_ = kDefaultNvmSectors;
+    } else if (!nvm_sectors_read_) {
+        if (auto ret = read_nvm(); ret != ESP_OK) {
             return ret;
         }
     }
 
-    // Save current PDO settings to NVM buffer
     if (!use_defaults) {
-        savePdoSettingsToNVM();
+        save_pdo_settings_to_nvm();
     }
 
-    // Enter write mode for all sectors
-    ret = nvmEnterWriteMode(STUSB4500_NVM_SECTOR_0 | STUSB4500_NVM_SECTOR_1 |
-        STUSB4500_NVM_SECTOR_2 | STUSB4500_NVM_SECTOR_3 |
-        STUSB4500_NVM_SECTOR_4);
-    if (ret != ESP_OK) {
+    if (auto ret = nvm_enter_write_mode(nvm::kAllSectors); ret != ESP_OK) {
         return ret;
     }
 
-    // Write all 5 sectors
-    for (uint8_t i = 0; i < 5; i++) {
-        ret = nvmWriteSector(i, nvm_sectors[i]);
-        if (ret != ESP_OK) {
-            nvmExitTestMode();
+    for (uint8_t i = 0; i < nvm::kSectorCount; ++i) {
+        if (auto ret = nvm_write_sector(i, nvm_sectors_[i].data()); ret != ESP_OK) {
+            nvm_exit_test_mode();
             return ret;
         }
     }
 
-    ret = nvmExitTestMode();
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
-    return ESP_OK;
+    return nvm_exit_test_mode();
 }
 
-// PDO Configuration Functions
-esp_err_t STUSB4500::getPdoNumber(uint8_t* pdo_count)
-{
-    if (!is_initialized || pdo_count == nullptr) {
-        return ESP_ERR_INVALID_ARG;
+std::optional<uint8_t> STUSB4500::get_pdo_number() {
+    if (!is_initialized_) {
+        return std::nullopt;
     }
 
-    esp_err_t ret = i2cReadRegister(STUSB4500_REG_DPM_PDO_NUMB, pdo_count);
-    if (ret == ESP_OK) {
-        *pdo_count = *pdo_count & 0x07; // Mask to get only the PDO count bits
+    auto pdo_count = i2c_read_register(reg::kDpmPdoNumb);
+    if (pdo_count) {
+        return static_cast<uint8_t>(*pdo_count & 0x07);
     }
-    return ret;
+    return std::nullopt;
 }
 
-esp_err_t STUSB4500::setPdoNumber(uint8_t pdo_count)
-{
-    if (!is_initialized) {
+esp_err_t STUSB4500::set_pdo_number(uint8_t pdo_count) {
+    if (!is_initialized_) {
         return ESP_ERR_INVALID_STATE;
     }
-
-    if (pdo_count > 3) {
-        pdo_count = 3;
-    }
-
-    return i2cWriteRegister(STUSB4500_REG_DPM_PDO_NUMB, pdo_count);
+    return i2c_write_register(reg::kDpmPdoNumb, std::min(pdo_count, static_cast<uint8_t>(3)));
 }
 
-float STUSB4500::getVoltage(uint8_t pdo_num)
-{
-    if (!is_initialized || pdo_num < 1 || pdo_num > 3) {
+float STUSB4500::get_voltage(uint8_t pdo_num) {
+    if (!is_initialized_ || pdo_num < 1 || pdo_num > kMaxPdos) {
         return 0.0f;
     }
 
-    uint32_t pdo_data = readPdoFromRegisters(pdo_num);
+    uint32_t pdo_data = read_pdo_from_registers(pdo_num);
     uint32_t voltage_raw = (pdo_data >> 10) & 0x3FF;
-    return voltage_raw / 20.0f; // 50mV resolution
+    return voltage_raw / 20.0f;  // 50mV resolution
 }
 
-esp_err_t STUSB4500::setVoltage(uint8_t pdo_num, float voltage)
-{
-    if (!is_initialized || pdo_num < 1 || pdo_num > 3) {
+esp_err_t STUSB4500::set_voltage(uint8_t pdo_num, float voltage) {
+    if (!is_initialized_ || pdo_num < 1 || pdo_num > kMaxPdos) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    // Constrain voltage to 5-20V
-    if (voltage < 5.0f) voltage = 5.0f;
-    else if (voltage > 20.0f) voltage = 20.0f;
+    voltage = std::clamp(voltage, 5.0f, 20.0f);
+    if (pdo_num == 1) {
+        voltage = 5.0f;  // PDO1 is fixed at 5V
+    }
 
-    // PDO1 is fixed at 5V
-    if (pdo_num == 1) voltage = 5.0f;
+    uint32_t voltage_raw = static_cast<uint32_t>(voltage * 20);
+    uint32_t pdo_data = read_pdo_from_registers(pdo_num);
 
-    uint32_t voltage_raw = (uint32_t)(voltage * 20); // Convert to 50mV units
-    uint32_t pdo_data = readPdoFromRegisters(pdo_num);
-
-    // Clear voltage bits (10:19) and set new voltage
-    pdo_data &= ~(0x3FF << 10);
+    pdo_data &= ~(0x3FFU << 10);
     pdo_data |= (voltage_raw << 10);
 
-    return writePdoToRegisters(pdo_num, pdo_data);
+    return write_pdo_to_registers(pdo_num, pdo_data);
 }
 
-float STUSB4500::getCurrent(uint8_t pdo_num)
-{
-    if (!is_initialized || pdo_num < 1 || pdo_num > 3) {
+float STUSB4500::get_current(uint8_t pdo_num) {
+    if (!is_initialized_ || pdo_num < 1 || pdo_num > kMaxPdos) {
         return 0.0f;
     }
 
-    uint32_t pdo_data = readPdoFromRegisters(pdo_num);
+    uint32_t pdo_data = read_pdo_from_registers(pdo_num);
     uint32_t current_raw = pdo_data & 0x3FF;
-    return current_raw * 0.01f; // 10mA resolution
+    return current_raw * 0.01f;  // 10mA resolution
 }
 
-esp_err_t STUSB4500::setCurrent(uint8_t pdo_num, float current)
-{
-    if (!is_initialized || pdo_num < 1 || pdo_num > 3) {
+esp_err_t STUSB4500::set_current(uint8_t pdo_num, float current) {
+    if (!is_initialized_ || pdo_num < 1 || pdo_num > kMaxPdos) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (current > 5.0f) current = 5.0f; // Max 5A
+    current = std::clamp(current, 0.0f, 5.0f);
+    uint32_t current_raw = static_cast<uint32_t>(current / 0.01f) & 0x3FF;
 
-    uint32_t current_raw = (uint32_t)(current / 0.01f); // Convert to 10mA units
-    current_raw &= 0x3FF; // Limit to 10 bits
+    uint32_t pdo_data = read_pdo_from_registers(pdo_num);
+    pdo_data = (pdo_data & ~0x3FFU) | current_raw;
 
-    uint32_t pdo_data = readPdoFromRegisters(pdo_num);
-
-    // Clear current bits (0:9) and set new current
-    pdo_data &= ~0x3FF;
-    pdo_data |= current_raw;
-
-    return writePdoToRegisters(pdo_num, pdo_data);
+    return write_pdo_to_registers(pdo_num, pdo_data);
 }
 
-// Status and Monitoring Functions
-esp_err_t STUSB4500::readNegotiationStatus(stusb4500_negotiation_status_t* status)
-{
-    if (!is_initialized || status == nullptr) {
-        return ESP_ERR_INVALID_ARG;
+std::optional<NegotiationStatus> STUSB4500::read_negotiation_status() {
+    if (!is_initialized_) {
+        return std::nullopt;
     }
 
-    esp_err_t ret;
-    memset(status, 0, sizeof(*status));
+    NegotiationStatus status{};
 
-    // Read device ID
-    ret = readDeviceId(&status->device_id);
-    if (ret != ESP_OK) return ret;
+    auto device_id = read_device_id();
+    if (!device_id) return std::nullopt;
+    status.device_id = *device_id;
 
-    // Read CC status
-    ret = readCcStatus(&status->cc_status);
-    if (ret != ESP_OK) return ret;
+    auto cc_status = read_cc_status();
+    if (!cc_status) return std::nullopt;
+    status.cc_status = *cc_status;
 
-    // Read PD/Type-C status
-    ret = readPdTypecStatus(&status->pd_typec_status);
-    if (ret != ESP_OK) return ret;
+    auto pd_typec_status = read_pd_typec_status();
+    if (!pd_typec_status) return std::nullopt;
+    status.pd_typec_status = *pd_typec_status;
 
-    // Read PRT status
-    ret = readPrtStatus(&status->prt_status);
-    if (ret != ESP_OK) return ret;
+    auto prt_status = read_prt_status();
+    if (!prt_status) return std::nullopt;
+    status.prt_status = *prt_status;
 
-    // Read PE FSM state
-    ret = i2cReadRegister(STUSB4500_REG_PE_FSM, &status->pe_fsm_state);
-    if (ret != ESP_OK) return ret;
+    auto pe_fsm = i2c_read_register(reg::kPeFsm);
+    if (!pe_fsm) return std::nullopt;
+    status.pe_fsm_state = *pe_fsm;
 
-    // Determine connection status
-    status->is_connected = status->cc_status.connection_result &&
-        (status->cc_status.cc1_connected || status->cc_status.cc2_connected);
+    status.is_connected = status.cc_status.is_connected();
+    status.pd_negotiation_complete = status.prt_status.pd_contract_active;
 
-    // Determine if PD negotiation is complete
-    status->pd_negotiation_complete = status->prt_status.pd_contract_active;
-
-    return ESP_OK;
+    return status;
 }
 
-esp_err_t STUSB4500::readCcStatus(stusb4500_cc_status_t* status)
-{
-    if (!is_initialized || status == nullptr) {
-        return ESP_ERR_INVALID_ARG;
+std::optional<CcStatus> STUSB4500::read_cc_status() {
+    if (!is_initialized_) {
+        return std::nullopt;
     }
 
-    uint8_t cc_status_reg;
-    esp_err_t ret = i2cReadRegister(STUSB4500_REG_CC_STATUS, &cc_status_reg);
-    if (ret != ESP_OK) return ret;
-
-    memset(status, 0, sizeof(*status));
-
-    // Parse CC1 and CC2 states
-    status->cc1_state = (stusb4500_cc_state_t)(cc_status_reg & STUSB4500_CC_STATUS_CC1_STATE_MASK);
-    status->cc2_state = (stusb4500_cc_state_t)((cc_status_reg & STUSB4500_CC_STATUS_CC2_STATE_MASK) >> STUSB4500_CC_STATUS_CC2_STATE_SHIFT);
-
-    // Determine if CC lines are connected
-    status->cc1_connected = (status->cc1_state != STUSB4500_CC_STATE_NOT_IN_UFP);
-    status->cc2_connected = (status->cc2_state != STUSB4500_CC_STATE_NOT_IN_UFP);
-
-    // Parse other status bits
-    status->connection_result = (cc_status_reg & STUSB4500_CC_STATUS_CONNECT_RESULT) != 0;
-    status->looking_for_connection = (cc_status_reg & STUSB4500_CC_STATUS_LOOKING4CONNECTION) != 0;
-
-    return ESP_OK;
-}
-
-esp_err_t STUSB4500::readPdTypecStatus(stusb4500_pd_typec_status_t* status)
-{
-    if (!is_initialized || status == nullptr) {
-        return ESP_ERR_INVALID_ARG;
+    auto reg_value = i2c_read_register(reg::kCcStatus);
+    if (!reg_value) {
+        return std::nullopt;
     }
 
-    uint8_t pd_typec_status_reg;
-    esp_err_t ret = i2cReadRegister(STUSB4500_REG_PD_TYPEC_STATUS, &pd_typec_status_reg);
-    if (ret != ESP_OK) return ret;
+    CcStatus status{};
+    status.cc1_state = static_cast<CcState>(*reg_value & kCcStatusCc1Mask);
+    status.cc2_state = static_cast<CcState>((*reg_value & kCcStatusCc2Mask) >> kCcStatusCc2Shift);
+    status.cc1_connected = status.cc1_state != CcState::NotInUfp;
+    status.cc2_connected = status.cc2_state != CcState::NotInUfp;
+    status.connection_result = (*reg_value & kCcStatusConnectResult) != 0;
+    status.looking_for_connection = (*reg_value & kCcStatusLooking4Connection) != 0;
 
-    memset(status, 0, sizeof(*status));
-
-    status->pd_typec_handshake_check = (pd_typec_status_reg & STUSB4500_PD_TYPEC_STATUS_PD_TYPEC_HAND_CHECK) != 0;
-    status->fsm_state = (stusb4500_typec_fsm_state_t)(pd_typec_status_reg & STUSB4500_PD_TYPEC_STATUS_TYPEC_FSM_STATE_MASK);
-
-    return ESP_OK;
+    return status;
 }
 
-esp_err_t STUSB4500::readPrtStatus(stusb4500_prt_status_t* status)
-{
-    if (!is_initialized || status == nullptr) {
-        return ESP_ERR_INVALID_ARG;
+std::optional<PdTypecStatus> STUSB4500::read_pd_typec_status() {
+    if (!is_initialized_) {
+        return std::nullopt;
     }
 
-    uint8_t prt_status_reg;
-    esp_err_t ret = i2cReadRegister(STUSB4500_REG_PRT_STATUS, &prt_status_reg);
-    if (ret != ESP_OK) return ret;
+    auto reg_value = i2c_read_register(reg::kPdTypecStatus);
+    if (!reg_value) {
+        return std::nullopt;
+    }
 
-    memset(status, 0, sizeof(*status));
+    PdTypecStatus status{};
+    status.pd_typec_handshake_check = (*reg_value & kPdTypecHandshakeCheck) != 0;
+    status.fsm_state = static_cast<TypecFsmState>(*reg_value & kPdTypecFsmStateMask);
 
-    status->hw_reset_received = (prt_status_reg & STUSB4500_PRT_STATUS_HWRESET_RECEIVED) != 0;
-    status->soft_reset_received = (prt_status_reg & STUSB4500_PRT_STATUS_SOFTRESET_RECEIVED) != 0;
-    status->data_role_sink = (prt_status_reg & STUSB4500_PRT_STATUS_DATAROLE) != 0;
-    status->power_role_sink = (prt_status_reg & STUSB4500_PRT_STATUS_POWERROLE) != 0;
-    status->pd_contract_active = (prt_status_reg & STUSB4500_PRT_STATUS_PD_CONTRACT) != 0;
-    status->startup_power = (prt_status_reg & STUSB4500_PRT_STATUS_STARTUP_POWER) != 0;
-    status->message_received = (prt_status_reg & STUSB4500_PRT_STATUS_MSG_RECEIVED) != 0;
-    status->message_sent = (prt_status_reg & STUSB4500_PRT_STATUS_MSG_SENT) != 0;
-
-    return ESP_OK;
+    return status;
 }
 
-esp_err_t STUSB4500::clearAlertStatus()
-{
-    if (!is_initialized) {
+std::optional<PrtStatus> STUSB4500::read_prt_status() {
+    if (!is_initialized_) {
+        return std::nullopt;
+    }
+
+    auto reg_value = i2c_read_register(reg::kPrtStatus);
+    if (!reg_value) {
+        return std::nullopt;
+    }
+
+    PrtStatus status{};
+    status.hw_reset_received = (*reg_value & kPrtHwResetReceived) != 0;
+    status.soft_reset_received = (*reg_value & kPrtSoftResetReceived) != 0;
+    status.data_role_sink = (*reg_value & kPrtDataRole) != 0;
+    status.power_role_sink = (*reg_value & kPrtPowerRole) != 0;
+    status.pd_contract_active = (*reg_value & kPrtPdContract) != 0;
+    status.startup_power = (*reg_value & kPrtStartupPower) != 0;
+    status.message_received = (*reg_value & kPrtMsgReceived) != 0;
+    status.message_sent = (*reg_value & kPrtMsgSent) != 0;
+
+    return status;
+}
+
+esp_err_t STUSB4500::clear_alert_status() {
+    if (!is_initialized_) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    // Read alert status to clear it
-    uint8_t alert_status;
-    return i2cReadRegister(STUSB4500_REG_ALERT_STATUS_1, &alert_status);
-}
-
-// Power Measurement Functions
-esp_err_t STUSB4500::readPowerStatus(stusb4500_power_status_t* status)
-{
-    if (!is_initialized || status == nullptr) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    esp_err_t ret;
-    memset(status, 0, sizeof(*status));
-
-    // Read actual measured voltage
-    ret = readVoltage(&status->voltage_mv);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to read voltage: %s", esp_err_to_name(ret));
-        status->voltage_mv = 0;
-    }
-
-    // Read actual negotiated current
-    ret = readCurrent(&status->current_ma);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to read current: %s", esp_err_to_name(ret));
-        status->current_ma = 0;
-    }
-
-    // Calculate power from actual measurements
-    if (status->voltage_mv > 0 && status->current_ma > 0) {
-        status->power_mw = (uint32_t)status->voltage_mv * status->current_ma / 1000;
-    }
-    else {
-        status->power_mw = 0;
-    }
-
-    // Read VSAFE0V status
-    uint8_t vsafe0v_reg;
-    ret = i2cReadRegister(STUSB4500_REG_VBUS_VSAFE0V, &vsafe0v_reg);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to read VSAFE0V status: %s", esp_err_to_name(ret));
-        status->vsafe0v = false;
-    }
-    else {
-        status->vsafe0v = (vsafe0v_reg & STUSB4500_VBUS_VSAFE0V_THRESHOLD) != 0;
-    }
-
+    auto _ = i2c_read_register(reg::kAlertStatus1);
     return ESP_OK;
 }
 
-esp_err_t STUSB4500::readVoltage(uint16_t* voltage_mv)
-{
-    if (!is_initialized || voltage_mv == nullptr) {
-        return ESP_ERR_INVALID_ARG;
+std::optional<PowerStatus> STUSB4500::read_power_status() {
+    if (!is_initialized_) {
+        return std::nullopt;
+    }
+
+    PowerStatus status{};
+
+    if (auto voltage = read_voltage()) {
+        status.voltage_mv = *voltage;
+    }
+
+    if (auto current = read_current()) {
+        status.current_ma = *current;
+    }
+
+    if (status.voltage_mv > 0 && status.current_ma > 0) {
+        status.power_mw = static_cast<uint32_t>(status.voltage_mv) * status.current_ma / 1000;
+    }
+
+    if (auto vsafe0v = i2c_read_register(reg::kVbusVsafe0v)) {
+        status.vsafe0v = (*vsafe0v & kVsafe0vThreshold) != 0;
+    }
+
+    return status;
+}
+
+std::optional<uint16_t> STUSB4500::read_voltage() {
+    if (!is_initialized_) {
+        return std::nullopt;
     }
 
     uint8_t voltage_regs[2];
-    esp_err_t ret = i2cRead(STUSB4500_REG_VBUS_VOLTAGE_LOW, voltage_regs, 2);
-    if (ret != ESP_OK) return ret;
+    if (i2c_read(reg::kVbusVoltageLow, voltage_regs, 2) != ESP_OK) {
+        return std::nullopt;
+    }
 
-    // Combine low and high bytes 
     uint16_t voltage_raw = voltage_regs[0] | (voltage_regs[1] << 8);
-
-    // Convert to millivolts using the STUSB4500 scaling factor
-    // VBUS voltage scale is 25mV per LSB (from STUSB4500 datasheet)
-    *voltage_mv = voltage_raw * STUSB4500_VBUS_LSB_MV;
-    return ESP_OK;
+    return voltage_raw * device::kVbusLsbMv;
 }
 
-esp_err_t STUSB4500::readCurrent(uint16_t* current_ma)
-{
-    if (!is_initialized || current_ma == nullptr) {
-        return ESP_ERR_INVALID_ARG;
+std::optional<uint16_t> STUSB4500::read_current() {
+    if (!is_initialized_) {
+        return std::nullopt;
     }
 
-    // First, try to determine current based on measured voltage
-    // If we're seeing high voltage (>5.5V), we likely have a PD contract even if the flag is wrong
-    uint16_t voltage_mv = 0;
-    bool high_voltage_detected = false;
+    // Check for high voltage (indicates PD contract)
+    auto voltage = read_voltage();
+    bool high_voltage_detected = voltage && *voltage > 5500;
 
-    if (readVoltage(&voltage_mv) == ESP_OK && voltage_mv > 5500) {
-        high_voltage_detected = true;
-        ESP_LOGI(TAG, "High voltage detected (%d mV), assuming PD contract exists", voltage_mv);
-    }
-
-    // Check if PD contract is active according to registers
-    stusb4500_prt_status_t prt_status;
-    esp_err_t ret = readPrtStatus(&prt_status);
-    bool pd_contract_active = (ret == ESP_OK && prt_status.pd_contract_active) || high_voltage_detected;
+    // Check PD contract status
+    auto prt_status = read_prt_status();
+    bool pd_contract_active = (prt_status && prt_status->pd_contract_active) || high_voltage_detected;
 
     if (!pd_contract_active) {
-        // No PD contract and no high voltage, assume standard USB current
-        *current_ma = 500; // Standard USB 2.0 current
-        ESP_LOGD(TAG, "No PD contract active and no high voltage, using default USB current: %d mA", *current_ma);
-        return ESP_OK;
+        return 500;  // Standard USB 2.0 current
     }
 
-    // Try to read which PDO is currently negotiated
-    uint8_t active_pdo_reg;
-    ret = i2cReadRegister(STUSB4500_REG_PE_PDO, &active_pdo_reg);
-    if (ret != ESP_OK) {
-        uint8_t pdo_count;
-        ret = getPdoNumber(&pdo_count);
-        if (ret == ESP_OK && pdo_count > 0) {
-            uint32_t pdo_data = readPdoFromRegisters(pdo_count);
+    // Get active PDO number
+    auto active_pdo = i2c_read_register(reg::kPePdo);
+    if (!active_pdo) {
+        // Fallback: try highest configured PDO
+        auto pdo_count = get_pdo_number();
+        if (pdo_count && *pdo_count > 0) {
+            uint32_t pdo_data = read_pdo_from_registers(*pdo_count);
             if (pdo_data != 0) {
-                uint32_t current_raw = pdo_data & 0x3FF;
-                *current_ma = current_raw * 10;
-                return ESP_OK;
+                return static_cast<uint16_t>((pdo_data & 0x3FF) * 10);
             }
         }
-
-        ESP_LOGW(TAG, "Could not determine negotiated current, using 3A estimate");
-        *current_ma = 3000;
-        return ESP_OK;
+        return 3000;  // Default estimate
     }
 
-    // The active PDO number is in the lower 3 bits
-    uint8_t active_pdo_num = active_pdo_reg & 0x07;
-    if (active_pdo_num == 0 || active_pdo_num > 3) {
-        ESP_LOGW(TAG, "Invalid active PDO number: %d, using estimate", active_pdo_num);
-        *current_ma = 3000;
-        return ESP_OK;
+    uint8_t active_pdo_num = *active_pdo & 0x07;
+    if (active_pdo_num == 0 || active_pdo_num > kMaxPdos) {
+        return 3000;
     }
 
-    // Read the current from the active PDO registers
-    uint32_t pdo_data = readPdoFromRegisters(active_pdo_num);
+    uint32_t pdo_data = read_pdo_from_registers(active_pdo_num);
     if (pdo_data == 0) {
-        ESP_LOGW(TAG, "Failed to read PDO data for PDO %d", active_pdo_num);
-        *current_ma = 3000;
-        return ESP_OK;
+        return 3000;
     }
 
-    // Extract current from PDO (bits 0-9, in 10mA units)
-    uint32_t current_raw = pdo_data & 0x3FF;
-    *current_ma = current_raw * 10; // Convert from 10mA units to mA
-    return ESP_OK;
+    return static_cast<uint16_t>((pdo_data & 0x3FF) * 10);
 }
 
-esp_err_t STUSB4500::readPower(uint32_t* power_mw) {
-    if (!is_initialized || power_mw == nullptr) {
-        return ESP_ERR_INVALID_ARG;
+std::optional<uint32_t> STUSB4500::read_power() {
+    auto voltage = read_voltage();
+    auto current = read_current();
+
+    if (!voltage || !current) {
+        return std::nullopt;
     }
 
-    uint16_t voltage_mv, current_ma;
-    esp_err_t ret;
-
-    // Read actual measured voltage
-    ret = readVoltage(&voltage_mv);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to read voltage for power calculation");
-        return ret;
-    }
-
-    // Read actual negotiated current
-    ret = readCurrent(&current_ma);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to read current for power calculation");
-        return ret;
-    }
-
-    // Calculate power in milliwatts
-    *power_mw = (uint32_t)voltage_mv * current_ma / 1000;
-
-    return ESP_OK;
+    return static_cast<uint32_t>(*voltage) * *current / 1000;
 }
 
-// Active PDO Functions
-esp_err_t STUSB4500::readActivePdo(uint8_t pdo_num, stusb4500_pdo_t* pdo)
-{
-    if (!is_initialized || pdo == nullptr || pdo_num < 1 || pdo_num > 3) {
-        return ESP_ERR_INVALID_ARG;
+std::optional<Pdo> STUSB4500::read_active_pdo(uint8_t pdo_num) {
+    if (!is_initialized_ || pdo_num < 1 || pdo_num > kMaxPdos) {
+        return std::nullopt;
     }
 
-    uint32_t raw_pdo = readPdoFromRegisters(pdo_num);
-    return rawToPdoStruct(raw_pdo, pdo);
+    uint32_t raw_pdo = read_pdo_from_registers(pdo_num);
+    return raw_to_pdo(raw_pdo);
 }
 
-esp_err_t STUSB4500::readAllActivePdos(stusb4500_pdo_t pdos[3])
-{
-    if (pdos == nullptr) {
-        return ESP_ERR_INVALID_ARG;
+std::optional<std::array<Pdo, STUSB4500::kMaxPdos>> STUSB4500::read_all_active_pdos() {
+    std::array<Pdo, kMaxPdos> pdos{};
+
+    for (size_t i = 0; i < kMaxPdos; ++i) {
+        auto pdo = read_active_pdo(i + 1);
+        if (!pdo) {
+            return std::nullopt;
+        }
+        pdos[i] = *pdo;
     }
 
-    esp_err_t ret;
-    for (int i = 0; i < 3; i++) {
-        ret = readActivePdo(i + 1, &pdos[i]);
-        if (ret != ESP_OK) return ret;
-    }
-
-    return ESP_OK;
+    return pdos;
 }
 
-esp_err_t STUSB4500::getActivePdoCount(uint8_t* count)
-{
-    return getPdoNumber(count);
+std::optional<uint8_t> STUSB4500::get_active_pdo_count() {
+    return get_pdo_number();
 }
 
-esp_err_t STUSB4500::getNegotiatedPdoNumber(uint8_t* pdo_num)
-{
-    if (!is_initialized || pdo_num == nullptr) {
-        return ESP_ERR_INVALID_ARG;
+std::optional<uint8_t> STUSB4500::get_negotiated_pdo_number() {
+    if (!is_initialized_) {
+        return std::nullopt;
     }
 
-    // Check if PD contract is active first
-    stusb4500_prt_status_t prt_status;
-    esp_err_t ret = readPrtStatus(&prt_status);
-    if (ret != ESP_OK) return ret;
-
-    if (!prt_status.pd_contract_active) {
-        ESP_LOGD(TAG, "No PD contract active, no negotiated PDO");
-        *pdo_num = 0;
-        return ESP_OK;
+    auto prt_status = read_prt_status();
+    if (!prt_status || !prt_status->pd_contract_active) {
+        return 0;
     }
 
-    // Read which PDO is currently negotiated
-    uint8_t active_pdo_reg;
-    ret = i2cReadRegister(STUSB4500_REG_PE_PDO, &active_pdo_reg);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to read negotiated PDO register: %s", esp_err_to_name(ret));
-        return ret;
+    auto active_pdo = i2c_read_register(reg::kPePdo);
+    if (!active_pdo) {
+        return std::nullopt;
     }
 
-    // The active PDO number is in the lower 3 bits
-    *pdo_num = active_pdo_reg & 0x07;
-
-    return ESP_OK;
+    return static_cast<uint8_t>(*active_pdo & 0x07);
 }
 
-// Control Functions
-esp_err_t STUSB4500::softReset()
-{
-    if (!is_initialized) {
+esp_err_t STUSB4500::soft_reset() {
+    if (!is_initialized_) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    // Send soft reset command (based on SparkFun implementation)
-    esp_err_t ret = i2cWriteRegister(STUSB4500_REG_TX_HEADER_LOW, 0x0D);
-    if (ret != ESP_OK) return ret;
+    if (auto ret = i2c_write_register(reg::kTxHeaderLow, 0x0D); ret != ESP_OK) {
+        return ret;
+    }
 
-    ret = i2cWriteRegister(STUSB4500_REG_PD_COMMAND_CTRL, 0x26);
-    if (ret != ESP_OK) return ret;
+    if (auto ret = i2c_write_register(reg::kPdCommandCtrl, 0x26); ret != ESP_OK) {
+        return ret;
+    }
 
-    vTaskDelay(pdMS_TO_TICKS(100)); // Wait for reset
+    vTaskDelay(pdMS_TO_TICKS(100));
     return ESP_OK;
 }
 
-// Private Implementation Methods
-
-esp_err_t STUSB4500::i2cRead(uint8_t reg_addr, uint8_t* data, size_t len)
-{
-    if (device_handle == nullptr || data == nullptr || len == 0) {
-        ESP_LOGE(TAG, "I2C read failed: invalid parameters");
+// I2C Implementation
+esp_err_t STUSB4500::i2c_read(uint8_t reg_addr, uint8_t* data, size_t len) {
+    if (!device_handle_ || !data || len == 0) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    esp_err_t ret = i2c_master_transmit_receive(device_handle,
-        &reg_addr, 1,
-        data, len,
-        250);
-
+    auto ret = i2c_master_transmit_receive(device_handle_, &reg_addr, 1, data, len, kI2cTimeoutMs);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "I2C read failed: reg=0x%02X, error=%s", reg_addr, esp_err_to_name(ret));
     }
-
     return ret;
 }
 
-esp_err_t STUSB4500::i2cWrite(uint8_t reg_addr, const uint8_t* data, size_t len)
-{
-    if (device_handle == nullptr || data == nullptr || len == 0) {
-        ESP_LOGE(TAG, "I2C write failed: invalid parameters");
+esp_err_t STUSB4500::i2c_write(uint8_t reg_addr, const uint8_t* data, size_t len) {
+    if (!device_handle_ || !data || len == 0) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    uint8_t* write_buffer = (uint8_t*)malloc(len + 1);
-    if (write_buffer == nullptr) {
-        ESP_LOGE(TAG, "I2C write failed: no memory");
-        return ESP_ERR_NO_MEM;
-    }
+    std::vector<uint8_t> buffer(len + 1);
+    buffer[0] = reg_addr;
+    std::memcpy(&buffer[1], data, len);
 
-    write_buffer[0] = reg_addr;
-    memcpy(&write_buffer[1], data, len);
-
-    esp_err_t ret = i2c_master_transmit(device_handle, write_buffer, len + 1, 250);
-
+    auto ret = i2c_master_transmit(device_handle_, buffer.data(), buffer.size(), kI2cTimeoutMs);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "I2C write failed: reg=0x%02X, error=%s", reg_addr, esp_err_to_name(ret));
     }
 
-    free(write_buffer);
-    vTaskDelay(pdMS_TO_TICKS(1)); // Small delay as in SparkFun library
-
+    vTaskDelay(pdMS_TO_TICKS(1));
     return ret;
 }
 
-esp_err_t STUSB4500::i2cReadRegister(uint8_t reg_addr, uint8_t* data)
-{
-    return i2cRead(reg_addr, data, 1);
+std::optional<uint8_t> STUSB4500::i2c_read_register(uint8_t reg_addr) {
+    uint8_t data;
+    if (i2c_read(reg_addr, &data, 1) != ESP_OK) {
+        return std::nullopt;
+    }
+    return data;
 }
 
-esp_err_t STUSB4500::i2cWriteRegister(uint8_t reg_addr, uint8_t data)
-{
-    return i2cWrite(reg_addr, &data, 1);
+esp_err_t STUSB4500::i2c_write_register(uint8_t reg_addr, uint8_t data) {
+    return i2c_write(reg_addr, &data, 1);
 }
 
-// NVM Access Functions (based on working SparkFun logic)
-esp_err_t STUSB4500::nvmEnterReadMode()
-{
-    esp_err_t ret;
-
-    // Set password (0x95 -> 0x47)
-    ret = i2cWriteRegister(STUSB4500_REG_FTP_CUST_PASSWORD_REG, STUSB4500_REG_FTP_CUST_PASSWORD);
-    if (ret != ESP_OK) return ret;
-
-    // NVM internal controller reset (0x96 -> 0x00)
-    ret = i2cWriteRegister(STUSB4500_REG_FTP_CTRL_0, 0x00);
-    if (ret != ESP_OK) return ret;
-
-    // Set PWR and RST_N bits (0x96 -> 0xC0)
-    ret = i2cWriteRegister(STUSB4500_REG_FTP_CTRL_0, STUSB4500_FTP_CUST_PWR | STUSB4500_FTP_CUST_RST_N);
-    if (ret != ESP_OK) return ret;
-
-    return ESP_OK;
+// NVM Implementation
+esp_err_t STUSB4500::nvm_enter_read_mode() {
+    if (auto ret = i2c_write_register(reg::kFtpCustPasswordReg, nvm::kPassword); ret != ESP_OK) {
+        return ret;
+    }
+    if (auto ret = i2c_write_register(reg::kFtpCtrl0, 0x00); ret != ESP_OK) {
+        return ret;
+    }
+    return i2c_write_register(reg::kFtpCtrl0, nvm::kCustPwr | nvm::kCustRstN);
 }
 
-esp_err_t STUSB4500::nvmEnterWriteMode(uint8_t sectors_to_erase)
-{
-    esp_err_t ret;
+esp_err_t STUSB4500::nvm_enter_write_mode(uint8_t sectors_to_erase) {
+    if (auto ret = i2c_write_register(reg::kFtpCustPasswordReg, nvm::kPassword); ret != ESP_OK) {
+        return ret;
+    }
+    if (auto ret = i2c_write_register(reg::kRwBuffer, 0x00); ret != ESP_OK) {
+        return ret;
+    }
+    if (auto ret = i2c_write_register(reg::kFtpCtrl0, 0x00); ret != ESP_OK) {
+        return ret;
+    }
+    if (auto ret = i2c_write_register(reg::kFtpCtrl0, nvm::kCustPwr | nvm::kCustRstN); ret != ESP_OK) {
+        return ret;
+    }
 
-    // Set password
-    ret = i2cWriteRegister(STUSB4500_REG_FTP_CUST_PASSWORD_REG, STUSB4500_REG_FTP_CUST_PASSWORD);
-    if (ret != ESP_OK) return ret;
-
-    // Clear RW buffer
-    ret = i2cWriteRegister(STUSB4500_REG_RW_BUFFER, 0x00);
-    if (ret != ESP_OK) return ret;
-
-    // Reset
-    ret = i2cWriteRegister(STUSB4500_REG_FTP_CTRL_0, 0x00);
-    if (ret != ESP_OK) return ret;
-
-    // Set PWR and RST_N
-    ret = i2cWriteRegister(STUSB4500_REG_FTP_CTRL_0, STUSB4500_FTP_CUST_PWR | STUSB4500_FTP_CUST_RST_N);
-    if (ret != ESP_OK) return ret;
-
-    // Set write sectors opcode
-    ret = i2cWriteRegister(STUSB4500_REG_FTP_CTRL_1,
-        ((sectors_to_erase << 3) & STUSB4500_FTP_CUST_SER) | (STUSB4500_NVM_WRITE_SER & STUSB4500_FTP_CUST_OPCODE));
-    if (ret != ESP_OK) return ret;
-
-    // Start write operation
-    ret = i2cWriteRegister(STUSB4500_REG_FTP_CTRL_0,
-        STUSB4500_FTP_CUST_PWR | STUSB4500_FTP_CUST_RST_N | STUSB4500_FTP_CUST_REQ);
-    if (ret != ESP_OK) return ret;
-
-    // Wait for completion
-    ret = nvmWaitForCompletion(500);
-    if (ret != ESP_OK) return ret;
+    // Write sectors opcode
+    if (auto ret = i2c_write_register(reg::kFtpCtrl1,
+            ((sectors_to_erase << 3) & nvm::kCustSer) | (nvm::kOpcodeWriteSer & nvm::kCustOpcode)); ret != ESP_OK) {
+        return ret;
+    }
+    if (auto ret = i2c_write_register(reg::kFtpCtrl0,
+            nvm::kCustPwr | nvm::kCustRstN | nvm::kCustReq); ret != ESP_OK) {
+        return ret;
+    }
+    if (auto ret = nvm_wait_for_completion(kNvmWriteTimeoutMs); ret != ESP_OK) {
+        return ret;
+    }
 
     // Soft prog sector
-    ret = i2cWriteRegister(STUSB4500_REG_FTP_CTRL_1, STUSB4500_NVM_SOFT_PROG_SECTOR & STUSB4500_FTP_CUST_OPCODE);
-    if (ret != ESP_OK) return ret;
-
-    ret = i2cWriteRegister(STUSB4500_REG_FTP_CTRL_0,
-        STUSB4500_FTP_CUST_PWR | STUSB4500_FTP_CUST_RST_N | STUSB4500_FTP_CUST_REQ);
-    if (ret != ESP_OK) return ret;
-
-    ret = nvmWaitForCompletion();
-    if (ret != ESP_OK) return ret;
+    if (auto ret = i2c_write_register(reg::kFtpCtrl1, nvm::kOpcodeSoftProgSector & nvm::kCustOpcode); ret != ESP_OK) {
+        return ret;
+    }
+    if (auto ret = i2c_write_register(reg::kFtpCtrl0,
+            nvm::kCustPwr | nvm::kCustRstN | nvm::kCustReq); ret != ESP_OK) {
+        return ret;
+    }
+    if (auto ret = nvm_wait_for_completion(); ret != ESP_OK) {
+        return ret;
+    }
 
     // Erase sectors
-    ret = i2cWriteRegister(STUSB4500_REG_FTP_CTRL_1, STUSB4500_NVM_ERASE_SECTOR & STUSB4500_FTP_CUST_OPCODE);
-    if (ret != ESP_OK) return ret;
+    if (auto ret = i2c_write_register(reg::kFtpCtrl1, nvm::kOpcodeEraseSector & nvm::kCustOpcode); ret != ESP_OK) {
+        return ret;
+    }
+    if (auto ret = i2c_write_register(reg::kFtpCtrl0,
+            nvm::kCustPwr | nvm::kCustRstN | nvm::kCustReq); ret != ESP_OK) {
+        return ret;
+    }
 
-    ret = i2cWriteRegister(STUSB4500_REG_FTP_CTRL_0,
-        STUSB4500_FTP_CUST_PWR | STUSB4500_FTP_CUST_RST_N | STUSB4500_FTP_CUST_REQ);
-    if (ret != ESP_OK) return ret;
-
-    return nvmWaitForCompletion();
+    return nvm_wait_for_completion();
 }
 
-esp_err_t STUSB4500::nvmExitTestMode()
-{
-    esp_err_t ret;
-
-    // Reset FTP control
-    ret = i2cWriteRegister(STUSB4500_REG_FTP_CTRL_0, STUSB4500_FTP_CUST_RST_N);
-    if (ret != ESP_OK) return ret;
-
-    // Clear password
-    ret = i2cWriteRegister(STUSB4500_REG_FTP_CUST_PASSWORD_REG, 0x00);
-    if (ret != ESP_OK) return ret;
-
-    return ESP_OK;
+esp_err_t STUSB4500::nvm_exit_test_mode() {
+    if (auto ret = i2c_write_register(reg::kFtpCtrl0, nvm::kCustRstN); ret != ESP_OK) {
+        return ret;
+    }
+    return i2c_write_register(reg::kFtpCustPasswordReg, 0x00);
 }
 
-esp_err_t STUSB4500::nvmReadSector(uint8_t sector_num, uint8_t* sector_data)
-{
-    esp_err_t ret;
+esp_err_t STUSB4500::nvm_read_sector(uint8_t sector_num, uint8_t* sector_data) {
+    if (auto ret = i2c_write_register(reg::kFtpCtrl0, nvm::kCustPwr | nvm::kCustRstN); ret != ESP_OK) {
+        return ret;
+    }
+    if (auto ret = i2c_write_register(reg::kFtpCtrl1, nvm::kOpcodeRead & nvm::kCustOpcode); ret != ESP_OK) {
+        return ret;
+    }
+    if (auto ret = i2c_write_register(reg::kFtpCtrl0,
+            (sector_num & nvm::kCustSect) | nvm::kCustPwr | nvm::kCustRstN | nvm::kCustReq); ret != ESP_OK) {
+        return ret;
+    }
+    if (auto ret = nvm_wait_for_completion(); ret != ESP_OK) {
+        return ret;
+    }
 
-    // Set PWR and RST_N bits
-    ret = i2cWriteRegister(STUSB4500_REG_FTP_CTRL_0, STUSB4500_FTP_CUST_PWR | STUSB4500_FTP_CUST_RST_N);
-    if (ret != ESP_OK) return ret;
-
-    // Set Read Sectors Opcode
-    ret = i2cWriteRegister(STUSB4500_REG_FTP_CTRL_1, STUSB4500_NVM_READ & STUSB4500_FTP_CUST_OPCODE);
-    if (ret != ESP_OK) return ret;
-
-    // Load Read Sectors Opcode with sector number
-    ret = i2cWriteRegister(STUSB4500_REG_FTP_CTRL_0,
-        (sector_num & STUSB4500_FTP_CUST_SECT) | STUSB4500_FTP_CUST_PWR |
-        STUSB4500_FTP_CUST_RST_N | STUSB4500_FTP_CUST_REQ);
-    if (ret != ESP_OK) return ret;
-
-    // Wait for completion
-    ret = nvmWaitForCompletion();
-    if (ret != ESP_OK) return ret;
-
-    // Read the sector data
-    return i2cRead(STUSB4500_REG_RW_BUFFER, sector_data, 8);
+    return i2c_read(reg::kRwBuffer, sector_data, nvm::kSectorSize);
 }
 
-esp_err_t STUSB4500::nvmWriteSector(uint8_t sector_num, const uint8_t* sector_data)
-{
-    esp_err_t ret;
+esp_err_t STUSB4500::nvm_write_sector(uint8_t sector_num, const uint8_t* sector_data) {
+    if (auto ret = i2c_write(reg::kRwBuffer, sector_data, nvm::kSectorSize); ret != ESP_OK) {
+        return ret;
+    }
+    if (auto ret = i2c_write_register(reg::kFtpCtrl1, nvm::kOpcodeWritePl & nvm::kCustOpcode); ret != ESP_OK) {
+        return ret;
+    }
+    if (auto ret = i2c_write_register(reg::kFtpCtrl0,
+            nvm::kCustPwr | nvm::kCustRstN | nvm::kCustReq); ret != ESP_OK) {
+        return ret;
+    }
+    if (auto ret = nvm_wait_for_completion(); ret != ESP_OK) {
+        return ret;
+    }
 
-    // Write data to buffer first
-    ret = i2cWrite(STUSB4500_REG_RW_BUFFER, sector_data, 8);
-    if (ret != ESP_OK) return ret;
+    if (auto ret = i2c_write_register(reg::kFtpCtrl1, nvm::kOpcodeProgSector & nvm::kCustOpcode); ret != ESP_OK) {
+        return ret;
+    }
+    if (auto ret = i2c_write_register(reg::kFtpCtrl0,
+            (sector_num & nvm::kCustSect) | nvm::kCustPwr | nvm::kCustRstN | nvm::kCustReq); ret != ESP_OK) {
+        return ret;
+    }
 
-    // Set Write to PL Sectors Opcode
-    ret = i2cWriteRegister(STUSB4500_REG_FTP_CTRL_1, STUSB4500_NVM_WRITE_PL & STUSB4500_FTP_CUST_OPCODE);
-    if (ret != ESP_OK) return ret;
-
-    // Load Write to PL Sectors Opcode
-    ret = i2cWriteRegister(STUSB4500_REG_FTP_CTRL_0, STUSB4500_FTP_CUST_PWR | STUSB4500_FTP_CUST_RST_N | STUSB4500_FTP_CUST_REQ);
-    if (ret != ESP_OK) return ret;
-
-    // Wait for completion
-    ret = nvmWaitForCompletion();
-    if (ret != ESP_OK) return ret;
-
-    // Set Prog Sectors Opcode
-    ret = i2cWriteRegister(STUSB4500_REG_FTP_CTRL_1, STUSB4500_NVM_PROG_SECTOR & STUSB4500_FTP_CUST_OPCODE);
-    if (ret != ESP_OK) return ret;
-
-    // Load Prog Sectors Opcode with sector number
-    ret = i2cWriteRegister(STUSB4500_REG_FTP_CTRL_0,
-        (sector_num & STUSB4500_FTP_CUST_SECT) | STUSB4500_FTP_CUST_PWR |
-        STUSB4500_FTP_CUST_RST_N | STUSB4500_FTP_CUST_REQ);
-    if (ret != ESP_OK) return ret;
-
-    // Wait for completion
-    return nvmWaitForCompletion();
+    return nvm_wait_for_completion();
 }
 
-esp_err_t STUSB4500::nvmWaitForCompletion(uint32_t timeout_ms)
-{
-    uint8_t status;
-    uint32_t start_time = xTaskGetTickCount();
-    uint32_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
+esp_err_t STUSB4500::nvm_wait_for_completion(uint32_t timeout_ms) {
+    const uint32_t start_time = xTaskGetTickCount();
+    const uint32_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
 
-    do {
-        esp_err_t ret = i2cReadRegister(STUSB4500_REG_FTP_CTRL_0, &status);
-        if (ret != ESP_OK) return ret;
+    while ((xTaskGetTickCount() - start_time) < timeout_ticks) {
+        auto status = i2c_read_register(reg::kFtpCtrl0);
+        if (!status) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
 
-        // Check if operation is complete (REQ bit cleared)
-        if ((status & STUSB4500_FTP_CUST_REQ) == 0) {
+        if ((*status & nvm::kCustReq) == 0) {
             return ESP_OK;
         }
 
         vTaskDelay(pdMS_TO_TICKS(5));
-    } while ((xTaskGetTickCount() - start_time) < timeout_ticks);
+    }
 
     ESP_LOGE(TAG, "NVM operation timeout");
     return ESP_ERR_TIMEOUT;
 }
 
-uint32_t STUSB4500::readPdoFromRegisters(uint8_t pdo_num)
-{
-    if (pdo_num < 1 || pdo_num > 3) {
+uint32_t STUSB4500::read_pdo_from_registers(uint8_t pdo_num) {
+    if (pdo_num < 1 || pdo_num > kMaxPdos) {
         return 0;
     }
 
     uint8_t pdo_regs[4];
-    uint8_t base_reg = STUSB4500_REG_DPM_SNK_PDO1_0 + ((pdo_num - 1) * 4);
+    uint8_t base_reg = reg::kDpmSnkPdo1 + ((pdo_num - 1) * 4);
 
-    esp_err_t ret = i2cRead(base_reg, pdo_regs, 4);
-    if (ret != ESP_OK) {
+    if (i2c_read(base_reg, pdo_regs, 4) != ESP_OK) {
         return 0;
     }
 
-    // Combine bytes (little endian format)
-    uint32_t pdo_data = 0;
-    for (uint8_t i = 0; i < 4; i++) {
-        pdo_data += ((uint32_t)pdo_regs[i] << (i * 8));
-    }
-
-    return pdo_data;
+    return static_cast<uint32_t>(pdo_regs[0]) |
+           (static_cast<uint32_t>(pdo_regs[1]) << 8) |
+           (static_cast<uint32_t>(pdo_regs[2]) << 16) |
+           (static_cast<uint32_t>(pdo_regs[3]) << 24);
 }
 
-esp_err_t STUSB4500::writePdoToRegisters(uint8_t pdo_num, uint32_t pdo_data)
-{
-    if (pdo_num < 1 || pdo_num > 3) {
+esp_err_t STUSB4500::write_pdo_to_registers(uint8_t pdo_num, uint32_t pdo_data) {
+    if (pdo_num < 1 || pdo_num > kMaxPdos) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    uint8_t pdo_regs[4];
-    uint8_t base_reg = STUSB4500_REG_DPM_SNK_PDO1_0 + ((pdo_num - 1) * 4);
+    std::array<uint8_t, 4> pdo_regs = {
+        static_cast<uint8_t>(pdo_data & 0xFF),
+        static_cast<uint8_t>((pdo_data >> 8) & 0xFF),
+        static_cast<uint8_t>((pdo_data >> 16) & 0xFF),
+        static_cast<uint8_t>((pdo_data >> 24) & 0xFF)
+    };
 
-    // Convert to little endian bytes
-    pdo_regs[0] = pdo_data & 0xFF;
-    pdo_regs[1] = (pdo_data >> 8) & 0xFF;
-    pdo_regs[2] = (pdo_data >> 16) & 0xFF;
-    pdo_regs[3] = (pdo_data >> 24) & 0xFF;
-
-    return i2cWrite(base_reg, pdo_regs, 4);
+    uint8_t base_reg = reg::kDpmSnkPdo1 + ((pdo_num - 1) * 4);
+    return i2c_write(base_reg, pdo_regs.data(), 4);
 }
 
-uint32_t STUSB4500::pdoStructToRaw(const stusb4500_pdo_t* pdo)
-{
-    if (pdo == nullptr) {
+uint32_t STUSB4500::pdo_to_raw(const Pdo& pdo) noexcept {
+    if (pdo.type != PdoType::Fixed) {
         return 0;
     }
 
-    uint32_t raw = 0;
-
-    if (pdo->type == STUSB4500_PDO_TYPE_FIXED) {
-        // Fixed PDO format (USB PD specification)
-        raw |= (STUSB4500_PDO_TYPE_FIXED << 30);
-
-        if (pdo->dual_role_power) raw |= (1 << 29);
-        if (pdo->usb_suspend_supported) raw |= (1 << 28);
-        if (pdo->unconstrained_power) raw |= (1 << 27);
-        if (pdo->usb_comm_capable) raw |= (1 << 26);
-        if (pdo->dual_role_data) raw |= (1 << 25);
-
-        raw |= ((pdo->peak_current & 0x03) << 20);
-        raw |= (((pdo->voltage_mv + 25) / 50) & 0x3FF) << 10;
-        raw |= ((pdo->max_current_ma + 5) / 10) & 0x3FF;
-    }
+    uint32_t raw = static_cast<uint32_t>(PdoType::Fixed) << 30;
+    if (pdo.dual_role_power) raw |= (1U << 29);
+    if (pdo.usb_suspend_supported) raw |= (1U << 28);
+    if (pdo.unconstrained_power) raw |= (1U << 27);
+    if (pdo.usb_comm_capable) raw |= (1U << 26);
+    if (pdo.dual_role_data) raw |= (1U << 25);
+    raw |= (static_cast<uint32_t>(pdo.peak_current) & 0x03) << 20;
+    raw |= (((pdo.voltage_mv + 25) / 50) & 0x3FF) << 10;
+    raw |= ((pdo.max_current_ma + 5) / 10) & 0x3FF;
 
     return raw;
 }
 
-esp_err_t STUSB4500::rawToPdoStruct(uint32_t raw_pdo, stusb4500_pdo_t* pdo)
-{
-    if (pdo == nullptr) {
-        return ESP_ERR_INVALID_ARG;
+Pdo STUSB4500::raw_to_pdo(uint32_t raw_pdo) noexcept {
+    Pdo pdo{};
+    pdo.type = static_cast<PdoType>((raw_pdo >> 30) & 0x03);
+
+    if (pdo.type == PdoType::Fixed) {
+        pdo.dual_role_power = (raw_pdo & (1U << 29)) != 0;
+        pdo.usb_suspend_supported = (raw_pdo & (1U << 28)) != 0;
+        pdo.unconstrained_power = (raw_pdo & (1U << 27)) != 0;
+        pdo.usb_comm_capable = (raw_pdo & (1U << 26)) != 0;
+        pdo.dual_role_data = (raw_pdo & (1U << 25)) != 0;
+        pdo.peak_current = (raw_pdo >> 20) & 0x03;
+        pdo.voltage_mv = ((raw_pdo >> 10) & 0x3FF) * 50;
+        pdo.max_current_ma = (raw_pdo & 0x3FF) * 10;
     }
 
-    memset(pdo, 0, sizeof(*pdo));
-
-    pdo->type = (stusb4500_pdo_type_t)((raw_pdo >> 30) & 0x03);
-
-    if (pdo->type == STUSB4500_PDO_TYPE_FIXED) {
-        pdo->dual_role_power = (raw_pdo & (1 << 29)) != 0;
-        pdo->usb_suspend_supported = (raw_pdo & (1 << 28)) != 0;
-        pdo->unconstrained_power = (raw_pdo & (1 << 27)) != 0;
-        pdo->usb_comm_capable = (raw_pdo & (1 << 26)) != 0;
-        pdo->dual_role_data = (raw_pdo & (1 << 25)) != 0;
-        pdo->peak_current = (raw_pdo >> 20) & 0x03;
-        pdo->voltage_mv = ((raw_pdo >> 10) & 0x3FF) * 50;
-        pdo->max_current_ma = (raw_pdo & 0x3FF) * 10;
-    }
-
-    return ESP_OK;
+    return pdo;
 }
 
-void STUSB4500::loadPdoSettingsFromNVM()
-{
-    if (!nvm_sectors_read) {
+void STUSB4500::load_pdo_settings_from_nvm() {
+    if (!nvm_sectors_read_) {
         return;
     }
 
-    // Load PDO number from NVM (sector 3, byte 2, bits 2:3)
-    uint8_t pdo_count = (nvm_sectors[3][2] & 0x06) >> 1;
-    setPdoNumber(pdo_count);
+    // PDO number from sector 3, byte 2, bits 2:3
+    uint8_t pdo_count = (nvm_sectors_[3][2] & 0x06) >> 1;
+    set_pdo_number(pdo_count);
 
-    // Load PDO1 (fixed at 5V)
-    setVoltage(1, 5.0f);
-    uint8_t current_value = (nvm_sectors[3][2] & 0xF0) >> 4;
-    if (current_value == 0) {
-        setCurrent(1, 0);
-    }
-    else if (current_value < 11) {
-        setCurrent(1, current_value * 0.25f + 0.25f);
-    }
-    else {
-        setCurrent(1, current_value * 0.50f - 2.50f);
-    }
+    // PDO1 (fixed at 5V)
+    set_voltage(1, 5.0f);
+    uint8_t current_val = (nvm_sectors_[3][2] & 0xF0) >> 4;
+    float current = (current_val == 0) ? 0.0f :
+                    (current_val < 11) ? (current_val * 0.25f + 0.25f) :
+                    (current_val * 0.50f - 2.50f);
+    set_current(1, current);
 
-    // Load PDO2
-    float voltage2 = ((nvm_sectors[4][1] << 2) + (nvm_sectors[4][0] >> 6)) / 20.0f;
-    setVoltage(2, voltage2);
-    current_value = nvm_sectors[3][4] & 0x0F;
-    if (current_value == 0) {
-        setCurrent(2, 0);
-    }
-    else if (current_value < 11) {
-        setCurrent(2, current_value * 0.25f + 0.25f);
-    }
-    else {
-        setCurrent(2, current_value * 0.50f - 2.50f);
-    }
+    // PDO2
+    float voltage2 = ((nvm_sectors_[4][1] << 2) + (nvm_sectors_[4][0] >> 6)) / 20.0f;
+    set_voltage(2, voltage2);
+    current_val = nvm_sectors_[3][4] & 0x0F;
+    current = (current_val == 0) ? 0.0f :
+              (current_val < 11) ? (current_val * 0.25f + 0.25f) :
+              (current_val * 0.50f - 2.50f);
+    set_current(2, current);
 
-    // Load PDO3
-    float voltage3 = (((nvm_sectors[4][3] & 0x03) << 8) + nvm_sectors[4][2]) / 20.0f;
-    setVoltage(3, voltage3);
-    current_value = (nvm_sectors[3][5] & 0xF0) >> 4;
-    if (current_value == 0) {
-        setCurrent(3, 0);
-    }
-    else if (current_value < 11) {
-        setCurrent(3, current_value * 0.25f + 0.25f);
-    }
-    else {
-        setCurrent(3, current_value * 0.50f - 2.50f);
-    }
+    // PDO3
+    float voltage3 = (((nvm_sectors_[4][3] & 0x03) << 8) + nvm_sectors_[4][2]) / 20.0f;
+    set_voltage(3, voltage3);
+    current_val = (nvm_sectors_[3][5] & 0xF0) >> 4;
+    current = (current_val == 0) ? 0.0f :
+              (current_val < 11) ? (current_val * 0.25f + 0.25f) :
+              (current_val * 0.50f - 2.50f);
+    set_current(3, current);
 }
 
-void STUSB4500::savePdoSettingsToNVM()
-{
-    if (!nvm_sectors_read) {
+void STUSB4500::save_pdo_settings_to_nvm() {
+    if (!nvm_sectors_read_) {
         return;
     }
 
-    // Get current PDO count and save to NVM
-    uint8_t pdo_count;
-    if (getPdoNumber(&pdo_count) == ESP_OK) {
-        nvm_sectors[3][2] &= 0xF9; // Clear bits 2:3
-        nvm_sectors[3][2] |= (pdo_count << 1); // Set PDO count
+    // Save PDO count
+    auto pdo_count = get_pdo_number();
+    if (pdo_count) {
+        nvm_sectors_[3][2] = (nvm_sectors_[3][2] & 0xF9) | (*pdo_count << 1);
     }
 
-    // Convert current PDO settings back to NVM format
-    for (uint8_t i = 1; i <= 3; i++) {
-        float voltage = getVoltage(i);
-        float current = getCurrent(i);
-
-        // Convert current to 4-bit NVM format
+    // Convert and save PDO settings
+    for (uint8_t i = 1; i <= kMaxPdos; ++i) {
+        float current = get_current(i);
         uint8_t nvm_current = 0;
         if (current > 0.0f) {
-            if (current <= 3.0f) {
-                nvm_current = (uint8_t)(current * 4) - 1; // 0.25A steps
-            }
-            else {
-                nvm_current = (uint8_t)(current * 2) + 5; // 0.5A steps
-            }
+            nvm_current = (current <= 3.0f) ?
+                          static_cast<uint8_t>(current * 4) - 1 :
+                          static_cast<uint8_t>(current * 2) + 5;
         }
 
-        // Save current values to NVM sectors
         if (i == 1) {
-            // PDO1 current (sector 3, byte 2, bits 4:7)
-            nvm_sectors[3][2] &= 0x0F;
-            nvm_sectors[3][2] |= (nvm_current << 4);
-        }
-        else if (i == 2) {
-            // PDO2 current (sector 3, byte 4, bits 0:3)
-            nvm_sectors[3][4] &= 0xF0;
-            nvm_sectors[3][4] |= nvm_current;
-
-            // PDO2 voltage (10-bit value)
-            uint16_t digital_voltage = (uint16_t)(voltage * 20);
-            nvm_sectors[4][0] &= 0x3F;
-            nvm_sectors[4][0] |= ((digital_voltage & 0x03) << 6);
-            nvm_sectors[4][1] = (digital_voltage >> 2);
-        }
-        else if (i == 3) {
-            // PDO3 current (sector 3, byte 5, bits 4:7)
-            nvm_sectors[3][5] &= 0x0F;
-            nvm_sectors[3][5] |= (nvm_current << 4);
-
-            // PDO3 voltage (10-bit value)
-            uint16_t digital_voltage = (uint16_t)(voltage * 20);
-            nvm_sectors[4][2] = digital_voltage & 0xFF;
-            nvm_sectors[4][3] &= 0xFC;
-            nvm_sectors[4][3] |= (digital_voltage >> 8);
+            nvm_sectors_[3][2] = (nvm_sectors_[3][2] & 0x0F) | (nvm_current << 4);
+        } else if (i == 2) {
+            nvm_sectors_[3][4] = (nvm_sectors_[3][4] & 0xF0) | nvm_current;
+            uint16_t voltage = static_cast<uint16_t>(get_voltage(2) * 20);
+            nvm_sectors_[4][0] = (nvm_sectors_[4][0] & 0x3F) | ((voltage & 0x03) << 6);
+            nvm_sectors_[4][1] = voltage >> 2;
+        } else {
+            nvm_sectors_[3][5] = (nvm_sectors_[3][5] & 0x0F) | (nvm_current << 4);
+            uint16_t voltage = static_cast<uint16_t>(get_voltage(3) * 20);
+            nvm_sectors_[4][2] = voltage & 0xFF;
+            nvm_sectors_[4][3] = (nvm_sectors_[4][3] & 0xFC) | (voltage >> 8);
         }
     }
 }
 
-// Additional Configuration Functions (matching SparkFun exactly)
-uint8_t STUSB4500::getLowerVoltageLimit(uint8_t pdo_num)
-{
-    if (!nvm_sectors_read || pdo_num < 1 || pdo_num > 3) {
+// Configuration functions
+uint8_t STUSB4500::get_lower_voltage_limit(uint8_t pdo_num) {
+    if (!nvm_sectors_read_ || pdo_num < 1 || pdo_num > kMaxPdos) {
         return 0;
     }
 
-    if (pdo_num == 1) {
-        return 0; // PDO1 has fixed limit
-    }
-    else if (pdo_num == 2) {
-        return (nvm_sectors[3][4] >> 4) + 5;
-    }
-    else {
-        return (nvm_sectors[3][6] & 0x0F) + 5;
-    }
+    if (pdo_num == 1) return 0;
+    if (pdo_num == 2) return (nvm_sectors_[3][4] >> 4) + 5;
+    return (nvm_sectors_[3][6] & 0x0F) + 5;
 }
 
-esp_err_t STUSB4500::setLowerVoltageLimit(uint8_t pdo_num, uint8_t percentage)
-{
-    if (!nvm_sectors_read || pdo_num < 2 || pdo_num > 3) {
+esp_err_t STUSB4500::set_lower_voltage_limit(uint8_t pdo_num, uint8_t percentage) {
+    if (!nvm_sectors_read_ || pdo_num < 2 || pdo_num > kMaxPdos) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (percentage < 5) percentage = 5;
-    else if (percentage > 20) percentage = 20;
+    percentage = std::clamp(percentage, static_cast<uint8_t>(5), static_cast<uint8_t>(20));
 
     if (pdo_num == 2) {
-        nvm_sectors[3][4] &= 0x0F;
-        nvm_sectors[3][4] |= ((percentage - 5) << 4);
+        nvm_sectors_[3][4] = (nvm_sectors_[3][4] & 0x0F) | ((percentage - 5) << 4);
+    } else {
+        nvm_sectors_[3][6] = (nvm_sectors_[3][6] & 0xF0) | (percentage - 5);
     }
-    else {
-        nvm_sectors[3][6] &= 0xF0;
-        nvm_sectors[3][6] |= (percentage - 5);
-    }
-
     return ESP_OK;
 }
 
-uint8_t STUSB4500::getUpperVoltageLimit(uint8_t pdo_num)
-{
-    if (!nvm_sectors_read || pdo_num < 1 || pdo_num > 3) {
+uint8_t STUSB4500::get_upper_voltage_limit(uint8_t pdo_num) {
+    if (!nvm_sectors_read_ || pdo_num < 1 || pdo_num > kMaxPdos) {
         return 0;
     }
 
-    if (pdo_num == 1) {
-        return (nvm_sectors[3][3] >> 4) + 5;
-    }
-    else if (pdo_num == 2) {
-        return (nvm_sectors[3][5] & 0x0F) + 5;
-    }
-    else {
-        return (nvm_sectors[3][6] >> 4) + 5;
-    }
+    if (pdo_num == 1) return (nvm_sectors_[3][3] >> 4) + 5;
+    if (pdo_num == 2) return (nvm_sectors_[3][5] & 0x0F) + 5;
+    return (nvm_sectors_[3][6] >> 4) + 5;
 }
 
-esp_err_t STUSB4500::setUpperVoltageLimit(uint8_t pdo_num, uint8_t percentage)
-{
-    if (!nvm_sectors_read || pdo_num < 1 || pdo_num > 3) {
+esp_err_t STUSB4500::set_upper_voltage_limit(uint8_t pdo_num, uint8_t percentage) {
+    if (!nvm_sectors_read_ || pdo_num < 1 || pdo_num > kMaxPdos) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (percentage < 5) percentage = 5;
-    else if (percentage > 20) percentage = 20;
+    percentage = std::clamp(percentage, static_cast<uint8_t>(5), static_cast<uint8_t>(20));
 
     if (pdo_num == 1) {
-        nvm_sectors[3][3] &= 0x0F;
-        nvm_sectors[3][3] |= ((percentage - 5) << 4);
+        nvm_sectors_[3][3] = (nvm_sectors_[3][3] & 0x0F) | ((percentage - 5) << 4);
+    } else if (pdo_num == 2) {
+        nvm_sectors_[3][5] = (nvm_sectors_[3][5] & 0xF0) | (percentage - 5);
+    } else {
+        nvm_sectors_[3][6] = (nvm_sectors_[3][6] & 0x0F) | ((percentage - 5) << 4);
     }
-    else if (pdo_num == 2) {
-        nvm_sectors[3][5] &= 0xF0;
-        nvm_sectors[3][5] |= (percentage - 5);
-    }
-    else {
-        nvm_sectors[3][6] &= 0x0F;
-        nvm_sectors[3][6] |= ((percentage - 5) << 4);
-    }
-
     return ESP_OK;
 }
 
-float STUSB4500::getFlexCurrent()
-{
-    if (!nvm_sectors_read) {
-        return 0.0f;
-    }
-
-    uint16_t digital_value = ((nvm_sectors[4][4] & 0x0F) << 6) + ((nvm_sectors[4][3] & 0xFC) >> 2);
-    return digital_value / 100.0f;
+float STUSB4500::get_flex_current() {
+    if (!nvm_sectors_read_) return 0.0f;
+    uint16_t value = ((nvm_sectors_[4][4] & 0x0F) << 6) + ((nvm_sectors_[4][3] & 0xFC) >> 2);
+    return value / 100.0f;
 }
 
-esp_err_t STUSB4500::setFlexCurrent(float current)
-{
-    if (!nvm_sectors_read) {
-        return ESP_ERR_INVALID_STATE;
-    }
+esp_err_t STUSB4500::set_flex_current(float current) {
+    if (!nvm_sectors_read_) return ESP_ERR_INVALID_STATE;
 
-    if (current < 0.0f) current = 0.0f;
-    else if (current > 5.0f) current = 5.0f;
+    current = std::clamp(current, 0.0f, 5.0f);
+    uint16_t value = static_cast<uint16_t>(current * 100);
 
-    uint16_t digital_value = (uint16_t)(current * 100);
-
-    nvm_sectors[4][4] &= 0xF0;
-    nvm_sectors[4][4] |= (digital_value >> 6) & 0x0F;
-
-    nvm_sectors[4][3] &= 0x03;
-    nvm_sectors[4][3] |= (digital_value << 2) & 0xFC;
-
+    nvm_sectors_[4][4] = (nvm_sectors_[4][4] & 0xF0) | ((value >> 6) & 0x0F);
+    nvm_sectors_[4][3] = (nvm_sectors_[4][3] & 0x03) | ((value << 2) & 0xFC);
     return ESP_OK;
 }
 
-bool STUSB4500::getExternalPower()
-{
-    if (!nvm_sectors_read) {
-        return false;
-    }
-
-    return (nvm_sectors[3][2] & 0x08) != 0;
+bool STUSB4500::get_external_power() {
+    return nvm_sectors_read_ && (nvm_sectors_[3][2] & 0x08) != 0;
 }
 
-esp_err_t STUSB4500::setExternalPower(bool enabled)
-{
-    if (!nvm_sectors_read) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    nvm_sectors[3][2] &= 0xF7; // Clear bit 3
-    if (enabled) {
-        nvm_sectors[3][2] |= 0x08; // Set bit 3
-    }
-
+esp_err_t STUSB4500::set_external_power(bool enabled) {
+    if (!nvm_sectors_read_) return ESP_ERR_INVALID_STATE;
+    nvm_sectors_[3][2] = (nvm_sectors_[3][2] & 0xF7) | (enabled ? 0x08 : 0x00);
     return ESP_OK;
 }
 
-bool STUSB4500::getUsbCommCapable()
-{
-    if (!nvm_sectors_read) {
-        return false;
-    }
-
-    return (nvm_sectors[3][2] & 0x01) != 0;
+bool STUSB4500::get_usb_comm_capable() {
+    return nvm_sectors_read_ && (nvm_sectors_[3][2] & 0x01) != 0;
 }
 
-esp_err_t STUSB4500::setUsbCommCapable(bool enabled)
-{
-    if (!nvm_sectors_read) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    nvm_sectors[3][2] &= 0xFE; // Clear bit 0
-    if (enabled) {
-        nvm_sectors[3][2] |= 0x01; // Set bit 0
-    }
-
+esp_err_t STUSB4500::set_usb_comm_capable(bool enabled) {
+    if (!nvm_sectors_read_) return ESP_ERR_INVALID_STATE;
+    nvm_sectors_[3][2] = (nvm_sectors_[3][2] & 0xFE) | (enabled ? 0x01 : 0x00);
     return ESP_OK;
 }
 
-uint8_t STUSB4500::getConfigOkGpio()
-{
-    if (!nvm_sectors_read) {
-        return 0;
-    }
-
-    return (nvm_sectors[4][4] & 0x60) >> 5;
+uint8_t STUSB4500::get_config_ok_gpio() {
+    return nvm_sectors_read_ ? (nvm_sectors_[4][4] & 0x60) >> 5 : 0;
 }
 
-esp_err_t STUSB4500::setConfigOkGpio(uint8_t config)
-{
-    if (!nvm_sectors_read) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    if (config > 3) config = 3;
-
-    nvm_sectors[4][4] &= 0x9F; // Clear bits 5:6
-    nvm_sectors[4][4] |= (config << 5);
-
+esp_err_t STUSB4500::set_config_ok_gpio(uint8_t config) {
+    if (!nvm_sectors_read_) return ESP_ERR_INVALID_STATE;
+    config = std::min(config, static_cast<uint8_t>(3));
+    nvm_sectors_[4][4] = (nvm_sectors_[4][4] & 0x9F) | (config << 5);
     return ESP_OK;
 }
 
-uint8_t STUSB4500::getGpioCtrl()
-{
-    if (!nvm_sectors_read) {
-        return 0;
-    }
-
-    return (nvm_sectors[1][0] & 0x30) >> 4;
+uint8_t STUSB4500::get_gpio_ctrl() {
+    return nvm_sectors_read_ ? (nvm_sectors_[1][0] & 0x30) >> 4 : 0;
 }
 
-esp_err_t STUSB4500::setGpioCtrl(uint8_t config)
-{
-    if (!nvm_sectors_read) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    if (config > 3) config = 3;
-
-    nvm_sectors[1][0] &= 0xCF; // Clear bits 4:5
-    nvm_sectors[1][0] |= (config << 4);
-
+esp_err_t STUSB4500::set_gpio_ctrl(uint8_t config) {
+    if (!nvm_sectors_read_) return ESP_ERR_INVALID_STATE;
+    config = std::min(config, static_cast<uint8_t>(3));
+    nvm_sectors_[1][0] = (nvm_sectors_[1][0] & 0xCF) | (config << 4);
     return ESP_OK;
 }
 
-bool STUSB4500::getPowerAbove5vOnly()
-{
-    if (!nvm_sectors_read) {
-        return false;
-    }
-
-    return (nvm_sectors[4][6] & 0x08) != 0;
+bool STUSB4500::get_power_above_5v_only() {
+    return nvm_sectors_read_ && (nvm_sectors_[4][6] & 0x08) != 0;
 }
 
-esp_err_t STUSB4500::setPowerAbove5vOnly(bool enabled)
-{
-    if (!nvm_sectors_read) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    nvm_sectors[4][6] &= 0xF7; // Clear bit 3
-    if (enabled) {
-        nvm_sectors[4][6] |= 0x08; // Set bit 3
-    }
-
+esp_err_t STUSB4500::set_power_above_5v_only(bool enabled) {
+    if (!nvm_sectors_read_) return ESP_ERR_INVALID_STATE;
+    nvm_sectors_[4][6] = (nvm_sectors_[4][6] & 0xF7) | (enabled ? 0x08 : 0x00);
     return ESP_OK;
 }
 
-bool STUSB4500::getReqSrcCurrent()
-{
-    if (!nvm_sectors_read) {
-        return false;
-    }
-
-    return (nvm_sectors[4][6] & 0x10) != 0;
+bool STUSB4500::get_req_src_current() {
+    return nvm_sectors_read_ && (nvm_sectors_[4][6] & 0x10) != 0;
 }
 
-esp_err_t STUSB4500::setReqSrcCurrent(bool enabled)
-{
-    if (!nvm_sectors_read) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    nvm_sectors[4][6] &= 0xEF; // Clear bit 4
-    if (enabled) {
-        nvm_sectors[4][6] |= 0x10; // Set bit 4
-    }
-
+esp_err_t STUSB4500::set_req_src_current(bool enabled) {
+    if (!nvm_sectors_read_) return ESP_ERR_INVALID_STATE;
+    nvm_sectors_[4][6] = (nvm_sectors_[4][6] & 0xEF) | (enabled ? 0x10 : 0x00);
     return ESP_OK;
 }
 
-// Utility Functions
-const char* STUSB4500::ccStateToString(stusb4500_cc_state_t state)
-{
+const char* STUSB4500::cc_state_to_string(CcState state) noexcept {
     switch (state) {
-    case STUSB4500_CC_STATE_NOT_IN_UFP: return "Not in UFP";
-    case STUSB4500_CC_STATE_DEFAULT_USB: return "Default USB";
-    case STUSB4500_CC_STATE_POWER_1_5A: return "1.5A";
-    case STUSB4500_CC_STATE_POWER_3_0A: return "3.0A";
-    default: return "Unknown";
+        case CcState::NotInUfp: return "Not in UFP";
+        case CcState::DefaultUsb: return "Default USB";
+        case CcState::Power1_5A: return "1.5A";
+        case CcState::Power3_0A: return "3.0A";
+        default: return "Unknown";
     }
 }
 
-const char* STUSB4500::typecFsmStateToString(stusb4500_typec_fsm_state_t state)
-{
+const char* STUSB4500::typec_fsm_state_to_string(TypecFsmState state) noexcept {
     switch (state) {
-    case STUSB4500_TYPEC_FSM_UNATTACHED_SNK: return "Unattached.SNK";
-    case STUSB4500_TYPEC_FSM_ATTACH_WAIT_SNK: return "AttachWait.SNK";
-    case STUSB4500_TYPEC_FSM_ATTACHED_SNK: return "Attached.SNK";
-    case STUSB4500_TYPEC_FSM_DEBUG_ACCESSORY_SNK: return "DebugAccessory.SNK";
-    default: return "Unknown";
+        case TypecFsmState::UnattachedSnk: return "Unattached.SNK";
+        case TypecFsmState::AttachWaitSnk: return "AttachWait.SNK";
+        case TypecFsmState::AttachedSnk: return "Attached.SNK";
+        case TypecFsmState::DebugAccessorySnk: return "DebugAccessory.SNK";
+        default: return "Unknown";
     }
 }
+
+} // namespace stusb
