@@ -109,7 +109,7 @@ inline MotionSegment PathPlanner::create_segment(
 
     // Set velocity parameters (will be refined by VelocityPlanner)
     segment.nominal_velocity = feedrate;
-    segment.acceleration = MotionConfig::DEFAULT_ACCEL_MM_S2;
+    segment.acceleration = static_cast<float>(MotionConfig::DEFAULT_ACCEL_MM_S2);
 
     return segment;
 }
@@ -129,8 +129,9 @@ inline Result<void> PathPlanner::plan_linear_move(
     }
 
     // Clamp feedrate
-    feedrate = std::clamp(feedrate, MotionConfig::MIN_VELOCITY_MM_S,
-                          MotionConfig::MAX_VELOCITY_MM_S);
+    feedrate = std::clamp(feedrate,
+                          static_cast<float>(MotionConfig::MIN_VELOCITY_MM_S),
+                          static_cast<float>(MotionConfig::MAX_VELOCITY_MM_S));
 
     // Calculate total path length
     const float total_length = CoordinateTransformer::calculate_path_length(current, target);
@@ -205,8 +206,9 @@ inline Result<void> PathPlanner::plan_spiral(
     }
 
     // Clamp feedrate
-    feedrate = std::clamp(feedrate, MotionConfig::MIN_VELOCITY_MM_S,
-                          MotionConfig::MAX_VELOCITY_MM_S);
+    feedrate = std::clamp(feedrate,
+                          static_cast<float>(MotionConfig::MIN_VELOCITY_MM_S),
+                          static_cast<float>(MotionConfig::MAX_VELOCITY_MM_S));
 
     // Calculate total angular distance
     const float total_theta = rotations * 360.0f;

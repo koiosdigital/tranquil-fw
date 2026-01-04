@@ -57,7 +57,7 @@ private:
     size_t tail_ = 0;  // Next position to read
     size_t count_ = 0;
 
-    float acceleration_ = MotionConfig::DEFAULT_ACCEL_MM_S2;
+    float acceleration_ = static_cast<float>(MotionConfig::DEFAULT_ACCEL_MM_S2);
     float junction_deviation_ = MotionConfig::JUNCTION_DEVIATION_MM;
 
     /// Calculate junction velocity between two segments based on direction change

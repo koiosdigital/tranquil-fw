@@ -158,7 +158,7 @@ private:
 
     // Current position tracking
     mutable SemaphoreHandle_t position_mutex_;
-    PolarPosition current_position_{0.0f, MechanicalConfig::RHO_MIN_MM};
+    PolarPosition current_position_{0.0f, static_cast<float>(MechanicalConfig::RHO_MIN_MM)};
 
     // FreeRTOS tasks
     TaskHandle_t stepper_task_ = nullptr;

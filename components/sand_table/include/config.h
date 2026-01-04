@@ -1,5 +1,6 @@
 #pragma once
 
+#include "sdkconfig.h"
 #include "driver/gpio.h"
 #include <cstdint>
 #include <cmath>
@@ -7,84 +8,72 @@
 namespace sand_table {
 
 // =============================================================================
-// Pin Configuration
+// Pin Configuration (from sdkconfig)
 // =============================================================================
 
 struct PinConfig {
     // Theta Axis (Stage Rotation)
-    static constexpr gpio_num_t THETA_STEP = GPIO_NUM_1;
-    static constexpr gpio_num_t THETA_DIR = GPIO_NUM_2;
-    static constexpr gpio_num_t THETA_ENABLE = GPIO_NUM_3;
-    static constexpr gpio_num_t THETA_HALL = GPIO_NUM_4;  // Hall effect sensor (active low)
+    static constexpr gpio_num_t THETA_STEP = static_cast<gpio_num_t>(CONFIG_ROBOT_THETA_STEP_PIN);
+    static constexpr gpio_num_t THETA_DIR = static_cast<gpio_num_t>(CONFIG_ROBOT_THETA_DIR_PIN);
+    static constexpr gpio_num_t THETA_ENABLE = static_cast<gpio_num_t>(CONFIG_ROBOT_COMMON_ENABLE_PIN);
+    static constexpr gpio_num_t THETA_HALL = static_cast<gpio_num_t>(CONFIG_ROBOT_THETA_ENDSTOP_PIN);
 
     // Rho Axis (Radial Movement)
-    static constexpr gpio_num_t RHO_STEP = GPIO_NUM_5;
-    static constexpr gpio_num_t RHO_DIR = GPIO_NUM_6;
-    static constexpr gpio_num_t RHO_ENABLE = GPIO_NUM_7;
+    static constexpr gpio_num_t RHO_STEP = static_cast<gpio_num_t>(CONFIG_ROBOT_RHO_STEP_PIN);
+    static constexpr gpio_num_t RHO_DIR = static_cast<gpio_num_t>(CONFIG_ROBOT_RHO_DIR_PIN);
+    static constexpr gpio_num_t RHO_ENABLE = static_cast<gpio_num_t>(CONFIG_ROBOT_COMMON_ENABLE_PIN);
 
     // TMC2209 UART (shared bus)
-    static constexpr gpio_num_t TMC_TX = GPIO_NUM_17;
-    static constexpr gpio_num_t TMC_RX = GPIO_NUM_18;
+    static constexpr gpio_num_t TMC_TX = static_cast<gpio_num_t>(CONFIG_ROBOT_TMC_UART_TX_PIN);
+    static constexpr gpio_num_t TMC_RX = static_cast<gpio_num_t>(CONFIG_ROBOT_TMC_UART_RX_PIN);
 
     // TMC2209 UART addresses
-    static constexpr uint8_t THETA_TMC_ADDR = 0x00;
-    static constexpr uint8_t RHO_TMC_ADDR = 0x01;
+    static constexpr uint8_t THETA_TMC_ADDR = CONFIG_ROBOT_THETA_TMC_ADDR;
+    static constexpr uint8_t RHO_TMC_ADDR = CONFIG_ROBOT_RHO_TMC_ADDR;
 };
 
 // =============================================================================
-// Mechanical Configuration
+// Mechanical Configuration (from sdkconfig with derived calculations)
 // =============================================================================
 
 struct MechanicalConfig {
     // Motor specifications
-    static constexpr uint32_t STEPS_PER_REV = 200;      // 1.8 degree motor
-    static constexpr uint32_t MICROSTEPS = 16;          // TMC2209 microstepping
-    static constexpr uint32_t EFFECTIVE_STEPS_PER_REV = STEPS_PER_REV * MICROSTEPS;  // 3200
+    static constexpr uint32_t STEPS_PER_REV = CONFIG_ROBOT_THETA_STEPS_PER_ROT;
+    static constexpr uint32_t MICROSTEPS = 16;  // TMC2209 microstepping
+    static constexpr uint32_t EFFECTIVE_STEPS_PER_REV = STEPS_PER_REV * MICROSTEPS;
 
-    // Theta axis: Belt drive with gear ratio
-    static constexpr float THETA_GEAR_RATIO = 4.0f;     // 4 motor revolutions = 1 stage revolution
+    // Theta axis: Belt drive with gear ratio (stored as x100 in config)
+    static constexpr float THETA_GEAR_RATIO = CONFIG_ROBOT_THETA_GEAR_RATIO / 100.0f;
 
     // Rho axis: Rack and pinion
-    static constexpr float PINION_PITCH_DIAMETER_MM = 12.0f;
-    static constexpr float PINION_CIRCUMFERENCE_MM = PINION_PITCH_DIAMETER_MM * M_PI;  // ~37.7mm
+    static constexpr int32_t PINION_PITCH_DIAMETER_MM = CONFIG_ROBOT_PINION_DIAMETER_MM;
+    static constexpr float PINION_CIRCUMFERENCE_MM = PINION_PITCH_DIAMETER_MM * static_cast<float>(M_PI);
 
-    // Physical limits
-    static constexpr float RHO_MIN_MM = 5.0f;           // Center exclusion zone
-    static constexpr float RHO_MAX_MM = 150.0f;         // Edge of sand
+    // Physical limits (integers from config)
+    static constexpr int32_t RHO_MIN_MM = CONFIG_ROBOT_RHO_MIN_MM;
+    static constexpr int32_t RHO_MAX_MM = CONFIG_ROBOT_RHO_MAX_MM;
 
     // Coupling compensation direction (determined empirically)
     // If theta CCW causes rho to increase, use -1. If decrease, use +1.
     static constexpr int8_t COUPLING_DIRECTION = -1;
 
     // ==========================================================================
-    // Derived Constants (calculated at compile time)
+    // Derived Constants (calculated at compile time from config values)
     // ==========================================================================
 
     // Theta: steps per degree of stage rotation
     // (effective_steps_per_rev * gear_ratio) / 360 degrees
     static constexpr float THETA_STEPS_PER_DEG =
         (static_cast<float>(EFFECTIVE_STEPS_PER_REV) * THETA_GEAR_RATIO) / 360.0f;
-    // = (3200 * 4) / 360 = 35.556 steps/degree
 
     // Rho: steps per mm of radial movement
     // effective_steps_per_rev / pinion_circumference
     static constexpr float RHO_STEPS_PER_MM =
         static_cast<float>(EFFECTIVE_STEPS_PER_REV) / PINION_CIRCUMFERENCE_MM;
-    // = 3200 / 37.7 = 84.88 steps/mm
 
     // Coupling compensation: rho steps per theta motor step
-    // When theta rotates, it causes unintended rho movement
-    // For each theta motor step, the stage rotates by:
-    //   1 / (steps_per_rev * microsteps * gear_ratio) revolutions
-    // This causes the rack to move by:
-    //   (1 / (steps_per_rev * microsteps * gear_ratio)) * pinion_circumference mm
-    // Which is:
-    //   pinion_circumference / (steps_per_rev * microsteps * gear_ratio) mm
-    // In steps, this is:
-    //   (pinion_circumference * rho_steps_per_mm) / (steps_per_rev * microsteps * gear_ratio)
     // = 1 / gear_ratio (since rho and theta have same motor/microstep config)
     static constexpr float RHO_STEPS_PER_THETA_STEP = 1.0f / THETA_GEAR_RATIO;
-    // = 0.25 steps of compensation per theta step
 
     // Validation helper
     [[nodiscard]] static constexpr bool is_rho_in_bounds(float rho_mm) noexcept {
@@ -93,18 +82,18 @@ struct MechanicalConfig {
 };
 
 // =============================================================================
-// Motion Configuration
+// Motion Configuration (from sdkconfig)
 // =============================================================================
 
 struct MotionConfig {
-    // Velocity limits
-    static constexpr float MAX_VELOCITY_MM_S = 50.0f;
-    static constexpr float DEFAULT_VELOCITY_MM_S = 30.0f;
-    static constexpr float MIN_VELOCITY_MM_S = 1.0f;
+    // Velocity limits (integers from config, cast to float when needed)
+    static constexpr int32_t MAX_VELOCITY_MM_S = CONFIG_ROBOT_MAX_VELOCITY_MM_S;
+    static constexpr int32_t DEFAULT_VELOCITY_MM_S = CONFIG_ROBOT_DEFAULT_VELOCITY_MM_S;
+    static constexpr int32_t MIN_VELOCITY_MM_S = 1;
 
     // Acceleration limits
-    static constexpr float MAX_ACCEL_MM_S2 = 200.0f;
-    static constexpr float DEFAULT_ACCEL_MM_S2 = 100.0f;
+    static constexpr int32_t MAX_ACCEL_MM_S2 = CONFIG_ROBOT_MAX_ACCEL_MM_S2;
+    static constexpr int32_t DEFAULT_ACCEL_MM_S2 = CONFIG_ROBOT_DEFAULT_ACCEL_MM_S2;
 
     // Path segmentation
     static constexpr float SEGMENT_LENGTH_MM = 1.0f;
@@ -113,25 +102,25 @@ struct MotionConfig {
     static constexpr uint32_t LOOKAHEAD_DEPTH = 32;
     static constexpr float JUNCTION_DEVIATION_MM = 0.05f;
 
-    // Motor current settings (mA)
-    static constexpr uint16_t THETA_IRUN_MA = 800;
-    static constexpr uint16_t THETA_IHOLD_MA = 400;
-    static constexpr uint16_t RHO_IRUN_MA = 600;
-    static constexpr uint16_t RHO_IHOLD_MA = 300;
+    // Motor current settings (from config, hold = run / 2)
+    static constexpr uint16_t THETA_IRUN_MA = CONFIG_ROBOT_THETA_MOTOR_CURRENT;
+    static constexpr uint16_t THETA_IHOLD_MA = CONFIG_ROBOT_THETA_MOTOR_CURRENT / 2;
+    static constexpr uint16_t RHO_IRUN_MA = CONFIG_ROBOT_RHO_MOTOR_CURRENT;
+    static constexpr uint16_t RHO_IHOLD_MA = CONFIG_ROBOT_RHO_MOTOR_CURRENT / 2;
 
     // StallGuard threshold for rho homing
-    static constexpr uint8_t RHO_STALLGUARD_THRESHOLD = 100;
+    static constexpr uint8_t RHO_STALLGUARD_THRESHOLD = CONFIG_ROBOT_RHO_STALLGUARD_THRESHOLD;
 
-    // Homing speeds (mm/s for rho, deg/s for theta)
-    static constexpr float HOMING_FAST_SPEED = 20.0f;
-    static constexpr float HOMING_SLOW_SPEED = 5.0f;
+    // Homing speeds (integer mm/s)
+    static constexpr int32_t HOMING_FAST_SPEED = 20;
+    static constexpr int32_t HOMING_SLOW_SPEED = 5;
 
     // Motor inactivity timeout (ms)
     static constexpr uint32_t MOTOR_INACTIVITY_TIMEOUT_MS = 5000;
 };
 
 // =============================================================================
-// Timer and Hardware Configuration
+// Timer and Hardware Configuration (from sdkconfig)
 // =============================================================================
 
 struct HardwareConfig {
@@ -148,8 +137,8 @@ struct HardwareConfig {
     static constexpr uint32_t MAX_STEP_RATE_HZ = 50000;
 
     // UART configuration for TMC2209
-    static constexpr uint32_t TMC_UART_BAUD = 115200;
-    static constexpr int TMC_UART_PORT = 1;
+    static constexpr uint32_t TMC_UART_BAUD = CONFIG_ROBOT_TMC_BAUD_RATE;
+    static constexpr int TMC_UART_PORT = CONFIG_ROBOT_TMC_UART_PORT;
 };
 
 // =============================================================================

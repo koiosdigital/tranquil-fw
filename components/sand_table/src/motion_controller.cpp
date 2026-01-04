@@ -303,11 +303,11 @@ Result<void> MotionController::home() {
 
         // Reset position tracking
         if (xSemaphoreTake(position_mutex_, portMAX_DELAY)) {
-            current_position_ = {0.0f, MechanicalConfig::RHO_MIN_MM};
+            current_position_ = {0.0f, static_cast<float>(MechanicalConfig::RHO_MIN_MM)};
             xSemaphoreGive(position_mutex_);
         }
 
-        path_planner_->set_current_position({0.0f, MechanicalConfig::RHO_MIN_MM});
+        path_planner_->set_current_position({0.0f, static_cast<float>(MechanicalConfig::RHO_MIN_MM)});
         path_planner_->reset_accumulator();
 
         state_.store(SystemState::Idle, std::memory_order_release);

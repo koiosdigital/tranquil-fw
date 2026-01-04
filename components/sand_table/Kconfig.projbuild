@@ -1,0 +1,159 @@
+menu "Polar Robot Motion System"
+
+menu "TMC Stepper Configuration"
+    config ROBOT_TMC_UART_PORT
+        int "TMC UART Port"
+        default 1
+
+    config ROBOT_TMC_UART_TX_PIN
+        int "TMC UART TX Pin"
+        default 12
+
+    config ROBOT_TMC_UART_RX_PIN
+        int "TMC UART RX Pin"
+        default 13
+
+    config ROBOT_TMC_BAUD_RATE
+        int "TMC UART Baud Rate"
+        default 115200
+
+    config ROBOT_THETA_TMC_ADDR
+        int "Theta TMC Address"
+        default 2
+
+    config ROBOT_RHO_TMC_ADDR
+        int "Rho TMC Address"
+        default 0
+
+    config ROBOT_THETA_STEP_PIN
+        int "Theta Step Pin"
+        default 39
+
+    config ROBOT_THETA_DIR_PIN
+        int "Theta Direction Pin"
+        default 40
+
+    config ROBOT_RHO_STEP_PIN
+        int "Rho Step Pin"
+        default 11
+
+    config ROBOT_RHO_DIR_PIN
+        int "Rho Direction Pin"
+        default 10
+
+    config ROBOT_COMMON_ENABLE_PIN
+        int "Common Enable Pin"
+        default 21
+
+    config ROBOT_RHO_STALLGUARD_DIAG_PIN
+        int "Rho StallGuard Diag Pin"
+        default 14
+
+    config ROBOT_THETA_STALLGUARD_DIAG_PIN
+        int "Theta StallGuard Diag Pin"
+        default 2
+endmenu
+
+menu "Theta Axis Configuration"
+    config ROBOT_THETA_MAX_SPEED
+        int "Theta Max Speed (mm/s)"
+        default 15
+
+    config ROBOT_THETA_STEPS_PER_ROT
+        int "Theta Steps Per Revolution"
+        default 200
+
+    config ROBOT_THETA_GEAR_RATIO
+        int "Theta Gear Ratio (x100)"
+        default 800
+        help
+            Gear ratio multiplied by 100. E.g., 800 = 8:1 ratio, 400 = 4:1 ratio.
+
+    config ROBOT_THETA_MOTOR_CURRENT
+        int "Theta Motor Current (mA)"
+        default 400
+
+    config ROBOT_THETA_INVERT_DIRECTION
+        bool "Invert Theta Direction"
+        default n
+
+    config ROBOT_THETA_HAS_ENDSTOP
+        bool "Theta Has Endstop"
+        default y
+
+    menu "Theta Endstop Configuration"
+        depends on ROBOT_THETA_HAS_ENDSTOP
+
+        config ROBOT_THETA_ENDSTOP_PIN
+            int "Theta Endstop Pin"
+            default 17
+
+        config ROBOT_THETA_ENDSTOP_INVERT
+            bool "Invert Endstop Logic"
+            default n
+
+        config ROBOT_THETA_ENDSTOP_PULLUP
+            bool "Enable Pullup"
+            default y
+    endmenu
+endmenu
+
+menu "Rho Axis Configuration"
+    config ROBOT_RHO_MAX_SPEED
+        int "Rho Max Speed (mm/s)"
+        default 15
+
+    config ROBOT_RHO_STEPS_PER_ROT
+        int "Rho Steps Per Revolution"
+        default 200
+
+    config ROBOT_RHO_MOTOR_CURRENT
+        int "Rho Motor Current (mA)"
+        default 400
+
+    config ROBOT_RHO_INVERT_DIRECTION
+        bool "Invert Rho Direction"
+        default n
+
+    config ROBOT_RHO_STALLGUARD_THRESHOLD
+        int "Rho StallGuard Threshold"
+        default 10
+
+    config ROBOT_RHO_MIN_MM
+        int "Rho Minimum (mm)"
+        default 5
+        help
+            Center exclusion zone radius in mm.
+
+    config ROBOT_RHO_MAX_MM
+        int "Rho Maximum (mm)"
+        default 150
+        help
+            Maximum radial travel in mm.
+
+    config ROBOT_PINION_DIAMETER_MM
+        int "Pinion Pitch Diameter (mm)"
+        default 12
+        help
+            Pitch diameter of the rack and pinion gear.
+endmenu
+
+menu "Motion Parameters"
+    config ROBOT_MAX_VELOCITY_MM_S
+        int "Max Velocity (mm/s)"
+        default 50
+
+    config ROBOT_DEFAULT_VELOCITY_MM_S
+        int "Default Velocity (mm/s)"
+        default 30
+
+    config ROBOT_MAX_ACCEL_MM_S2
+        int "Max Acceleration (mm/s^2)"
+        default 200
+
+    config ROBOT_DEFAULT_ACCEL_MM_S2
+        int "Default Acceleration (mm/s^2)"
+        default 100
+endmenu
+
+endmenu

@@ -45,9 +45,9 @@ float SandTablePlayer::radiansToMm(double rho_normalized) {
     // Convert normalized 0-1 to mm
     // rho_normalized 0 = center = RHO_MIN_MM
     // rho_normalized 1 = edge = RHO_MAX_MM
-    const float range = sand_table::MechanicalConfig::RHO_MAX_MM -
-                        sand_table::MechanicalConfig::RHO_MIN_MM;
-    return sand_table::MechanicalConfig::RHO_MIN_MM +
+    const float range = static_cast<float>(sand_table::MechanicalConfig::RHO_MAX_MM) -
+                        static_cast<float>(sand_table::MechanicalConfig::RHO_MIN_MM);
+    return static_cast<float>(sand_table::MechanicalConfig::RHO_MIN_MM) +
            static_cast<float>(rho_normalized) * range;
 }
 
@@ -866,11 +866,11 @@ void SandTablePlayer::sendMoveCommand(double theta_rad, double rho_normalized) {
     // Convert feed rate (legacy RPM-like value) to mm/s
     // Use approximate conversion: feed_rate is roughly 1-20, map to reasonable mm/s
     float feedrate_mm_s = static_cast<float>(feed_rate_) * 5.0f;  // Rough scaling
-    if (feedrate_mm_s < sand_table::MotionConfig::MIN_VELOCITY_MM_S) {
-        feedrate_mm_s = sand_table::MotionConfig::MIN_VELOCITY_MM_S;
+    if (feedrate_mm_s < static_cast<float>(sand_table::MotionConfig::MIN_VELOCITY_MM_S)) {
+        feedrate_mm_s = static_cast<float>(sand_table::MotionConfig::MIN_VELOCITY_MM_S);
     }
-    if (feedrate_mm_s > sand_table::MotionConfig::MAX_VELOCITY_MM_S) {
-        feedrate_mm_s = sand_table::MotionConfig::MAX_VELOCITY_MM_S;
+    if (feedrate_mm_s > static_cast<float>(sand_table::MotionConfig::MAX_VELOCITY_MM_S)) {
+        feedrate_mm_s = static_cast<float>(sand_table::MotionConfig::MAX_VELOCITY_MM_S);
     }
 
     sand_table::PolarPosition target{theta_deg, rho_mm};

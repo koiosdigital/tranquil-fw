@@ -147,8 +147,8 @@ inline float CoordinateTransformer::calculate_path_length(
 }
 
 inline bool CoordinateTransformer::is_within_bounds(const PolarPosition& pos) {
-    return pos.rho >= MechanicalConfig::RHO_MIN_MM &&
-           pos.rho <= MechanicalConfig::RHO_MAX_MM;
+    return pos.rho >= static_cast<float>(MechanicalConfig::RHO_MIN_MM) &&
+           pos.rho <= static_cast<float>(MechanicalConfig::RHO_MAX_MM);
 }
 
 inline StepPosition CoordinateTransformer::polar_to_steps(const PolarPosition& pos) const {
