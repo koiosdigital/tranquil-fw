@@ -211,8 +211,12 @@ Result<void> GpTimerStepGenerator::execute(
         return Result<void>::err(MotionError::HardwareFault);
     }
 
-    ESP_LOGI(TAG, "Motion started: theta=%ld, rho=%ld, rate=%.0f steps/s",
-             theta_steps, rho_steps, step_rate_per_sec);
+    // Calculate expected motion time for verification
+    float expected_time_ms = (static_cast<float>(max_steps) / step_rate_per_sec) * 1000.0f;
+
+    ESP_LOGI(TAG, "Motion: theta=%ld rho=%ld | rate=%.0f steps/s | time=%.0fms | max_axis=%s",
+             theta_steps, rho_steps, step_rate_per_sec, expected_time_ms,
+             (state_.max_axis == 0) ? "theta" : "rho");
 
     // Wait for completion
     const TickType_t timeout_ticks = pdMS_TO_TICKS(30000);
@@ -225,6 +229,11 @@ Result<void> GpTimerStepGenerator::execute(
     if (stop_requested_.load(std::memory_order_acquire)) {
         return Result<void>::err(MotionError::EmergencyStop);
     }
+
+    // Log completion with actual step counts (verify they match commanded)
+    ESP_LOGD(TAG, "Done: theta_count=%lu/%lu rho_count=%lu/%lu",
+             state_.theta_count, state_.theta_total,
+             state_.rho_count, state_.rho_total);
 
     return Result<void>::ok();
 }
