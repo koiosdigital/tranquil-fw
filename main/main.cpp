@@ -76,11 +76,8 @@ extern "C" void app_main(void)
         ESP_LOGI(TAG, "Homing succeeded");
     }
 
-
-    vTaskSuspend(NULL);
-
     // Draw a square pattern at constant rho, 4 positions at 90° intervals
-    constexpr float rho = 75.0f;       // mm (midpoint of 5-150mm range)
+    constexpr float rho = 50.0f;       // mm (midpoint of 5-150mm range)
     constexpr float feedrate = 30.0f;  // mm/s
 
     ESP_LOGI(TAG, "Starting square demo at rho=%.1fmm, feedrate=%.1fmm/s", rho, feedrate);

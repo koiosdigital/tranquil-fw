@@ -1,8 +1,6 @@
 #include "homing_controller.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 
 namespace sand_table {
 
@@ -26,6 +24,17 @@ HomingController::HomingController(
 
 HomingController::~HomingController() {
     abort();
+
+    if (step_timer_) {
+        gptimer_stop(step_timer_);
+        gptimer_disable(step_timer_);
+        gptimer_del_timer(step_timer_);
+    }
+
+    if (completion_sem_) {
+        vSemaphoreDelete(completion_sem_);
+    }
+
     gpio_isr_handler_remove(PinConfig::THETA_HALL);
     gpio_isr_handler_remove(PinConfig::RHO_DIAG);
     g_homing_instance = nullptr;
@@ -36,6 +45,13 @@ Result<void> HomingController::init() {
     ESP_LOGI(TAG, "  Hall sensor pin: GPIO%d", PinConfig::THETA_HALL);
     ESP_LOGI(TAG, "  Rho DIAG pin: GPIO%d", PinConfig::RHO_DIAG);
     ESP_LOGI(TAG, "  StallGuard threshold: %d", MotionConfig::RHO_STALLGUARD_THRESHOLD);
+
+    // Create completion semaphore
+    completion_sem_ = xSemaphoreCreateBinary();
+    if (!completion_sem_) {
+        ESP_LOGE(TAG, "Failed to create completion semaphore");
+        return Result<void>::err(MotionError::HardwareFault);
+    }
 
     // Configure Hall sensor GPIO with interrupt
     gpio_config_t hall_config = {
@@ -51,12 +67,12 @@ Result<void> HomingController::init() {
         return Result<void>::err(MotionError::HardwareFault);
     }
 
-    // Configure StallGuard DIAG pin with interrupt
+    // Configure StallGuard DIAG pin with interrupt (no pull resistors - TMC2209 is push-pull)
     gpio_config_t diag_config = {
         .pin_bit_mask = (1ULL << PinConfig::RHO_DIAG),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_POSEDGE,  // DIAG goes high on stall
     };
 
@@ -84,21 +100,51 @@ Result<void> HomingController::init() {
         return Result<void>::err(MotionError::HardwareFault);
     }
 
+    // Create step timer (1 MHz resolution = 1us per tick)
+    gptimer_config_t timer_config = {
+        .clk_src = GPTIMER_CLK_SRC_DEFAULT,
+        .direction = GPTIMER_COUNT_UP,
+        .resolution_hz = 1000000,  // 1 MHz
+        .intr_priority = 0,
+        .flags = { .intr_shared = false }
+    };
+
+    if (gptimer_new_timer(&timer_config, &step_timer_) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to create step timer");
+        return Result<void>::err(MotionError::HardwareFault);
+    }
+
+    gptimer_event_callbacks_t cbs = {
+        .on_alarm = step_timer_callback
+    };
+
+    if (gptimer_register_event_callbacks(step_timer_, &cbs, this) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to register timer callback");
+        return Result<void>::err(MotionError::HardwareFault);
+    }
+
+    if (gptimer_enable(step_timer_) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to enable step timer");
+        return Result<void>::err(MotionError::HardwareFault);
+    }
+
     // Configure StallGuard for rho axis
     ESP_LOGI(TAG, "Configuring TMC2209 StallGuard...");
     (void)rho_tmc_.set_stallguard_threshold(MotionConfig::RHO_STALLGUARD_THRESHOLD);
 
     // CRITICAL: Set TCOOLTHRS to enable StallGuard at all speeds
-    // StallGuard only activates when TSTEP < TCOOLTHRS, so 0xFFFFF enables it always
     (void)rho_tmc_.set_stallguard_min_speed(0xFFFFF);
 
-    // Read back initial DIAG pin state
     int diag_level = gpio_get_level(PinConfig::RHO_DIAG);
     ESP_LOGI(TAG, "Initial DIAG pin level: %d", diag_level);
 
     ESP_LOGI(TAG, "Homing controller initialized");
     return Result<void>::ok();
 }
+
+// =============================================================================
+// ISR Handlers
+// =============================================================================
 
 void IRAM_ATTR HomingController::hall_isr_handler(void* arg) {
     auto* self = static_cast<HomingController*>(arg);
@@ -108,17 +154,271 @@ void IRAM_ATTR HomingController::hall_isr_handler(void* arg) {
 void IRAM_ATTR HomingController::diag_isr_handler(void* arg) {
     auto* self = static_cast<HomingController*>(arg);
     self->rho_stall_triggered_ = true;
-    self->diag_isr_count_++;
 }
 
-void HomingController::rho_stall_callback(uint8_t addr, bool stalled) {
-    if (g_homing_instance && stalled && addr == PinConfig::RHO_TMC_ADDR) {
-        g_homing_instance->rho_stall_triggered_ = true;
+bool IRAM_ATTR HomingController::step_timer_callback(
+    gptimer_handle_t timer,
+    const gptimer_alarm_event_data_t* edata,
+    void* user_ctx)
+{
+    auto* self = static_cast<HomingController*>(user_ctx);
+    self->generate_homing_steps();
+    return true;  // Keep alarm active
+}
+
+// =============================================================================
+// Timer-based Step Generation (runs in ISR context)
+// =============================================================================
+
+void IRAM_ATTR HomingController::generate_homing_steps() {
+    HomingState current_state = state_.load(std::memory_order_acquire);
+    bool step_generated = false;
+
+    // Process state machine transitions first
+    switch (current_state) {
+    case HomingState::RhoSeekingMax:
+        if (rho_stall_triggered_) {
+            rho_stall_triggered_ = false;
+            gptimer_stop(step_timer_);
+            // Transition to seeking minimum
+            start_rho_min_isr();
+            return;
+        }
+        if (homing_ctrl_.step_count >= homing_ctrl_.max_steps) {
+            homing_ctrl_.error = MotionError::HomingFailed;
+            state_.store(HomingState::Error, std::memory_order_release);
+            gptimer_stop(step_timer_);
+            BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+            xSemaphoreGiveFromISR(completion_sem_, &xHigherPriorityTaskWoken);
+            portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+            return;
+        }
+        break;
+
+    case HomingState::RhoSeekingMin:
+        if (rho_stall_triggered_) {
+            homing_ctrl_.rho_max_steps = homing_ctrl_.step_count;
+            rho_stall_triggered_ = false;
+            gptimer_stop(step_timer_);
+            // Transition to theta calibration
+            start_theta_calibration_isr();
+            return;
+        }
+        if (homing_ctrl_.step_count >= homing_ctrl_.max_steps) {
+            homing_ctrl_.error = MotionError::HomingFailed;
+            state_.store(HomingState::Error, std::memory_order_release);
+            gptimer_stop(step_timer_);
+            BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+            xSemaphoreGiveFromISR(completion_sem_, &xHigherPriorityTaskWoken);
+            portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+            return;
+        }
+        break;
+
+    case HomingState::ThetaBackingOff:
+        // Check if we've backed off the Hall sensor
+        if (!hall_triggered_ && gpio_get_level(PinConfig::THETA_HALL) == 1) {
+            // Switched to seeking first edge
+            state_.store(HomingState::ThetaSeekingFirstEdge, std::memory_order_release);
+            gpio_set_level(PinConfig::THETA_DIR, 1);  // Forward direction
+            gpio_set_level(PinConfig::RHO_DIR, 1);
+            homing_ctrl_.step_count = 0;
+            homing_ctrl_.theta_step_counter = 0;
+        }
+        break;
+
+    case HomingState::ThetaSeekingFirstEdge:
+        if (hall_triggered_) {
+            hall_triggered_ = false;
+            homing_ctrl_.first_hall_edge_found = true;
+            homing_ctrl_.step_count = 0;
+            homing_ctrl_.theta_step_counter = 0;
+            state_.store(HomingState::ThetaSeekingSecondEdge, std::memory_order_release);
+        }
+        if (homing_ctrl_.step_count >= homing_ctrl_.max_steps) {
+            homing_ctrl_.error = MotionError::HomingFailed;
+            state_.store(HomingState::Error, std::memory_order_release);
+            gptimer_stop(step_timer_);
+            BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+            xSemaphoreGiveFromISR(completion_sem_, &xHigherPriorityTaskWoken);
+            portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+            return;
+        }
+        break;
+
+    case HomingState::ThetaSeekingSecondEdge:
+        if (hall_triggered_) {
+            homing_ctrl_.theta_steps_per_rot = homing_ctrl_.step_count;
+            hall_triggered_ = false;
+            state_.store(HomingState::Complete, std::memory_order_release);
+            homing_active_.store(false, std::memory_order_release);
+            gptimer_stop(step_timer_);
+            BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+            xSemaphoreGiveFromISR(completion_sem_, &xHigherPriorityTaskWoken);
+            portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+            return;
+        }
+        if (homing_ctrl_.step_count >= homing_ctrl_.max_steps) {
+            homing_ctrl_.error = MotionError::HomingFailed;
+            state_.store(HomingState::Error, std::memory_order_release);
+            gptimer_stop(step_timer_);
+            BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+            xSemaphoreGiveFromISR(completion_sem_, &xHigherPriorityTaskWoken);
+            portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+            return;
+        }
+        break;
+
+    case HomingState::Complete:
+    case HomingState::Error:
+    case HomingState::Idle:
+    default:
+        return;
+    }
+
+    // Check for abort
+    if (abort_requested_.load(std::memory_order_acquire)) {
+        homing_ctrl_.error = MotionError::EmergencyStop;
+        state_.store(HomingState::Error, std::memory_order_release);
+        homing_active_.store(false, std::memory_order_release);
+        gptimer_stop(step_timer_);
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        xSemaphoreGiveFromISR(completion_sem_, &xHigherPriorityTaskWoken);
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+        return;
+    }
+
+    // Generate steps based on current state
+    switch (current_state) {
+    case HomingState::RhoSeekingMax:
+    case HomingState::RhoSeekingMin:
+        // Generate rho step
+        gpio_set_level(PinConfig::RHO_STEP, 1);
+        esp_rom_delay_us(2);
+        gpio_set_level(PinConfig::RHO_STEP, 0);
+        step_generated = true;
+        break;
+
+    case HomingState::ThetaBackingOff:
+    case HomingState::ThetaSeekingFirstEdge:
+    case HomingState::ThetaSeekingSecondEdge:
+        // Generate theta step
+        gpio_set_level(PinConfig::THETA_STEP, 1);
+        esp_rom_delay_us(2);
+        gpio_set_level(PinConfig::THETA_STEP, 0);
+
+        // Coupled rho motion (rho follows theta at gear ratio)
+        homing_ctrl_.theta_step_counter++;
+        if (homing_ctrl_.theta_step_counter >= kGearRatio) {
+            homing_ctrl_.theta_step_counter = 0;
+            gpio_set_level(PinConfig::RHO_STEP, 1);
+            esp_rom_delay_us(2);
+            gpio_set_level(PinConfig::RHO_STEP, 0);
+        }
+        step_generated = true;
+        break;
+
+    default:
+        break;
+    }
+
+    if (step_generated) {
+        homing_ctrl_.step_count++;
     }
 }
 
+// =============================================================================
+// Homing Phase Starters (ISR-safe)
+// =============================================================================
+
+void IRAM_ATTR HomingController::start_rho_max_isr() {
+    homing_ctrl_.max_steps = kMaxHomingSteps;
+    homing_ctrl_.step_count = 0;
+    rho_stall_triggered_ = false;
+
+    state_.store(HomingState::RhoSeekingMax, std::memory_order_release);
+    gpio_set_level(PinConfig::RHO_DIR, 1);  // Move outward
+
+    gptimer_alarm_config_t alarm_config = {
+        .alarm_count = kRhoStepIntervalUs,
+        .reload_count = 0,
+        .flags = { .auto_reload_on_alarm = true }
+    };
+    gptimer_set_alarm_action(step_timer_, &alarm_config);
+    gptimer_set_raw_count(step_timer_, 0);
+    gptimer_start(step_timer_);
+}
+
+void IRAM_ATTR HomingController::start_rho_min_isr() {
+    homing_ctrl_.max_steps = kMaxHomingSteps;
+    homing_ctrl_.step_count = 0;
+    rho_stall_triggered_ = false;
+
+    state_.store(HomingState::RhoSeekingMin, std::memory_order_release);
+    gpio_set_level(PinConfig::RHO_DIR, 0);  // Move inward
+
+    gptimer_alarm_config_t alarm_config = {
+        .alarm_count = kRhoStepIntervalUs,
+        .reload_count = 0,
+        .flags = { .auto_reload_on_alarm = true }
+    };
+    gptimer_set_alarm_action(step_timer_, &alarm_config);
+    gptimer_set_raw_count(step_timer_, 0);
+    gptimer_start(step_timer_);
+}
+
+void IRAM_ATTR HomingController::start_theta_calibration_isr() {
+    homing_ctrl_.max_steps = kMaxHomingSteps;
+    homing_ctrl_.step_count = 0;
+    homing_ctrl_.theta_step_counter = 0;
+    homing_ctrl_.first_hall_edge_found = false;
+    hall_triggered_ = false;
+
+    // Check if already on Hall sensor
+    if (gpio_get_level(PinConfig::THETA_HALL) == 0) {
+        state_.store(HomingState::ThetaBackingOff, std::memory_order_release);
+        gpio_set_level(PinConfig::THETA_DIR, 0);  // Reverse direction
+        gpio_set_level(PinConfig::RHO_DIR, 0);
+    } else {
+        state_.store(HomingState::ThetaSeekingFirstEdge, std::memory_order_release);
+        gpio_set_level(PinConfig::THETA_DIR, 1);  // Forward direction
+        gpio_set_level(PinConfig::RHO_DIR, 1);
+    }
+
+    gptimer_alarm_config_t alarm_config = {
+        .alarm_count = kThetaStepIntervalUs,
+        .reload_count = 0,
+        .flags = { .auto_reload_on_alarm = true }
+    };
+    gptimer_set_alarm_action(step_timer_, &alarm_config);
+    gptimer_set_raw_count(step_timer_, 0);
+    gptimer_start(step_timer_);
+}
+
+// =============================================================================
+// Timer Control
+// =============================================================================
+
+void HomingController::start_timer(uint64_t interval_us) {
+    gptimer_alarm_config_t alarm_config = {
+        .alarm_count = interval_us,
+        .reload_count = 0,
+        .flags = { .auto_reload_on_alarm = true }
+    };
+    gptimer_set_alarm_action(step_timer_, &alarm_config);
+    gptimer_set_raw_count(step_timer_, 0);
+    gptimer_start(step_timer_);
+}
+
+void HomingController::stop_timer() {
+    gptimer_stop(step_timer_);
+}
+
+// =============================================================================
+// Public Homing Functions
+// =============================================================================
+
 bool HomingController::is_hall_triggered() const {
-    // Check current GPIO level (active low)
     return gpio_get_level(PinConfig::THETA_HALL) == 0;
 }
 
@@ -128,337 +428,99 @@ bool HomingController::is_rho_stalled() const {
 
 void HomingController::abort() {
     abort_requested_.store(true, std::memory_order_release);
+    stop_timer();
     homing_active_.store(false, std::memory_order_release);
     state_.store(HomingState::Idle, std::memory_order_release);
 }
 
-bool HomingController::should_stop_rho() const {
-    return abort_requested_.load(std::memory_order_acquire) ||
-           rho_stall_triggered_;
-}
+HomingController::HomingResult HomingController::wait_for_completion() {
+    // Wait for ISR to signal completion
+    if (xSemaphoreTake(completion_sem_, pdMS_TO_TICKS(60000)) != pdTRUE) {
+        // Timeout
+        stop_timer();
+        HomingResult result;
+        result.error = MotionError::HomingFailed;
+        return result;
+    }
 
-bool HomingController::should_stop_theta() const {
-    return abort_requested_.load(std::memory_order_acquire) ||
-           hall_triggered_;
-}
-
-HomingController::HomingResult HomingController::seek_rho_max() {
     HomingResult result;
-    state_.store(HomingState::RhoSeekingMax, std::memory_order_release);
+    HomingState final_state = state_.load(std::memory_order_acquire);
 
-    ESP_LOGI(TAG, "Seeking rho maximum...");
-
-    // Clear stall flag and ISR counter
-    rho_stall_triggered_ = false;
-    diag_isr_count_ = 0;
-
-    // Check initial DIAG pin state
-    int diag_level = gpio_get_level(PinConfig::RHO_DIAG);
-    ESP_LOGW(TAG, "seek_rho_max: Initial DIAG=%d, stall_triggered=%d",
-             diag_level, rho_stall_triggered_ ? 1 : 0);
-
-    // Move outward (positive direction)
-    rho_.set_direction(true);
-    rho_.set_enabled(true);
-
-    uint32_t steps = 0;
-    uint32_t log_interval = 5000;  // Log every 5000 steps
-    while (steps < kMaxHomingSteps && !should_stop_rho()) {
-        rho_.step_once();
-        steps++;
-        esp_rom_delay_us(kRhoHomingStepIntervalUs);
-
-        // Yield to RTOS periodically to prevent watchdog timeout
-        if (steps % kYieldIntervalSteps == 0) {
-            vTaskDelay(1);
-        }
-
-        // Periodic debug logging
-        if (steps % log_interval == 0) {
-            diag_level = gpio_get_level(PinConfig::RHO_DIAG);
-            bool tmc_stalled = rho_tmc_.is_stalled();
-            ESP_LOGW(TAG, "seek_rho_max: steps=%lu, DIAG=%d, tmc_stalled=%d, isr_count=%lu, triggered=%d",
-                     steps, diag_level, tmc_stalled ? 1 : 0, diag_isr_count_, rho_stall_triggered_ ? 1 : 0);
-        }
-    }
-
-    // Final debug info
-    diag_level = gpio_get_level(PinConfig::RHO_DIAG);
-    ESP_LOGW(TAG, "seek_rho_max: Stopped at steps=%lu, DIAG=%d, isr_count=%lu, triggered=%d",
-             steps, diag_level, diag_isr_count_, rho_stall_triggered_ ? 1 : 0);
-
-    if (abort_requested_.load(std::memory_order_acquire)) {
-        result.error = MotionError::EmergencyStop;
-        return result;
-    }
-
-    if (steps >= kMaxHomingSteps) {
-        ESP_LOGE(TAG, "Rho max homing failed - exceeded max steps (no stall detected)");
-        result.error = MotionError::HomingFailed;
-        return result;
-    }
-
-    ESP_LOGI(TAG, "Rho max found at step %lu (stall detected)", steps);
-    result.success = true;
-    result.position_steps = steps;
-    return result;
-}
-
-HomingController::HomingResult HomingController::seek_rho_min() {
-    HomingResult result;
-    state_.store(HomingState::RhoSeekingMin, std::memory_order_release);
-
-    ESP_LOGI(TAG, "Seeking rho minimum...");
-
-    // Clear stall flag and ISR counter
-    rho_stall_triggered_ = false;
-    diag_isr_count_ = 0;
-
-    // Check initial DIAG pin state
-    int diag_level = gpio_get_level(PinConfig::RHO_DIAG);
-    ESP_LOGW(TAG, "seek_rho_min: Initial DIAG=%d, stall_triggered=%d",
-             diag_level, rho_stall_triggered_ ? 1 : 0);
-
-    // Move inward (negative direction)
-    rho_.set_direction(false);
-    rho_.set_enabled(true);
-
-    uint32_t steps = 0;
-    uint32_t log_interval = 5000;  // Log every 5000 steps
-    while (steps < kMaxHomingSteps && !should_stop_rho()) {
-        rho_.step_once();
-        steps++;
-        esp_rom_delay_us(kRhoHomingStepIntervalUs);
-
-        // Yield to RTOS periodically to prevent watchdog timeout
-        if (steps % kYieldIntervalSteps == 0) {
-            vTaskDelay(1);
-        }
-
-        // Periodic debug logging
-        if (steps % log_interval == 0) {
-            diag_level = gpio_get_level(PinConfig::RHO_DIAG);
-            bool tmc_stalled = rho_tmc_.is_stalled();
-            ESP_LOGW(TAG, "seek_rho_min: steps=%lu, DIAG=%d, tmc_stalled=%d, isr_count=%lu, triggered=%d",
-                     steps, diag_level, tmc_stalled ? 1 : 0, diag_isr_count_, rho_stall_triggered_ ? 1 : 0);
-        }
-    }
-
-    // Final debug info
-    diag_level = gpio_get_level(PinConfig::RHO_DIAG);
-    ESP_LOGW(TAG, "seek_rho_min: Stopped at steps=%lu, DIAG=%d, isr_count=%lu, triggered=%d",
-             steps, diag_level, diag_isr_count_, rho_stall_triggered_ ? 1 : 0);
-
-    if (abort_requested_.load(std::memory_order_acquire)) {
-        result.error = MotionError::EmergencyStop;
-        return result;
-    }
-
-    if (steps >= kMaxHomingSteps) {
-        ESP_LOGE(TAG, "Rho min homing failed - exceeded max steps (no stall detected)");
-        result.error = MotionError::HomingFailed;
-        return result;
-    }
-
-    ESP_LOGI(TAG, "Rho min found after %lu steps (stall detected)", steps);
-    result.success = true;
-    result.position_steps = steps;
-    return result;
-}
-
-HomingController::HomingResult HomingController::calibrate_theta() {
-    HomingResult result;
-
-    ESP_LOGI(TAG, "Calibrating theta axis...");
-
-    theta_.set_enabled(true);
-    rho_.set_enabled(true);  // Keep rho enabled for coupling compensation
-
-    // If already on Hall sensor, back off first
-    if (is_hall_triggered()) {
-        state_.store(HomingState::ThetaBackingOff, std::memory_order_release);
-        ESP_LOGI(TAG, "Backing off from Hall sensor...");
-
-        hall_triggered_ = false;
-        theta_.set_direction(false);  // Reverse direction
-        rho_.set_direction(false);    // Coupled motion
-
-        uint32_t backoff_steps = 0;
-        const uint32_t gear_ratio = static_cast<uint32_t>(MechanicalConfig::THETA_GEAR_RATIO);
-        uint32_t theta_step_counter = 0;
-
-        while (backoff_steps < kMaxHomingSteps && is_hall_triggered()) {
-            theta_.step_once();
-            backoff_steps++;
-            theta_step_counter++;
-
-            // Coupled rho compensation
-            if (theta_step_counter >= gear_ratio) {
-                theta_step_counter = 0;
-                rho_.step_once();
-            }
-
-            esp_rom_delay_us(kThetaHomingStepIntervalUs);
-
-            // Yield to RTOS periodically to prevent watchdog timeout
-            if (backoff_steps % kYieldIntervalSteps == 0) {
-                vTaskDelay(1);
-            }
-
-            if (abort_requested_.load(std::memory_order_acquire)) {
-                result.error = MotionError::EmergencyStop;
-                return result;
-            }
-        }
-
-        if (is_hall_triggered()) {
-            ESP_LOGE(TAG, "Failed to back off from Hall sensor");
-            result.error = MotionError::HomingFailed;
-            return result;
-        }
-    }
-
-    // Seek first edge (Hall sensor trigger)
-    state_.store(HomingState::ThetaSeekingFirstEdge, std::memory_order_release);
-    ESP_LOGI(TAG, "Seeking first Hall edge...");
-
-    hall_triggered_ = false;
-    theta_.set_direction(true);  // Forward direction
-    rho_.set_direction(true);    // Coupled motion
-
-    uint32_t seek_steps = 0;
-    const uint32_t gear_ratio = static_cast<uint32_t>(MechanicalConfig::THETA_GEAR_RATIO);
-    uint32_t theta_step_counter = 0;
-
-    while (seek_steps < kMaxHomingSteps && !should_stop_theta()) {
-        theta_.step_once();
-        seek_steps++;
-        theta_step_counter++;
-
-        // Coupled rho compensation
-        if (theta_step_counter >= gear_ratio) {
-            theta_step_counter = 0;
-            rho_.step_once();
-        }
-
-        esp_rom_delay_us(kThetaHomingStepIntervalUs);
-
-        // Yield to RTOS periodically to prevent watchdog timeout
-        if (seek_steps % kYieldIntervalSteps == 0) {
-            vTaskDelay(1);
-        }
-    }
-
-    if (abort_requested_.load(std::memory_order_acquire)) {
-        result.error = MotionError::EmergencyStop;
-        return result;
-    }
-
-    if (!hall_triggered_) {
-        ESP_LOGE(TAG, "Failed to find first Hall edge");
-        result.error = MotionError::HomingFailed;
-        return result;
-    }
-
-    ESP_LOGI(TAG, "First Hall edge found");
-
-    // Seek second edge (complete rotation)
-    state_.store(HomingState::ThetaSeekingSecondEdge, std::memory_order_release);
-    ESP_LOGI(TAG, "Seeking second Hall edge for calibration...");
-
-    hall_triggered_ = false;
-    theta_step_counter = 0;
-    uint32_t rotation_steps = 0;
-
-    // Wait a bit for debounce
-    vTaskDelay(pdMS_TO_TICKS(50));
-
-    while (rotation_steps < kMaxHomingSteps && !should_stop_theta()) {
-        theta_.step_once();
-        rotation_steps++;
-        theta_step_counter++;
-
-        // Coupled rho compensation
-        if (theta_step_counter >= gear_ratio) {
-            theta_step_counter = 0;
-            rho_.step_once();
-        }
-
-        esp_rom_delay_us(kThetaHomingStepIntervalUs);
-
-        // Yield to RTOS periodically to prevent watchdog timeout
-        if (rotation_steps % kYieldIntervalSteps == 0) {
-            vTaskDelay(1);
-        }
-    }
-
-    if (abort_requested_.load(std::memory_order_acquire)) {
-        result.error = MotionError::EmergencyStop;
-        return result;
-    }
-
-    if (!hall_triggered_) {
-        ESP_LOGE(TAG, "Failed to find second Hall edge");
-        result.error = MotionError::HomingFailed;
-        return result;
-    }
-
-    ESP_LOGI(TAG, "Theta calibration complete: %lu steps per rotation", rotation_steps);
-
-    result.success = true;
-    result.position_steps = rotation_steps;
-    return result;
-}
-
-HomingController::HomingResult HomingController::home_theta() {
-    homing_active_.store(true, std::memory_order_release);
-    abort_requested_.store(false, std::memory_order_release);
-
-    auto result = calibrate_theta();
-
-    if (result.success) {
-        theta_steps_per_rotation_ = result.position_steps;
-        theta_.reset_position();
-        state_.store(HomingState::Complete, std::memory_order_release);
+    if (final_state == HomingState::Complete) {
+        result.success = true;
+        result.position_steps = homing_ctrl_.step_count;
     } else {
-        state_.store(HomingState::Error, std::memory_order_release);
+        result.error = homing_ctrl_.error;
     }
 
-    homing_active_.store(false, std::memory_order_release);
     return result;
 }
 
 HomingController::HomingResult HomingController::home_rho() {
+    ESP_LOGI(TAG, "Starting rho homing...");
+
     homing_active_.store(true, std::memory_order_release);
     abort_requested_.store(false, std::memory_order_release);
+    homing_ctrl_.error = MotionError::None;
 
-    // First seek maximum
-    auto max_result = seek_rho_max();
-    if (!max_result.success) {
-        state_.store(HomingState::Error, std::memory_order_release);
+    // Enable motors
+    theta_.set_enabled(true);
+    rho_.set_enabled(true);
+
+    // Start seeking max (this will chain to min, then signal completion)
+    // But we need a modified flow for rho-only homing
+    homing_ctrl_.max_steps = kMaxHomingSteps;
+    homing_ctrl_.step_count = 0;
+    rho_stall_triggered_ = false;
+
+    ESP_LOGI(TAG, "Seeking rho maximum...");
+    state_.store(HomingState::RhoSeekingMax, std::memory_order_release);
+    gpio_set_level(PinConfig::RHO_DIR, 1);
+    start_timer(kRhoStepIntervalUs);
+
+    // Wait for max to complete
+    if (xSemaphoreTake(completion_sem_, pdMS_TO_TICKS(30000)) != pdTRUE) {
+        stop_timer();
         homing_active_.store(false, std::memory_order_release);
-        return max_result;
+        HomingResult result;
+        result.error = MotionError::HomingFailed;
+        ESP_LOGE(TAG, "Rho max homing timeout");
+        return result;
     }
 
-    // Brief pause
-    vTaskDelay(pdMS_TO_TICKS(100));
+    // Check if max succeeded (state should be RhoSeekingMin now, started by ISR)
+    // Actually for rho-only, we need to handle the chain differently
+    // The ISR already started seeking min, so wait again
 
-    // Then seek minimum
-    auto min_result = seek_rho_min();
-    if (!min_result.success) {
-        state_.store(HomingState::Error, std::memory_order_release);
+    vTaskDelay(pdMS_TO_TICKS(100));  // Brief pause between phases
+
+    if (state_.load(std::memory_order_acquire) == HomingState::Error) {
         homing_active_.store(false, std::memory_order_release);
-        return min_result;
+        HomingResult result;
+        result.error = homing_ctrl_.error;
+        return result;
     }
 
-    // Store calibration
-    rho_max_steps_ = min_result.position_steps;
-    rho_.reset_position();  // Home is at minimum (center)
+    // Wait for min to complete (ISR will signal and start theta, but we stop there for rho-only)
+    if (xSemaphoreTake(completion_sem_, pdMS_TO_TICKS(30000)) != pdTRUE) {
+        stop_timer();
+        homing_active_.store(false, std::memory_order_release);
+        HomingResult result;
+        result.error = MotionError::HomingFailed;
+        ESP_LOGE(TAG, "Rho min homing timeout");
+        return result;
+    }
+
+    // For rho-only homing, stop here
+    stop_timer();
+
+    rho_max_steps_ = homing_ctrl_.rho_max_steps;
+    rho_.reset_position();
+
+    homing_active_.store(false, std::memory_order_release);
+    state_.store(HomingState::Complete, std::memory_order_release);
 
     ESP_LOGI(TAG, "Rho homing complete: %ld steps travel", rho_max_steps_);
-
-    state_.store(HomingState::Complete, std::memory_order_release);
-    homing_active_.store(false, std::memory_order_release);
 
     HomingResult result;
     result.success = true;
@@ -466,57 +528,68 @@ HomingController::HomingResult HomingController::home_rho() {
     return result;
 }
 
-Result<void> HomingController::home_all() {
+HomingController::HomingResult HomingController::home_theta() {
+    ESP_LOGI(TAG, "Starting theta homing...");
+
     homing_active_.store(true, std::memory_order_release);
     abort_requested_.store(false, std::memory_order_release);
-
-    ESP_LOGI(TAG, "Starting full homing sequence...");
+    homing_ctrl_.error = MotionError::None;
 
     // Enable motors
     theta_.set_enabled(true);
     rho_.set_enabled(true);
 
-    // Home rho first (safer - moves to center)
-    auto rho_result = seek_rho_max();
-    if (!rho_result.success) {
-        state_.store(HomingState::Error, std::memory_order_release);
-        homing_active_.store(false, std::memory_order_release);
-        return Result<void>::err(rho_result.error);
+    // Start theta calibration directly
+    start_theta_calibration_isr();
+
+    auto result = wait_for_completion();
+
+    if (result.success) {
+        theta_steps_per_rotation_ = homing_ctrl_.theta_steps_per_rot;
+        theta_.reset_position();
+        ESP_LOGI(TAG, "Theta homing complete: %ld steps/rotation", theta_steps_per_rotation_);
+    } else {
+        ESP_LOGE(TAG, "Theta homing failed");
     }
 
-    vTaskDelay(pdMS_TO_TICKS(100));
-
-    auto rho_min_result = seek_rho_min();
-    if (!rho_min_result.success) {
-        state_.store(HomingState::Error, std::memory_order_release);
-        homing_active_.store(false, std::memory_order_release);
-        return Result<void>::err(rho_min_result.error);
-    }
-
-    rho_max_steps_ = rho_min_result.position_steps;
-    rho_.reset_position();
-
-    vTaskDelay(pdMS_TO_TICKS(100));
-
-    // Then home theta
-    auto theta_result = calibrate_theta();
-    if (!theta_result.success) {
-        state_.store(HomingState::Error, std::memory_order_release);
-        homing_active_.store(false, std::memory_order_release);
-        return Result<void>::err(theta_result.error);
-    }
-
-    theta_steps_per_rotation_ = theta_result.position_steps;
-    theta_.reset_position();
-    rho_.reset_position();  // Reset again since theta moves affect rho
-
-    state_.store(HomingState::Complete, std::memory_order_release);
     homing_active_.store(false, std::memory_order_release);
+    return result;
+}
 
-    ESP_LOGI(TAG, "Homing complete - Rho: %ld steps, Theta: %ld steps/rev",
-             rho_max_steps_, theta_steps_per_rotation_);
+Result<void> HomingController::home_all() {
+    ESP_LOGI(TAG, "Starting full homing sequence...");
 
-    return Result<void>::ok();
+    homing_active_.store(true, std::memory_order_release);
+    abort_requested_.store(false, std::memory_order_release);
+    homing_ctrl_.error = MotionError::None;
+
+    // Enable motors
+    theta_.set_enabled(true);
+    rho_.set_enabled(true);
+
+    // Start the homing sequence (rho max -> rho min -> theta calibration)
+    start_rho_max_isr();
+
+    // Wait for full sequence to complete
+    auto result = wait_for_completion();
+
+    if (result.success) {
+        rho_max_steps_ = homing_ctrl_.rho_max_steps;
+        theta_steps_per_rotation_ = homing_ctrl_.theta_steps_per_rot;
+
+        theta_.reset_position();
+        rho_.reset_position();
+
+        ESP_LOGI(TAG, "Homing complete - Rho: %ld steps, Theta: %ld steps/rev",
+                 rho_max_steps_, theta_steps_per_rotation_);
+
+        homing_active_.store(false, std::memory_order_release);
+        return Result<void>::ok();
+    }
+
+    ESP_LOGE(TAG, "Homing failed");
+    homing_active_.store(false, std::memory_order_release);
+    return Result<void>::err(result.error);
 }
 
 } // namespace sand_table

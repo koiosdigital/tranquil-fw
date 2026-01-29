@@ -6,14 +6,20 @@
 
 #include "tmc2209.h"
 #include "driver/gpio.h"
+#include "driver/gptimer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 #include <atomic>
 
 namespace sand_table {
 
-    /// Controls the homing sequence for both axes.
+    /// Controls the homing sequence for both axes using timer-based stepping.
     /// - Theta uses Hall effect sensor
     /// - Rho uses TMC2209 StallGuard for sensorless homing
+    ///
+    /// Step generation happens in a hardware timer ISR for precise timing
+    /// and non-blocking operation.
     class HomingController {
     public:
         struct HomingResult {
@@ -49,7 +55,7 @@ namespace sand_table {
         HomingController(const HomingController&) = delete;
         HomingController& operator=(const HomingController&) = delete;
 
-        /// Initialize homing hardware (Hall sensor GPIO, StallGuard)
+        /// Initialize homing hardware (Hall sensor GPIO, StallGuard, timer)
         [[nodiscard]] Result<void> init();
 
         /// Home theta axis using Hall effect sensor
@@ -90,6 +96,10 @@ namespace sand_table {
         tmc::TMC2209Stepper& theta_tmc_;
         tmc::TMC2209Stepper& rho_tmc_;
 
+        // Timer for step generation
+        gptimer_handle_t step_timer_ = nullptr;
+        SemaphoreHandle_t completion_sem_ = nullptr;
+
         std::atomic<HomingState> state_{ HomingState::Idle };
         std::atomic<bool> homing_active_{ false };
         std::atomic<bool> abort_requested_{ false };
@@ -97,31 +107,50 @@ namespace sand_table {
         // Sensor state (updated by ISR)
         volatile bool hall_triggered_ = false;
         volatile bool rho_stall_triggered_ = false;
-        volatile uint32_t diag_isr_count_ = 0;  // Debug counter for DIAG ISR triggers
+
+        // Homing control state (used by timer ISR)
+        struct HomingControl {
+            uint32_t step_count = 0;
+            uint32_t max_steps = 0;
+            uint32_t theta_step_counter = 0;  // For coupled rho motion
+            int32_t rho_max_steps = 0;
+            int32_t theta_steps_per_rot = 0;
+            bool first_hall_edge_found = false;
+            MotionError error = MotionError::None;
+        };
+        volatile HomingControl homing_ctrl_;
 
         // Calibration results
         int32_t rho_max_steps_ = 0;
         int32_t theta_steps_per_rotation_ = 0;
 
-        // Homing parameters - matched to main branch PolarHoming.cpp
+        // Homing parameters (matched to main branch)
         static constexpr uint32_t kMaxHomingSteps = 100000;
-        static constexpr uint32_t kRhoHomingStepIntervalUs = 600;   // Rho homing: 1333 steps/sec (from main)
-        static constexpr uint32_t kThetaHomingStepIntervalUs = 400; // Theta homing: 2500 steps/sec (from main)
-        static constexpr uint32_t kYieldIntervalSteps = 1000;  // Yield to RTOS every N steps
+        static constexpr uint64_t kRhoStepIntervalUs = 750;   // Rho homing step interval
+        static constexpr uint64_t kThetaStepIntervalUs = 400; // Theta homing step interval
+        static constexpr uint32_t kGearRatio = static_cast<uint32_t>(MechanicalConfig::THETA_GEAR_RATIO);
 
         // ISR handlers
         static void IRAM_ATTR hall_isr_handler(void* arg);
         static void IRAM_ATTR diag_isr_handler(void* arg);
-        static void rho_stall_callback(uint8_t addr, bool stalled);
+        static bool IRAM_ATTR step_timer_callback(gptimer_handle_t timer,
+                                                   const gptimer_alarm_event_data_t* edata,
+                                                   void* user_ctx);
 
-        // Internal homing functions
-        HomingResult seek_rho_max();
-        HomingResult seek_rho_min();
-        HomingResult calibrate_theta();
+        // Timer ISR step generation
+        void IRAM_ATTR generate_homing_steps();
 
-        // Helper to check abort and stall conditions
-        bool should_stop_rho() const;
-        bool should_stop_theta() const;
+        // Internal homing phase starters (called from ISR context)
+        void IRAM_ATTR start_rho_max_isr();
+        void IRAM_ATTR start_rho_min_isr();
+        void IRAM_ATTR start_theta_calibration_isr();
+
+        // Start timer with specified interval
+        void start_timer(uint64_t interval_us);
+        void stop_timer();
+
+        // Wait for homing phase to complete
+        HomingResult wait_for_completion();
     };
 
 } // namespace sand_table
