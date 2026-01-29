@@ -152,6 +152,7 @@ namespace sand_table {
         (void)theta_tmc_->set_motor_current(MotionConfig::THETA_IRUN_MA);
         (void)theta_tmc_->set_microstep_resolution(tmc::MicrostepResolution::Sixteenth);
         (void)theta_tmc_->set_stealthchop_enable(true);
+        (void)theta_tmc_->set_stealthchop_threshold(0);
 
         // Initialize rho TMC
         if (rho_tmc_->initialize() != ESP_OK) {
@@ -162,7 +163,7 @@ namespace sand_table {
         (void)rho_tmc_->set_motor_current(MotionConfig::RHO_IRUN_MA);
         (void)rho_tmc_->set_microstep_resolution(tmc::MicrostepResolution::Sixteenth);
         (void)rho_tmc_->set_stealthchop_enable(true);
-        (void)rho_tmc_->set_stallguard_threshold(MotionConfig::RHO_STALLGUARD_THRESHOLD);
+        (void)rho_tmc_->set_stealthchop_threshold(0);
 
         ESP_LOGI(TAG, "TMC2209 drivers initialized");
         return Result<void>::ok();
