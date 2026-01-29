@@ -103,10 +103,12 @@ inline Result<void> PathPlanner::plan_linear_move(
 
         // Convert back to polar
         const double seg_rho = std::sqrt(seg_x * seg_x + seg_y * seg_y);
-        double seg_theta = std::atan2(seg_y, seg_x);
-        if (seg_theta < 0) {
-            seg_theta += 2.0 * M_PI;  // Normalize to [0, 2π)
-        }
+        double seg_theta = std::atan2(seg_y, seg_x);  // Returns [-π, π]
+
+        // Unwrap angle relative to previous position to maintain continuity.
+        // This ensures cumulative theta (e.g., 405° instead of 45° after one rotation).
+        while (seg_theta - prev_pos.theta > M_PI) seg_theta -= 2.0 * M_PI;
+        while (seg_theta - prev_pos.theta < -M_PI) seg_theta += 2.0 * M_PI;
 
         MotionSegment segment;
         // Set absolute target position (used for step calculation at execution time)
@@ -131,7 +133,8 @@ inline Result<void> PathPlanner::plan_linear_move(
         prev_pos = {seg_theta, seg_rho};
     }
 
-    current_position_ = target;
+    // Store the unwrapped position (prev_pos) to maintain theta continuity for next move
+    current_position_ = prev_pos;
     return Result<void>::ok();
 }
 

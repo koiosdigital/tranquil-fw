@@ -248,7 +248,8 @@ namespace sand_table {
                     curr_theta_steps = target_theta_steps_;
                     curr_rho_steps = target_rho_steps_;
                     xSemaphoreGive(position_mutex_);
-                } else {
+                }
+                else {
                     ESP_LOGE(TAG, "Failed to acquire position mutex");
                     continue;
                 }
@@ -273,9 +274,26 @@ namespace sand_table {
                     continue;
                 }
 
-                // Update position tracking with new target steps (integer)
+                // Get actual motor positions - these are the source of truth
+                int32_t actual_theta = theta_stepper_->position();
+                int32_t actual_rho = rho_stepper_->position();
+
+                // Log position tracking info for debugging
+                ESP_LOGD(TAG, "Segment: delta_theta=%ld, delta_rho=%ld",
+                    segment.delta_theta_steps, segment.delta_rho_steps);
+                ESP_LOGD(TAG, "  Target: theta=%ld, rho=%ld | Motor: theta=%ld, rho=%ld",
+                    new_target_theta_steps, new_target_rho_steps, actual_theta, actual_rho);
+
+                // Update position tracking
+                // Theta accumulates naturally (no normalization/wraparound)
+                // Rho is tracked as "raw" steps (coupling compensation applied per-segment)
                 if (xSemaphoreTake(position_mutex_, pdMS_TO_TICKS(10))) {
                     target_theta_steps_ = new_target_theta_steps;
+                    // Rho tracking must account for coupling: motor position includes
+                    // compensation, so we need to track the "raw" equivalent.
+                    // raw_rho = motor_rho - accumulated_coupling
+                    // But simpler: just track what polar_to_absolute_steps gives us,
+                    // since that's consistent with how we compute deltas.
                     target_rho_steps_ = new_target_rho_steps;
                     xSemaphoreGive(position_mutex_);
                 }
@@ -468,8 +486,9 @@ namespace sand_table {
             theta_steps = target_theta_steps_;
             rho_steps = target_rho_steps_;
             xSemaphoreGive(position_mutex_);
-        } else {
-            return {0.0, 0.0};
+        }
+        else {
+            return { 0.0, 0.0 };
         }
         return transformer_->steps_to_polar(theta_steps, rho_steps);
     }

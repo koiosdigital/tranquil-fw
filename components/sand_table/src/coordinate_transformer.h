@@ -123,9 +123,9 @@ inline void CoordinateTransformer::polar_to_steps(
     int32_t& theta_steps,
     int32_t& rho_steps) const
 {
-    // Convert theta from radians to steps
-    // drive_gear_rotations = theta / 2π
-    // theta_steps = drive_gear_rotations * steps_per_theta_rot
+    // DON'T normalize theta - let it accumulate naturally
+    // This ensures closed loops return to exact starting position
+    // (normalization is only done for display in steps_to_polar)
     double drive_gear_rotations = polar.theta / (2.0 * M_PI);
     theta_steps = static_cast<int32_t>(std::round(drive_gear_rotations * steps_per_theta_rot_));
 
@@ -151,21 +151,12 @@ inline void CoordinateTransformer::calculate_coupled_delta_steps(
     int32_t& delta_rho_steps) const
 {
     // Pure integer arithmetic for step deltas - no floating point accumulation errors
+    // NO wraparound: for continuous patterns, theta accumulates naturally.
+    // The path planner provides continuous (non-normalized) theta values.
 
-    // Compute raw theta delta
-    int32_t raw_theta_delta = target_theta_steps - current_theta_steps;
+    delta_theta_steps = target_theta_steps - current_theta_steps;
 
-    // Handle theta wraparound - find shortest path (like calculate_min_rotation did)
-    // If delta is more than half a rotation, go the other way
-    const int32_t half_rot = steps_per_theta_rot_ / 2;
-    if (raw_theta_delta > half_rot) {
-        raw_theta_delta -= steps_per_theta_rot_;
-    } else if (raw_theta_delta < -half_rot) {
-        raw_theta_delta += steps_per_theta_rot_;
-    }
-    delta_theta_steps = raw_theta_delta;
-
-    // Rho delta (no wraparound needed)
+    // Rho delta
     int32_t raw_rho_delta = target_rho_steps - current_rho_steps;
 
     // Add coupling compensation:

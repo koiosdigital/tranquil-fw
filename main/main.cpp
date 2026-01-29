@@ -159,5 +159,25 @@ extern "C" void app_main(void)
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 
+    // Get final status for position comparison
+    auto status = g_motion_controller->get_status();
+
+    // Expected final position: theta = 45° = π/4 = 0.125 rotations, rho = 0
+    // In steps: theta = 0.125 * theta_steps_per_rot, rho = 0
+    const int32_t expected_theta_steps = static_cast<int32_t>(0.125 * theta_steps_per_rot);
+    constexpr int32_t expected_rho_steps = 0;
+
+    ESP_LOGI(TAG, "=== FINAL POSITION COMPARISON ===");
+    ESP_LOGI(TAG, "Expected theta: %ld steps (45°)", expected_theta_steps);
+    ESP_LOGI(TAG, "Actual theta:   %ld steps (motor counter)", status.theta.position_steps);
+    ESP_LOGI(TAG, "Theta error:    %ld steps", status.theta.position_steps - expected_theta_steps);
+    ESP_LOGI(TAG, "---");
+    ESP_LOGI(TAG, "Expected rho:   %ld steps", expected_rho_steps);
+    ESP_LOGI(TAG, "Actual rho:     %ld steps (motor counter)", status.rho.position_steps);
+    ESP_LOGI(TAG, "Rho error:      %ld steps", status.rho.position_steps - expected_rho_steps);
+    ESP_LOGI(TAG, "---");
+    ESP_LOGI(TAG, "Tracked pos (polar): theta=%.4f rad, rho=%.4f", status.position.theta, status.position.rho);
+    ESP_LOGI(TAG, "=================================");
+
     ESP_LOGI(TAG, "3-square demo complete!");
 }
