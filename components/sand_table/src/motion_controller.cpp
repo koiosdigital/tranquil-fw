@@ -278,11 +278,13 @@ namespace sand_table {
                 int32_t actual_theta = theta_stepper_->position();
                 int32_t actual_rho = rho_stepper_->position();
 
-                // Log position tracking info for debugging
-                ESP_LOGD(TAG, "Segment: delta_theta=%ld, delta_rho=%ld",
-                    segment.delta_theta_steps, segment.delta_rho_steps);
-                ESP_LOGD(TAG, "  Target: theta=%ld, rho=%ld | Motor: theta=%ld, rho=%ld",
-                    new_target_theta_steps, new_target_rho_steps, actual_theta, actual_rho);
+                // Check for drift between expected and actual
+                int32_t expected_theta = curr_theta_steps + segment.delta_theta_steps;
+                int32_t theta_drift = actual_theta - expected_theta;
+                if (std::abs(theta_drift) > 2) {
+                    ESP_LOGW(TAG, "Theta drift detected: expected=%ld, actual=%ld, drift=%ld",
+                        expected_theta, actual_theta, theta_drift);
+                }
 
                 // Update position tracking
                 // Theta accumulates naturally (no normalization/wraparound)

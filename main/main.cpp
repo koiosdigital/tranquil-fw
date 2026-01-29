@@ -80,11 +80,11 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "Development mode: Homing skipped (theta=%ld steps/rot, rho=%ld max)",
         theta_steps_per_rot, rho_max_steps);
 
-    // Draw 3 squares using linear interpolation in Cartesian space
-    // Square corners at 45°, 135°, 225°, 315°
+    // Draw shapes using linear interpolation in Cartesian space
+    // Test pattern: 3 squares, 2 triangles, 1 hexagon, return to center
     constexpr float feedrate = 25.0f;   // RPM
 
-    ESP_LOGI(TAG, "Starting 3-square demo, feedrate=%.1f RPM", feedrate);
+    ESP_LOGI(TAG, "Starting shape demo: 3 squares + 2 triangles + hexagon, feedrate=%.1f RPM", feedrate);
 
     sand_table::PolarPosition pos;
 
@@ -148,7 +148,65 @@ extern "C" void app_main(void)
     pos.theta = M_PI / 4.0;
     (void)g_motion_controller->move_to(pos, feedrate);
 
-    pos.rho = 0;
+    // === Triangle 1: rho=0.35, CCW (vertices at 0°, 120°, 240°) ===
+    constexpr double tri_rho1 = 0.35;
+    ESP_LOGI(TAG, "Triangle 1: rho=%.2f, CCW", tri_rho1);
+
+    pos.theta = 0.0;
+    pos.rho = tri_rho1;
+    (void)g_motion_controller->move_to(pos, feedrate);
+
+    pos.theta = 2.0 * M_PI / 3.0;  // 120°
+    (void)g_motion_controller->move_to(pos, feedrate);
+
+    pos.theta = 4.0 * M_PI / 3.0;  // 240°
+    (void)g_motion_controller->move_to(pos, feedrate);
+
+    pos.theta = 2.0 * M_PI;  // 360° (back to 0°, but accumulated)
+    (void)g_motion_controller->move_to(pos, feedrate);
+
+    // === Triangle 2: rho=0.55, CW (reversed) ===
+    constexpr double tri_rho2 = 0.55;
+    ESP_LOGI(TAG, "Triangle 2: rho=%.2f, CW", tri_rho2);
+
+    pos.rho = tri_rho2;
+    // Already at 360°, go CW: 360°→240°→120°→0°
+    pos.theta = 4.0 * M_PI / 3.0;  // 240°
+    (void)g_motion_controller->move_to(pos, feedrate);
+
+    pos.theta = 2.0 * M_PI / 3.0;  // 120°
+    (void)g_motion_controller->move_to(pos, feedrate);
+
+    pos.theta = 0.0;  // 0°
+    (void)g_motion_controller->move_to(pos, feedrate);
+
+    // === Hexagon: rho=0.45, CCW (vertices at 0°, 60°, 120°, 180°, 240°, 300°) ===
+    constexpr double hex_rho = 0.45;
+    ESP_LOGI(TAG, "Hexagon: rho=%.2f, CCW", hex_rho);
+
+    pos.rho = hex_rho;
+    // Starting at 0°
+    pos.theta = M_PI / 3.0;  // 60°
+    (void)g_motion_controller->move_to(pos, feedrate);
+
+    pos.theta = 2.0 * M_PI / 3.0;  // 120°
+    (void)g_motion_controller->move_to(pos, feedrate);
+
+    pos.theta = M_PI;  // 180°
+    (void)g_motion_controller->move_to(pos, feedrate);
+
+    pos.theta = 4.0 * M_PI / 3.0;  // 240°
+    (void)g_motion_controller->move_to(pos, feedrate);
+
+    pos.theta = 5.0 * M_PI / 3.0;  // 300°
+    (void)g_motion_controller->move_to(pos, feedrate);
+
+    pos.theta = 2.0 * M_PI;  // 360° (back to 0°)
+    (void)g_motion_controller->move_to(pos, feedrate);
+
+    // === Return to center ===
+    ESP_LOGI(TAG, "Returning to center");
+    pos.rho = 0.0;
     (void)g_motion_controller->move_to(pos, feedrate);
 
     ESP_LOGI(TAG, "All moves queued. Waiting for completion...");
@@ -162,22 +220,28 @@ extern "C" void app_main(void)
     // Get final status for position comparison
     auto status = g_motion_controller->get_status();
 
-    // Expected final position: theta = 45° = π/4 = 0.125 rotations, rho = 0
-    // In steps: theta = 0.125 * theta_steps_per_rot, rho = 0
-    const int32_t expected_theta_steps = static_cast<int32_t>(0.125 * theta_steps_per_rot);
+    // Expected final position:
+    // - Rho = 0 (center)
+    // - Theta accumulated through: 3 squares + 2 triangles + hexagon
+    //   Net theta depends on CW vs CCW rotations and unwrapping
+    //   Last explicit theta before center was 2π (hexagon endpoint)
+    //
+    // For drift detection, the key check is rho should be exactly 0,
+    // and there should be no "Theta drift detected" warnings during execution.
     constexpr int32_t expected_rho_steps = 0;
 
-    ESP_LOGI(TAG, "=== FINAL POSITION COMPARISON ===");
-    ESP_LOGI(TAG, "Expected theta: %ld steps (45°)", expected_theta_steps);
-    ESP_LOGI(TAG, "Actual theta:   %ld steps (motor counter)", status.theta.position_steps);
-    ESP_LOGI(TAG, "Theta error:    %ld steps", status.theta.position_steps - expected_theta_steps);
-    ESP_LOGI(TAG, "---");
-    ESP_LOGI(TAG, "Expected rho:   %ld steps", expected_rho_steps);
-    ESP_LOGI(TAG, "Actual rho:     %ld steps (motor counter)", status.rho.position_steps);
-    ESP_LOGI(TAG, "Rho error:      %ld steps", status.rho.position_steps - expected_rho_steps);
-    ESP_LOGI(TAG, "---");
-    ESP_LOGI(TAG, "Tracked pos (polar): theta=%.4f rad, rho=%.4f", status.position.theta, status.position.rho);
-    ESP_LOGI(TAG, "=================================");
+    ESP_LOGI(TAG, "=== FINAL POSITION ===");
+    ESP_LOGI(TAG, "Motor theta:  %ld steps (%.2f rotations)",
+        status.theta.position_steps,
+        static_cast<float>(status.theta.position_steps) / theta_steps_per_rot);
+    ESP_LOGI(TAG, "Motor rho:    %ld steps (expected: %ld, error: %ld)",
+        status.rho.position_steps, expected_rho_steps,
+        status.rho.position_steps - expected_rho_steps);
+    ESP_LOGI(TAG, "Tracked pos:  theta=%.4f rad (%.1f°), rho=%.4f",
+        status.position.theta,
+        status.position.theta * 180.0 / M_PI,
+        status.position.rho);
+    ESP_LOGI(TAG, "======================");
 
-    ESP_LOGI(TAG, "3-square demo complete!");
+    ESP_LOGI(TAG, "Shape demo complete!");
 }
