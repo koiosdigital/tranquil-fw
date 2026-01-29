@@ -8,8 +8,20 @@
 
 namespace sand_table {
 
+// =============================================================================
+// Interpolation Mode Selection (for A/B testing)
+// =============================================================================
+
+/// Path interpolation mode for A/B testing.
+/// TO SWITCH BACK TO CARTESIAN: Use InterpolationMode::Cartesian (the default)
+enum class InterpolationMode {
+    Cartesian,   // Linear interpolation in XY space, breaks into ~100 segments
+    DirectPolar  // Direct polar move like main branch, single segment per move
+};
+
 /// Path planner that breaks moves into small segments.
-/// Works with radians for theta and normalized (0-1) for rho.
+/// Supports both Cartesian interpolation and direct polar modes.
+/// Outputs delta-based segments (min-rotation for theta).
 class PathPlanner {
 public:
     /// Callback for emitting segments
@@ -23,6 +35,17 @@ public:
         callback_ = std::move(cb);
     }
 
+    /// Set interpolation mode for A/B testing
+    /// TO SWITCH BACK TO CARTESIAN: Use InterpolationMode::Cartesian
+    void set_interpolation_mode(InterpolationMode mode) noexcept {
+        mode_ = mode;
+    }
+
+    /// Get current interpolation mode
+    [[nodiscard]] InterpolationMode get_interpolation_mode() const noexcept {
+        return mode_;
+    }
+
     /// Set the current position (e.g., after homing)
     void set_current_position(const PolarPosition& pos) noexcept {
         current_position_ = pos;
@@ -33,8 +56,8 @@ public:
         return current_position_;
     }
 
-    /// Plan a linear move from current to target position
-    /// Breaks the move into small segments and emits them via callback
+    /// Plan a move from current to target position
+    /// Uses the configured interpolation mode (Cartesian or DirectPolar)
     ///
     /// @param current Current polar position (theta: radians, rho: 0-1)
     /// @param target Target polar position (theta: radians, rho: 0-1)
@@ -46,12 +69,45 @@ public:
         float feedrate_rpm
     );
 
+    /// Plan a direct polar move (single segment, like main branch)
+    /// This bypasses Cartesian interpolation for better precision.
+    ///
+    /// @param current Current polar position (theta: radians, rho: 0-1)
+    /// @param target Target polar position (theta: radians, rho: 0-1)
+    /// @param feedrate_rpm Speed in RPM
+    /// @return Error if move could not be planned
+    [[nodiscard]] Result<void> plan_direct_polar_move(
+        const PolarPosition& current,
+        const PolarPosition& target,
+        float feedrate_rpm
+    );
+
+    /// Get cumulative delta tracking (for debugging)
+    [[nodiscard]] double debug_cumulative_theta() const noexcept { return debug_cumulative_theta_; }
+    [[nodiscard]] double debug_cumulative_rho() const noexcept { return debug_cumulative_rho_; }
+    void debug_reset_cumulative() noexcept { debug_cumulative_theta_ = 0; debug_cumulative_rho_ = 0; }
+
 private:
     SegmentCallback callback_;
     PolarPosition current_position_{0.0, 0.0};
 
+    // Interpolation mode (Cartesian vs DirectPolar for A/B testing)
+    // TO SWITCH TO DIRECT POLAR: Change default to InterpolationMode::DirectPolar
+    InterpolationMode mode_ = InterpolationMode::Cartesian;  // Using Cartesian for testing
+
+    // Debug: track cumulative deltas to verify they sum correctly
+    double debug_cumulative_theta_ = 0.0;
+    double debug_cumulative_rho_ = 0.0;
+
     // Segment length in normalized units (~1% of table)
     static constexpr double kSegmentLength = 0.01;
+
+    /// Internal: Cartesian interpolation (original behavior)
+    [[nodiscard]] Result<void> plan_cartesian_interpolation(
+        const PolarPosition& current,
+        const PolarPosition& target,
+        float feedrate_rpm
+    );
 };
 
 // =============================================================================
@@ -59,6 +115,66 @@ private:
 // =============================================================================
 
 inline Result<void> PathPlanner::plan_linear_move(
+    const PolarPosition& current,
+    const PolarPosition& target,
+    float feedrate_rpm)
+{
+    // Branch based on interpolation mode
+    // TO SWITCH BACK TO CARTESIAN: Use InterpolationMode::Cartesian
+    if (mode_ == InterpolationMode::DirectPolar) {
+        return plan_direct_polar_move(current, target, feedrate_rpm);
+    }
+    return plan_cartesian_interpolation(current, target, feedrate_rpm);
+}
+
+inline Result<void> PathPlanner::plan_direct_polar_move(
+    const PolarPosition& current,
+    const PolarPosition& target,
+    float feedrate_rpm)
+{
+    if (!callback_) {
+        return Result<void>::err(MotionError::InvalidState);
+    }
+
+    // Direct polar move - single segment like main branch
+    // This avoids Cartesian round-trip conversion precision loss
+    MotionSegment segment;
+
+    // Use min-rotation for theta delta (shortest path)
+    segment.delta_theta_rad = calculate_min_rotation(target.theta, current.theta);
+    segment.delta_rho_norm = target.rho - current.rho;
+
+    // Calculate distance for velocity profile (like main branch)
+    // Main branch uses: max(thetaDelta / (2*PI), rhoDelta)
+    // This normalizes theta to [0,1] range for comparison with rho
+    const double theta_normalized = std::fabs(segment.delta_theta_rad) / (2.0 * M_PI);
+    const double rho_delta = std::fabs(segment.delta_rho_norm);
+    segment.distance = static_cast<float>(std::max(theta_normalized, rho_delta));
+
+    // Ensure minimum distance for moves that are essentially stationary
+    if (segment.distance < 0.001f) {
+        // Negligible move - update position and return
+        current_position_ = target;
+        return Result<void>::ok();
+    }
+
+    segment.nominal_velocity = feedrate_rpm;
+    segment.is_last_segment = true;
+
+    // Motor steps will be calculated at execution time, not here
+    segment.delta_theta_steps = 0;
+    segment.delta_rho_steps = 0;
+
+    if (!callback_(segment)) {
+        return Result<void>::err(MotionError::QueueFull);
+    }
+
+    // Store the final position for the next move
+    current_position_ = target;
+    return Result<void>::ok();
+}
+
+inline Result<void> PathPlanner::plan_cartesian_interpolation(
     const PolarPosition& current,
     const PolarPosition& target,
     float feedrate_rpm)
@@ -80,7 +196,8 @@ inline Result<void> PathPlanner::plan_linear_move(
     const double total_distance = std::sqrt(delta_x * delta_x + delta_y * delta_y);
 
     if (total_distance < 0.001) {
-        // Negligible move
+        // Negligible move - update position and return
+        current_position_ = target;
         return Result<void>::ok();
     }
 
@@ -92,49 +209,63 @@ inline Result<void> PathPlanner::plan_linear_move(
     const float dist_per_seg = static_cast<float>(total_distance / num_segments);
 
     // Generate segments by interpolating linearly in Cartesian space
+    // Track cumulative deltas to ensure final segment corrects for any drift
     PolarPosition prev_pos = current;
+    double cumulative_theta_delta = 0.0;
+    double cumulative_rho_delta = 0.0;
+
     for (uint32_t i = 0; i < num_segments; ++i) {
-        // Linear interpolation parameter (0 to 1)
-        const double t = static_cast<double>(i + 1) / static_cast<double>(num_segments);
-
-        // Interpolate in Cartesian space
-        const double seg_x = start_x + t * delta_x;
-        const double seg_y = start_y + t * delta_y;
-
-        // Convert back to polar
-        const double seg_rho = std::sqrt(seg_x * seg_x + seg_y * seg_y);
-        double seg_theta = std::atan2(seg_y, seg_x);  // Returns [-π, π]
-
-        // Unwrap angle relative to previous position to maintain continuity.
-        // This ensures cumulative theta (e.g., 405° instead of 45° after one rotation).
-        while (seg_theta - prev_pos.theta > M_PI) seg_theta -= 2.0 * M_PI;
-        while (seg_theta - prev_pos.theta < -M_PI) seg_theta += 2.0 * M_PI;
+        const bool is_last = (i == num_segments - 1);
 
         MotionSegment segment;
-        // Set absolute target position (used for step calculation at execution time)
-        segment.target_theta_rad = seg_theta;
-        segment.target_rho_norm = seg_rho;
-
-        // Set deltas from previous position (used for velocity calculations)
-        segment.delta_theta_rad = calculate_min_rotation(seg_theta, prev_pos.theta);
-        segment.delta_rho_norm = seg_rho - prev_pos.rho;
         segment.distance = dist_per_seg;
         segment.nominal_velocity = feedrate_rpm;
-        segment.is_last_segment = (i == num_segments - 1);
-
-        // Motor steps will be calculated at execution time, not here
+        segment.is_last_segment = is_last;
         segment.delta_theta_steps = 0;
         segment.delta_rho_steps = 0;
+
+        if (is_last) {
+            // CRITICAL: Final segment uses exact remaining delta to prevent drift
+            // This ensures the sum of all deltas exactly equals the intended move
+            const double total_theta_delta = calculate_min_rotation(target.theta, current.theta);
+            const double total_rho_delta = target.rho - current.rho;
+
+            segment.delta_theta_rad = total_theta_delta - cumulative_theta_delta;
+            segment.delta_rho_norm = total_rho_delta - cumulative_rho_delta;
+        } else {
+            // Linear interpolation parameter (0 to 1)
+            const double t = static_cast<double>(i + 1) / static_cast<double>(num_segments);
+
+            // Interpolate in Cartesian space
+            const double seg_x = start_x + t * delta_x;
+            const double seg_y = start_y + t * delta_y;
+
+            // Convert back to polar
+            const double seg_rho = std::sqrt(seg_x * seg_x + seg_y * seg_y);
+            const double seg_theta = std::atan2(seg_y, seg_x);  // Returns [-π, π]
+
+            // Normalize to [0, 2π] for consistency
+            const double seg_theta_norm = (seg_theta < 0) ? seg_theta + 2.0 * M_PI : seg_theta;
+
+            // Use min-rotation for theta delta (shortest path)
+            segment.delta_theta_rad = calculate_min_rotation(seg_theta_norm, prev_pos.theta);
+            segment.delta_rho_norm = seg_rho - prev_pos.rho;
+
+            // Update tracking for final segment correction
+            cumulative_theta_delta += segment.delta_theta_rad;
+            cumulative_rho_delta += segment.delta_rho_norm;
+
+            // Update prev_pos for next segment
+            prev_pos = {seg_theta_norm, seg_rho};
+        }
 
         if (!callback_(segment)) {
             return Result<void>::err(MotionError::QueueFull);
         }
-
-        prev_pos = {seg_theta, seg_rho};
     }
 
-    // Store the unwrapped position (prev_pos) to maintain theta continuity for next move
-    current_position_ = prev_pos;
+    // Store the final position for the next move
+    current_position_ = target;
     return Result<void>::ok();
 }
 

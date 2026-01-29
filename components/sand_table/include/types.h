@@ -124,17 +124,14 @@ struct StepPosition {
 // =============================================================================
 
 struct MotionSegment {
-    // Absolute target position for this segment (set by PathPlanner)
-    double target_theta_rad = 0.0;  // radians
-    double target_rho_norm = 0.0;   // normalized (0-1)
+    // Delta movement in polar coordinates (set by PathPlanner)
+    // Uses min-rotation for theta (shortest path, can be negative)
+    double delta_theta_rad = 0.0;   // radians (min rotation, [-π, π])
+    double delta_rho_norm = 0.0;    // normalized (0-1 scale)
 
     // Motor steps (WITH coupling compensation applied) - calculated at execution time
     int32_t delta_theta_steps = 0;
     int32_t delta_rho_steps = 0;
-
-    // Delta movement (for velocity calculations)
-    double delta_theta_rad = 0.0;   // radians
-    double delta_rho_norm = 0.0;    // normalized (0-1 scale)
 
     // Normalized distance (for velocity planning)
     float distance = 0.0f;

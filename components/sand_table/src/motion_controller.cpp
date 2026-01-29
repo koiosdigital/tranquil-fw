@@ -14,8 +14,6 @@ namespace sand_table {
         : path_planner_(std::make_unique<PathPlanner>())
         , transformer_(std::make_unique<CoordinateTransformer>())
     {
-        position_mutex_ = xSemaphoreCreateMutex();
-
         // Set up PathPlanner callback to enqueue segments
         path_planner_->set_segment_callback([this](MotionSegment& seg) {
             return this->enqueue_segment(seg);
@@ -24,10 +22,6 @@ namespace sand_table {
 
     MotionController::~MotionController() {
         stop();
-
-        if (position_mutex_) {
-            vSemaphoreDelete(position_mutex_);
-        }
 
         if (inactivity_timer_) {
             xTimerDelete(inactivity_timer_, 0);
@@ -234,33 +228,60 @@ namespace sand_table {
             // Try to get next segment from queue
             MotionSegment segment;
             if (segment_queue_.pop(segment)) {
-                // Convert target polar to absolute step position (one-time conversion)
-                PolarPosition target_polar{ segment.target_theta_rad, segment.target_rho_norm };
-                int32_t new_target_theta_steps, new_target_rho_steps;
-                transformer_->polar_to_absolute_steps(
-                    target_polar,
-                    new_target_theta_steps, new_target_rho_steps
+                // Convert polar deltas to motor steps (simple, direct conversion)
+                transformer_->delta_polar_to_motor_steps(
+                    segment.delta_theta_rad,
+                    segment.delta_rho_norm,
+                    segment.delta_theta_steps,
+                    segment.delta_rho_steps
                 );
 
-                // Get current target steps (protected by mutex)
-                int32_t curr_theta_steps, curr_rho_steps;
-                if (xSemaphoreTake(position_mutex_, pdMS_TO_TICKS(10))) {
-                    curr_theta_steps = target_theta_steps_;
-                    curr_rho_steps = target_rho_steps_;
-                    xSemaphoreGive(position_mutex_);
-                }
-                else {
-                    ESP_LOGE(TAG, "Failed to acquire position mutex");
-                    continue;
+                // Debug: Track cumulative steps to find drift source
+                static int debug_segment_count = 0;
+                static int64_t cumulative_theta_steps = 0;
+                static int64_t cumulative_rho_steps = 0;
+                static double cumulative_theta_rad = 0.0;
+                static double cumulative_rho_norm = 0.0;
+
+                cumulative_theta_steps += segment.delta_theta_steps;
+                cumulative_rho_steps += segment.delta_rho_steps;
+                cumulative_theta_rad += segment.delta_theta_rad;
+                cumulative_rho_norm += segment.delta_rho_norm;
+
+                if (debug_segment_count < 5) {
+                    ESP_LOGI(TAG, "Seg[%d]: d_theta=%.6f rad, d_rho=%.6f, theta_s=%ld, rho_s=%ld, dist=%.4f",
+                        debug_segment_count, segment.delta_theta_rad, segment.delta_rho_norm,
+                        segment.delta_theta_steps, segment.delta_rho_steps, segment.distance);
+                    debug_segment_count++;
                 }
 
-                // Calculate motor step deltas using pure integer arithmetic
-                // This avoids floating-point accumulation errors
-                transformer_->calculate_coupled_delta_steps(
-                    curr_theta_steps, curr_rho_steps,
-                    new_target_theta_steps, new_target_rho_steps,
-                    segment.delta_theta_steps, segment.delta_rho_steps
-                );
+                // Log cumulative totals and at end
+                static int total_segments = 0;
+                total_segments++;
+                if (segment.is_last_segment) {
+                    // Get actual motor positions
+                    int32_t actual_theta = theta_stepper_->position();
+                    int32_t actual_rho = rho_stepper_->position();
+
+                    ESP_LOGI(TAG, "=== Move Complete ===");
+                    ESP_LOGI(TAG, "  Segments: %d", total_segments);
+                    ESP_LOGI(TAG, "  Commanded: theta=%lld steps (%.4f rad), rho=%lld steps (%.4f norm)",
+                        cumulative_theta_steps, cumulative_theta_rad,
+                        cumulative_rho_steps, cumulative_rho_norm);
+                    ESP_LOGI(TAG, "  Actual pos: theta=%ld, rho=%ld",
+                        actual_theta, actual_rho);
+                    ESP_LOGI(TAG, "  Accumulators: theta=%.6f, rho=%.6f",
+                        transformer_->theta_accumulator(), transformer_->rho_accumulator());
+                    ESP_LOGI(TAG, "=====================");
+
+                    // Reset for next move
+                    total_segments = 0;
+                    cumulative_theta_steps = 0;
+                    cumulative_rho_steps = 0;
+                    cumulative_theta_rad = 0.0;
+                    cumulative_rho_norm = 0.0;
+                    debug_segment_count = 0;
+                }
 
                 // Execute segment at constant velocity
                 auto result = execute_segment_constant_velocity(segment);
@@ -274,31 +295,8 @@ namespace sand_table {
                     continue;
                 }
 
-                // Get actual motor positions - these are the source of truth
-                int32_t actual_theta = theta_stepper_->position();
-                int32_t actual_rho = rho_stepper_->position();
-
-                // Check for drift between expected and actual
-                int32_t expected_theta = curr_theta_steps + segment.delta_theta_steps;
-                int32_t theta_drift = actual_theta - expected_theta;
-                if (std::abs(theta_drift) > 2) {
-                    ESP_LOGW(TAG, "Theta drift detected: expected=%ld, actual=%ld, drift=%ld",
-                        expected_theta, actual_theta, theta_drift);
-                }
-
-                // Update position tracking
-                // Theta accumulates naturally (no normalization/wraparound)
-                // Rho is tracked as "raw" steps (coupling compensation applied per-segment)
-                if (xSemaphoreTake(position_mutex_, pdMS_TO_TICKS(10))) {
-                    target_theta_steps_ = new_target_theta_steps;
-                    // Rho tracking must account for coupling: motor position includes
-                    // compensation, so we need to track the "raw" equivalent.
-                    // raw_rho = motor_rho - accumulated_coupling
-                    // But simpler: just track what polar_to_absolute_steps gives us,
-                    // since that's consistent with how we compute deltas.
-                    target_rho_steps_ = new_target_rho_steps;
-                    xSemaphoreGive(position_mutex_);
-                }
+                // Handle position overflow (wrap theta, adjust rho - like main branch)
+                handle_position_overflow();
 
                 // Check if this was the last segment
                 if (segment.is_last_segment && segment_queue_.empty()) {
@@ -318,6 +316,70 @@ namespace sand_table {
 
         ESP_LOGI(TAG, "Stepper task exiting");
         vTaskDelete(nullptr);
+    }
+
+    void MotionController::handle_position_overflow() {
+        // Like main branch's handleStepOverflow()
+        // When theta exceeds ±1 rotation, wrap it and adjust rho for coupling
+        int32_t theta_steps = theta_stepper_->position();
+        int32_t rho_steps = rho_stepper_->position();
+        const int32_t theta_rot = transformer_->steps_per_theta_rotation();
+
+        if (theta_rot <= 0) {
+            return;  // Not calibrated yet
+        }
+
+        // Calculate rho adjustment per theta rotation (due to coupling)
+        // FIX: The coupling happens at the MOTOR level, not the drive gear level.
+        // When theta motor rotates once (EFFECTIVE_STEPS_PER_REV steps), rho moves
+        // by EFFECTIVE_STEPS_PER_REV / THETA_GEAR_RATIO steps due to mechanical coupling.
+        //
+        // Main branch uses: _rhoPosition -= CONFIG_ROBOT_RHO_STEPS_PER_ROT * 16.0f
+        // Which is: motor_steps_per_rev * microsteps = 200 * 16 = 3200 steps/motor_rot
+        //
+        // Per drive gear rotation (theta_rot steps), we have:
+        //   theta_rot = motor_steps_per_rev * gear_ratio * microsteps
+        //   rho_steps_per_motor_rot = motor_steps_per_rev * microsteps
+        //   motor_rotations_per_theta_rot = gear_ratio
+        //   rho_per_theta_rot = rho_steps_per_motor_rot * motor_rotations_per_theta_rot
+        //                     = EFFECTIVE_STEPS_PER_REV * THETA_GEAR_RATIO / THETA_GEAR_RATIO
+        //                     = EFFECTIVE_STEPS_PER_REV
+        //
+        // Wait, let me recalculate:
+        // - theta_rot = steps per full theta (drive gear) rotation
+        // - When drive gear rotates once, theta motor rotates (gear_ratio) times
+        // - Each theta motor rotation causes rho to move by (EFFECTIVE_STEPS_PER_REV / gear_ratio) steps
+        // - So per drive gear rotation: rho moves by EFFECTIVE_STEPS_PER_REV steps
+        //
+        // This matches main branch: 3200 steps per theta rotation (with 4:1 ratio, 3200 = 200*16)
+        const int32_t rho_per_theta_rot = static_cast<int32_t>(
+            MechanicalConfig::EFFECTIVE_STEPS_PER_REV
+        );
+
+        bool wrapped = false;
+
+        while (theta_steps >= theta_rot) {
+            theta_steps -= theta_rot;
+            rho_steps -= rho_per_theta_rot;
+            wrapped = true;
+        }
+        while (theta_steps <= -theta_rot) {
+            theta_steps += theta_rot;
+            rho_steps += rho_per_theta_rot;
+            wrapped = true;
+        }
+
+        if (wrapped) {
+            ESP_LOGD(TAG, "Position wrapped: theta=%ld, rho=%ld (rho_per_rot=%ld)",
+                     theta_steps, rho_steps, rho_per_theta_rot);
+            theta_stepper_->set_position(theta_steps);
+            rho_stepper_->set_position(rho_steps);
+
+            // CRITICAL: Reset fractional accumulator when wrapping
+            // The integer adjustment handles the bulk coupling compensation,
+            // fractional error accumulated before wrap is negligible
+            transformer_->reset_accumulators();
+        }
     }
 
     void MotionController::inactivity_timer_callback(TimerHandle_t timer) {
@@ -364,12 +426,12 @@ namespace sand_table {
                 homing_controller_->theta_steps_per_rotation(),
                 homing_controller_->rho_max_steps());
 
-            // Reset position tracking to home position (0 steps)
-            if (xSemaphoreTake(position_mutex_, portMAX_DELAY)) {
-                target_theta_steps_ = 0;
-                target_rho_steps_ = 0;
-                xSemaphoreGive(position_mutex_);
-            }
+            // Reset motor positions to home (0 steps)
+            theta_stepper_->set_position(0);
+            rho_stepper_->set_position(0);
+
+            // Reset fractional accumulators
+            transformer_->reset_accumulators();
 
             // Reset path planner position
             path_planner_->set_current_position({ 0.0, 0.0 });
@@ -395,12 +457,12 @@ namespace sand_table {
         // Pass calibration to coordinate transformer
         transformer_->set_calibration(theta_steps_per_rot, rho_max);
 
-        // Reset position to home (0 steps)
-        if (xSemaphoreTake(position_mutex_, portMAX_DELAY)) {
-            target_theta_steps_ = 0;
-            target_rho_steps_ = 0;
-            xSemaphoreGive(position_mutex_);
-        }
+        // Reset motor positions to home (0 steps)
+        theta_stepper_->set_position(0);
+        rho_stepper_->set_position(0);
+
+        // Reset fractional accumulators
+        transformer_->reset_accumulators();
 
         // Reset path planner position
         path_planner_->set_current_position({ 0.0, 0.0 });
@@ -429,7 +491,6 @@ namespace sand_table {
 
         // Get current planning position from PathPlanner
         // This represents where the arm will be after all currently queued moves
-        // (not the actual position, which is tracked separately)
         const PolarPosition& current = path_planner_->current_position();
 
         // Set default feedrate if not specified
@@ -446,10 +507,6 @@ namespace sand_table {
         auto result = path_planner_->plan_linear_move(current, target, actual_feedrate);
 
         if (result.is_ok()) {
-            // Don't update current_position_ here - that's the actual executed position
-            // which is updated by stepper_task_loop after each segment completes.
-            // PathPlanner tracks the planning position internally.
-
             // Ensure motors are enabled and state is Running
             enable_motors();
             state_.store(SystemState::Running, std::memory_order_release);
@@ -482,26 +539,11 @@ namespace sand_table {
     }
 
     PolarPosition MotionController::get_position() const {
-        // Derive polar position from step counts (only for display/API)
-        int32_t theta_steps, rho_steps;
-        if (xSemaphoreTake(position_mutex_, portMAX_DELAY)) {
-            theta_steps = target_theta_steps_;
-            rho_steps = target_rho_steps_;
-            xSemaphoreGive(position_mutex_);
-        }
-        else {
-            return { 0.0, 0.0 };
-        }
-        return transformer_->steps_to_polar(theta_steps, rho_steps);
-    }
-
-    void MotionController::update_position(int32_t theta_steps, int32_t rho_steps) {
-        // Store step counts directly (no floating-point conversion)
-        if (xSemaphoreTake(position_mutex_, portMAX_DELAY)) {
-            target_theta_steps_ = theta_steps;
-            target_rho_steps_ = rho_steps;
-            xSemaphoreGive(position_mutex_);
-        }
+        // Derive polar position from actual motor step positions (for display/API only)
+        return transformer_->steps_to_polar(
+            theta_stepper_->position(),
+            rho_stepper_->position()
+        );
     }
 
     bool MotionController::enqueue_segment(MotionSegment& segment) {
@@ -512,8 +554,6 @@ namespace sand_table {
             vTaskDelay(pdMS_TO_TICKS(10));
         }
 
-        // Motor steps are calculated at execution time, not here
-        // The segment already has target_theta_rad and target_rho_norm set by PathPlanner
         return segment_queue_.push(segment);
     }
 

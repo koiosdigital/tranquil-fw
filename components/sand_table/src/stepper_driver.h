@@ -2,6 +2,7 @@
 
 #include "types.h"
 #include "config.h"
+#include "gptimer_step_generator.h"
 
 #include "driver/gpio.h"
 #include "driver/rmt_tx.h"
@@ -18,6 +19,17 @@ namespace sand_table {
 
 // Forward declaration
 struct BresenhamState;
+
+// =============================================================================
+// Step Generator Mode Selection (for A/B testing)
+// =============================================================================
+
+/// Step generator mode for A/B testing RMT vs GPTimer implementations.
+/// TO SWITCH BACK TO RMT-ONLY: Use StepGeneratorMode::RMT (the default)
+enum class StepGeneratorMode {
+    RMT,      // Current RMT-based implementation (default)
+    GPTimer   // GPTimer fallback matching main branch behavior
+};
 
 /// Low-level stepper motor driver using RMT for precise step generation
 class StepperDriver {
@@ -217,7 +229,7 @@ public:
     CoordinatedStepperController(const CoordinatedStepperController&) = delete;
     CoordinatedStepperController& operator=(const CoordinatedStepperController&) = delete;
 
-    /// Initialize the controller (creates RMT sequencer)
+    /// Initialize the controller (creates RMT sequencer and GPTimer generator)
     [[nodiscard]] Result<void> init();
 
     /// Execute a motion segment with velocity profile
@@ -235,6 +247,9 @@ public:
 
     /// Check if motion is in progress
     [[nodiscard]] bool is_moving() const noexcept {
+        if (step_mode_ == StepGeneratorMode::GPTimer) {
+            return gptimer_generator_.is_executing();
+        }
         return rmt_sequencer_.is_executing();
     }
 
@@ -243,11 +258,27 @@ public:
         return {theta_.position(), rho_.position()};
     }
 
+    /// Set step generator mode for A/B testing
+    /// TO SWITCH BACK TO RMT-ONLY: Use StepGeneratorMode::RMT
+    void set_step_generator_mode(StepGeneratorMode mode) noexcept {
+        step_mode_ = mode;
+    }
+
+    /// Get current step generator mode
+    [[nodiscard]] StepGeneratorMode get_step_generator_mode() const noexcept {
+        return step_mode_;
+    }
+
 private:
     StepperDriver& theta_;
     StepperDriver& rho_;
 
+    // Step generator mode (RMT vs GPTimer for A/B testing)
+    // TO SWITCH BACK TO RMT-ONLY: Change default to StepGeneratorMode::RMT
+    StepGeneratorMode step_mode_ = StepGeneratorMode::GPTimer;  // Default to GPTimer for testing
+
     RmtStepSequencer rmt_sequencer_;
+    GpTimerStepGenerator gptimer_generator_;
     BresenhamState bresenham_;
 
     // Pre-computed step intervals for velocity profiles

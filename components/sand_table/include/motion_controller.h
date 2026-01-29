@@ -162,12 +162,9 @@ private:
     std::atomic<bool> paused_{false};
     std::atomic<bool> running_{false};
 
-    // Current position tracking
-    // We track position in STEPS (integer) to avoid floating-point accumulation errors.
-    // Polar position is derived from steps only when needed for display/API.
-    mutable SemaphoreHandle_t position_mutex_;
-    int32_t target_theta_steps_{0};  // Accumulated target theta position in steps
-    int32_t target_rho_steps_{0};    // Accumulated target rho position in steps
+    // Position tracking: uses actual motor positions directly
+    // No need for separate "target" tracking - motor positions are the source of truth
+    // (Polar position is derived from motor steps only when needed for display/API)
 
     // FreeRTOS tasks
     TaskHandle_t stepper_task_ = nullptr;
@@ -185,9 +182,12 @@ private:
     static void inactivity_timer_callback(TimerHandle_t timer);
 
     // Internal helpers
-    void update_position(int32_t theta_steps, int32_t rho_steps);
     void reset_inactivity_timer();
     Result<void> init_tmc();
+
+    // Position overflow handling (like main branch's handleStepOverflow)
+    // Wraps theta position when it exceeds ±1 rotation and adjusts rho accordingly
+    void handle_position_overflow();
 
     // Segment handling
     bool enqueue_segment(MotionSegment& segment);

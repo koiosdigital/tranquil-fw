@@ -215,6 +215,10 @@ Result<void> RmtStepSequencer::init(gpio_num_t theta_step, gpio_num_t rho_step) 
         return Result<void>::err(MotionError::HardwareFault);
     }
 
+    // Allow RMT hardware to stabilize before first transmission
+    // This helps prevent timing issues on the first segment (first move speed bug)
+    vTaskDelay(pdMS_TO_TICKS(1));
+
     // Create sync manager AFTER channels are enabled
     rmt_channel_handle_t channels[] = {theta_channel_, rho_channel_};
     rmt_sync_manager_config_t sync_config = {
@@ -599,14 +603,33 @@ CoordinatedStepperController::~CoordinatedStepperController() {
 }
 
 Result<void> CoordinatedStepperController::init() {
-    // Initialize RMT step sequencer
-    auto result = rmt_sequencer_.init(theta_.step_pin(), rho_.step_pin());
-    if (result.is_err()) {
-        ESP_LOGE(TAG, "Failed to initialize RMT step sequencer");
-        return result;
+    // IMPORTANT: Only initialize ONE step generator because they both use the same GPIO pins.
+    // RMT takes ownership of pins when initialized, preventing direct GPIO access.
+    // GPTimer uses direct GPIO access for step pulses.
+    //
+    // TO SWITCH BACK TO RMT-ONLY: Change step_mode_ default to StepGeneratorMode::RMT
+
+    if (step_mode_ == StepGeneratorMode::GPTimer) {
+        // Initialize GPTimer step generator (direct GPIO access like main branch)
+        auto gptimer_result = gptimer_generator_.init(
+            theta_.step_pin(), theta_.dir_pin(),
+            rho_.step_pin(), rho_.dir_pin()
+        );
+        if (gptimer_result.is_err()) {
+            ESP_LOGE(TAG, "Failed to initialize GPTimer step generator");
+            return gptimer_result;
+        }
+        ESP_LOGI(TAG, "Coordinated stepper controller initialized (GPTimer mode)");
+    } else {
+        // Initialize RMT step sequencer (takes ownership of step pins)
+        auto result = rmt_sequencer_.init(theta_.step_pin(), rho_.step_pin());
+        if (result.is_err()) {
+            ESP_LOGE(TAG, "Failed to initialize RMT step sequencer");
+            return result;
+        }
+        ESP_LOGI(TAG, "Coordinated stepper controller initialized (RMT mode)");
     }
 
-    ESP_LOGI(TAG, "Coordinated stepper controller initialized (RMT mode)");
     return Result<void>::ok();
 }
 
@@ -622,6 +645,7 @@ void CoordinatedStepperController::disable() {
 
 void CoordinatedStepperController::emergency_stop() {
     rmt_sequencer_.stop();
+    gptimer_generator_.stop();
     bresenham_.clear();
 }
 
@@ -642,7 +666,6 @@ VelocityProfile CoordinatedStepperController::calculate_velocity_profile(
 
     // Simplified constant velocity profile (like main branch)
     // nominal_velocity is in RPM
-    // For normalized distance motion, calculate step rate based on RPM and motion distance
     float feedrate_rpm = segment.nominal_velocity;
     if (feedrate_rpm <= 0) {
         feedrate_rpm = static_cast<float>(MotionConfig::RHO_MAX_SPEED_RPM);
@@ -655,17 +678,25 @@ VelocityProfile CoordinatedStepperController::calculate_velocity_profile(
         motion_time_seconds = segment.distance / (feedrate_rpm / 60.0f);
     }
 
+    // CRITICAL: Ensure minimum motion time based on step count and max velocity
+    // This prevents extremely fast moves when Cartesian distance is small but step count is large
+    // (happens when theta changes significantly at small rho values)
+    const float max_step_rate = static_cast<float>(HardwareConfig::MAX_STEP_RATE_HZ);
+    const float min_motion_time = static_cast<float>(total_steps) / max_step_rate;
+    if (motion_time_seconds < min_motion_time) {
+        motion_time_seconds = min_motion_time;
+    }
+
     // Calculate steps per second for constant velocity
     if (motion_time_seconds > 0.0f) {
         profile.cruise_velocity = static_cast<float>(total_steps) / motion_time_seconds;
     } else {
-        // Fallback: use a reasonable default step rate
-        profile.cruise_velocity = feedrate_rpm * steps_per_unit / 60.0f;
+        // Fallback: use max step rate
+        profile.cruise_velocity = max_step_rate;
     }
 
     // Clamp to hardware limits
     // Min velocity limited by RMT symbol max duration (~3278µs = 305 steps/s)
-    const float max_step_rate = static_cast<float>(HardwareConfig::MAX_STEP_RATE_HZ);
     const float min_step_rate = 310.0f;  // Limited by RMT symbol duration
     profile.cruise_velocity = std::max(min_step_rate, std::min(profile.cruise_velocity, max_step_rate));
 
@@ -683,10 +714,50 @@ VelocityProfile CoordinatedStepperController::calculate_velocity_profile(
 Result<void> CoordinatedStepperController::execute_segment(
     const MotionSegment& segment)
 {
-    if (rmt_sequencer_.is_executing()) {
-        return Result<void>::err(MotionError::InvalidState);
+    // Check if already executing based on current mode
+    if (step_mode_ == StepGeneratorMode::GPTimer) {
+        if (gptimer_generator_.is_executing()) {
+            return Result<void>::err(MotionError::InvalidState);
+        }
+    } else {
+        if (rmt_sequencer_.is_executing()) {
+            return Result<void>::err(MotionError::InvalidState);
+        }
     }
 
+    // Calculate total steps for Bresenham (major axis)
+    const uint32_t total_steps = static_cast<uint32_t>(
+        std::max(std::abs(segment.delta_theta_steps), std::abs(segment.delta_rho_steps)));
+
+    // No steps to execute
+    if (total_steps == 0) {
+        return Result<void>::ok();
+    }
+
+    // Set directions
+    theta_.set_direction(segment.delta_theta_steps >= 0);
+    rho_.set_direction(segment.delta_rho_steps >= 0);
+
+    // Branch based on step generator mode
+    // TO SWITCH BACK TO RMT-ONLY: Remove GPTimer branch or set step_mode_ = RMT
+    if (step_mode_ == StepGeneratorMode::GPTimer) {
+        // GPTimer mode: Direct execution like main branch
+        // Uses single Bresenham calculation, simpler timing
+        ESP_LOGD(TAG, "GPTimer segment: theta=%ld, rho=%ld, dist=%.4f, rpm=%.1f",
+                 segment.delta_theta_steps, segment.delta_rho_steps,
+                 segment.distance, segment.nominal_velocity);
+
+        return gptimer_generator_.execute(
+            segment.delta_theta_steps,
+            segment.delta_rho_steps,
+            segment.nominal_velocity,
+            segment.distance,
+            theta_.position_,
+            rho_.position_
+        );
+    }
+
+    // RMT mode: Original implementation with interval table
     // Setup Bresenham state
     bresenham_.theta_remaining = std::abs(segment.delta_theta_steps);
     bresenham_.rho_remaining = std::abs(segment.delta_rho_steps);
@@ -699,19 +770,6 @@ Result<void> CoordinatedStepperController::execute_segment(
     const int32_t major = std::max(bresenham_.theta_total, bresenham_.rho_total);
     bresenham_.error = major / 2;
 
-    // Set directions
-    theta_.set_direction(bresenham_.theta_dir > 0);
-    rho_.set_direction(bresenham_.rho_dir > 0);
-
-    // Calculate total steps for Bresenham (major axis)
-    const uint32_t total_steps = static_cast<uint32_t>(
-        std::max(bresenham_.theta_remaining, bresenham_.rho_remaining));
-
-    // No steps to execute
-    if (total_steps == 0) {
-        return Result<void>::ok();
-    }
-
     // Calculate velocity profile
     const float steps_per_unit = (segment.distance > 0.0f)
         ? static_cast<float>(total_steps) / segment.distance
@@ -721,9 +779,16 @@ Result<void> CoordinatedStepperController::execute_segment(
     // Pre-compute interval table (all FPU operations happen here, in task context)
     prepare_interval_table(profile, total_steps);
 
-    ESP_LOGD(TAG, "Segment: theta=%ld, rho=%ld, total=%lu, cruise_v=%.1f",
+    // Debug: Validate first interval (for first move speed issue)
+    constexpr uint32_t min_interval_us = 1000000 / HardwareConfig::MAX_STEP_RATE_HZ;  // 20us
+    if (interval_table_.intervals[0] < min_interval_us) {
+        ESP_LOGW(TAG, "First interval too fast: %u us (min: %lu us)",
+                 interval_table_.intervals[0], min_interval_us);
+    }
+
+    ESP_LOGD(TAG, "RMT segment: theta=%ld, rho=%ld, total=%lu, cruise_v=%.1f, interval[0]=%u us",
              segment.delta_theta_steps, segment.delta_rho_steps,
-             total_steps, profile.cruise_velocity);
+             total_steps, profile.cruise_velocity, interval_table_.intervals[0]);
 
     // Execute via RMT sequencer (blocking)
     return rmt_sequencer_.execute(

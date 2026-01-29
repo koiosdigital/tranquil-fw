@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "src/stepper_driver.cpp"
+        "src/gptimer_step_generator.cpp"
         "src/homing_controller.cpp"
         "src/motion_controller.cpp"
     INCLUDE_DIRS
@@ -12,5 +13,6 @@ idf_component_register(
         esp_timer
         freertos
         esp_system
+        esp_hw_support
         tmcstepper
 )
