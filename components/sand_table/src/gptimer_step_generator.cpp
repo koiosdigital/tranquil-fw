@@ -1,13 +1,8 @@
-// GPTimer-based step generator for A/B testing against RMT implementation.
-// This implementation closely matches the main branch's PolarRobot timer approach.
-//
-// TO SWITCH BACK TO RMT-ONLY:
-// - In CoordinatedStepperController, set step_mode_ = StepGeneratorMode::RMT
-// - Or simply don't call set_step_generator_mode()
+// GPTimer-based step generator using fixed-interval + accumulator approach.
+// This matches RBotFirmware's proven timer architecture for reliable stepping.
 
 #include "gptimer_step_generator.h"
 #include "esp_log.h"
-#include "esp_rom_sys.h"
 
 #include <cmath>
 #include <algorithm>
@@ -35,14 +30,12 @@ Result<void> GpTimerStepGenerator::init(
     rho_step_pin_ = rho_step;
     rho_dir_pin_ = rho_dir;
 
-    // Note: GPIO is already configured by StepperDriver, we just use the pins
-    // Direction pins are also configured by StepperDriver
-
-    // Create GPTimer at 1MHz (matching main branch exactly)
+    // Create GPTimer at 1MHz (1us resolution)
+    // Timer fires every TICK_INTERVAL_US (20us) for fixed-interval stepping
     gptimer_config_t timer_config = {
         .clk_src = GPTIMER_CLK_SRC_DEFAULT,
         .direction = GPTIMER_COUNT_UP,
-        .resolution_hz = 1000000,  // 1MHz = 1us resolution (same as main branch)
+        .resolution_hz = 1000000,  // 1MHz = 1us resolution
         .intr_priority = 0,
         .flags = {
             .intr_shared = false,
@@ -85,8 +78,8 @@ Result<void> GpTimerStepGenerator::init(
     }
 
     initialized_ = true;
-    ESP_LOGI(TAG, "GPTimer step generator initialized (1MHz, pins: theta=%d/%d, rho=%d/%d)",
-             theta_step, theta_dir, rho_step, rho_dir);
+    ESP_LOGI(TAG, "GPTimer initialized (fixed %uus interval, pins: theta=%d/%d, rho=%d/%d)",
+             TICK_INTERVAL_US, theta_step, theta_dir, rho_step, rho_dir);
     return Result<void>::ok();
 }
 
@@ -124,66 +117,79 @@ Result<void> GpTimerStepGenerator::execute(
         return Result<void>::err(MotionError::InvalidState);
     }
 
-    int32_t abs_theta = std::abs(theta_steps);
-    int32_t abs_rho = std::abs(rho_steps);
+    uint32_t abs_theta = static_cast<uint32_t>(std::abs(theta_steps));
+    uint32_t abs_rho = static_cast<uint32_t>(std::abs(rho_steps));
 
     // No steps to execute
     if (abs_theta == 0 && abs_rho == 0) {
         return Result<void>::ok();
     }
 
-    // Set directions via GPIO (matching main branch)
+    // Set directions via GPIO
     gpio_set_level(theta_dir_pin_, theta_steps >= 0 ? 1 : 0);
     gpio_set_level(rho_dir_pin_, rho_steps >= 0 ? 1 : 0);
 
-    // Initialize Bresenham state (matching main branch PolarRobot exactly)
-    // Store original totals for algorithm AND remaining for completion tracking
-    bresenham_.theta_total = abs_theta;
-    bresenham_.rho_total = abs_rho;
-    bresenham_.theta_remaining = abs_theta;
-    bresenham_.rho_remaining = abs_rho;
-    bresenham_.theta_dir = (theta_steps >= 0) ? 1 : -1;
-    bresenham_.rho_dir = (rho_steps >= 0) ? 1 : -1;
+    // Initialize step state
+    state_.clear();
+    state_.theta_total = abs_theta;
+    state_.rho_total = abs_rho;
+    state_.theta_dir = (theta_steps >= 0) ? 1 : -1;
+    state_.rho_dir = (rho_steps >= 0) ? 1 : -1;
 
-    // Initialize Bresenham error term based on which axis has more steps
-    // This matches main branch: positive error for theta-major, negative for rho-major
-    if (bresenham_.theta_total >= bresenham_.rho_total) {
-        bresenham_.error = bresenham_.theta_total / 2;  // Theta is primary axis
+    // Determine which axis has the most steps (drives timing)
+    if (abs_theta >= abs_rho) {
+        state_.max_axis = 0;  // theta
     } else {
-        bresenham_.error = -bresenham_.rho_total / 2;   // Rho is primary axis
+        state_.max_axis = 1;  // rho
     }
 
-    theta_pos_ = &theta_pos;
-    rho_pos_ = &rho_pos;
-
-    // Calculate step interval (matching main branch planMotion logic)
-    uint32_t total_steps = abs_theta + abs_rho;
-    uint64_t step_interval_us;
+    // Calculate step rate in steps/second
+    uint32_t max_steps = std::max(abs_theta, abs_rho);
+    float step_rate_per_sec;
 
     if (feedrate_rpm <= 0) {
         feedrate_rpm = static_cast<float>(MotionConfig::RHO_MAX_SPEED_RPM);
     }
 
-    if (distance > 0.0f && total_steps > 0) {
-        // Calculate interval based on RPM and motion distance
-        // This matches main branch: motionTimeSeconds = totalDistance / (feedRateRPM / 60.0f)
+    if (distance > 0.0f && max_steps > 0) {
+        // motion_time = distance / (feedrate_rpm / 60)
         float motion_time_sec = distance / (feedrate_rpm / 60.0f);
-        step_interval_us = static_cast<uint64_t>((motion_time_sec * 1000000.0f) / total_steps);
+        // Ensure minimum motion time to prevent division issues
+        if (motion_time_sec < 0.001f) {
+            motion_time_sec = 0.001f;
+        }
+        step_rate_per_sec = static_cast<float>(max_steps) / motion_time_sec;
     } else {
-        // Fallback: conservative fixed rate (matching main branch fallback)
-        step_interval_us = 500;  // 2000 steps/sec
+        // Fallback: conservative fixed rate
+        step_rate_per_sec = 2000.0f;
     }
 
-    // Clamp to reasonable bounds (matching main branch: 10kHz max, 1Hz min)
-    step_interval_us = std::max<uint64_t>(100, std::min<uint64_t>(1000000, step_interval_us));
+    // Clamp step rate to hardware limits
+    // Max: 25k steps/sec (each step needs 2 ISR ticks minimum at 50kHz)
+    // Min: 10 steps/sec
+    step_rate_per_sec = std::max(10.0f, std::min(25000.0f, step_rate_per_sec));
+
+    // Convert to TTICKS units: step_rate_per_tticks = (steps_per_sec * TTICKS_VALUE) / TICKS_PER_SEC
+    state_.step_rate_per_tticks = static_cast<uint64_t>(
+        (static_cast<double>(step_rate_per_sec) * static_cast<double>(TTICKS_VALUE)) /
+        static_cast<double>(TICKS_PER_SEC)
+    );
+
+    // Ensure minimum step rate
+    if (state_.step_rate_per_tticks < MIN_STEP_RATE_PER_TTICKS) {
+        state_.step_rate_per_tticks = MIN_STEP_RATE_PER_TTICKS;
+    }
+
+    theta_pos_ = &theta_pos;
+    rho_pos_ = &rho_pos;
 
     executing_.store(true, std::memory_order_release);
     stop_requested_.store(false, std::memory_order_release);
     xSemaphoreTake(completion_sem_, 0);  // Clear semaphore
 
-    // Start timer with calculated interval (auto-reload for continuous stepping)
+    // Configure timer for fixed interval (TICK_INTERVAL_US microseconds)
     gptimer_alarm_config_t alarm_config = {
-        .alarm_count = step_interval_us,
+        .alarm_count = TICK_INTERVAL_US,
         .reload_count = 0,
         .flags = {
             .auto_reload_on_alarm = true,
@@ -205,14 +211,13 @@ Result<void> GpTimerStepGenerator::execute(
         return Result<void>::err(MotionError::HardwareFault);
     }
 
-    ESP_LOGI(TAG, "GPTimer started: theta=%ld (dir=%d), rho=%ld (dir=%d), interval=%llu us",
-             theta_steps, bresenham_.theta_dir, rho_steps, bresenham_.rho_dir,
-             step_interval_us);
+    ESP_LOGI(TAG, "Motion started: theta=%ld, rho=%ld, rate=%.0f steps/s",
+             theta_steps, rho_steps, step_rate_per_sec);
 
-    // Wait for completion (with timeout)
-    const TickType_t timeout_ticks = pdMS_TO_TICKS(30000);  // 30 second timeout
+    // Wait for completion
+    const TickType_t timeout_ticks = pdMS_TO_TICKS(30000);
     if (xSemaphoreTake(completion_sem_, timeout_ticks) != pdTRUE) {
-        ESP_LOGE(TAG, "GPTimer execution timeout");
+        ESP_LOGE(TAG, "Execution timeout");
         stop();
         return Result<void>::err(MotionError::Timeout);
     }
@@ -221,10 +226,6 @@ Result<void> GpTimerStepGenerator::execute(
         return Result<void>::err(MotionError::EmergencyStop);
     }
 
-    // Log final positions for debugging
-    int32_t final_theta = theta_pos_->load(std::memory_order_acquire);
-    int32_t final_rho = rho_pos_->load(std::memory_order_acquire);
-    ESP_LOGI(TAG, "GPTimer motion complete: final pos theta=%ld, rho=%ld", final_theta, final_rho);
     return Result<void>::ok();
 }
 
@@ -235,10 +236,13 @@ void GpTimerStepGenerator::stop() {
         gptimer_stop(step_timer_);
     }
 
-    bresenham_.clear();
+    // Clear any pending step pulses
+    gpio_set_level(theta_step_pin_, 0);
+    gpio_set_level(rho_step_pin_, 0);
+
+    state_.clear();
     executing_.store(false, std::memory_order_release);
 
-    // Signal completion in case execute() is waiting
     if (completion_sem_) {
         xSemaphoreGive(completion_sem_);
     }
@@ -250,13 +254,37 @@ bool IRAM_ATTR GpTimerStepGenerator::timer_callback(
     void* user_ctx)
 {
     auto* self = static_cast<GpTimerStepGenerator*>(user_ctx);
-    self->generate_step();
-    return true;  // Return true to yield if higher priority task is woken
+    self->isr_step_handler();
+    return false;  // No context switch needed unless we signal completion
 }
 
-void IRAM_ATTR GpTimerStepGenerator::generate_step() {
+void IRAM_ATTR GpTimerStepGenerator::isr_step_handler() {
     // Check for stop request
     if (stop_requested_.load(std::memory_order_acquire)) {
+        gptimer_stop(step_timer_);
+        // Clear any pending step pulses
+        gpio_set_level(theta_step_pin_, 0);
+        gpio_set_level(rho_step_pin_, 0);
+        executing_.store(false, std::memory_order_release);
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        xSemaphoreGiveFromISR(completion_sem_, &xHigherPriorityTaskWoken);
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+        return;
+    }
+
+    // Handle step pulse endings first - ensures minimum pulse width
+    // This also updates position for each completed step
+    bool steps_ended = handle_step_end();
+
+    // Check if we've completed all steps AND ended all pulses
+    // Both counts must match totals AND no pulses pending
+    bool motion_complete =
+        (state_.theta_count >= state_.theta_total) &&
+        (state_.rho_count >= state_.rho_total) &&
+        !state_.theta_step_pending &&
+        !state_.rho_step_pending;
+
+    if (motion_complete) {
         gptimer_stop(step_timer_);
         executing_.store(false, std::memory_order_release);
         BaseType_t xHigherPriorityTaskWoken = pdFALSE;
@@ -265,60 +293,77 @@ void IRAM_ATTR GpTimerStepGenerator::generate_step() {
         return;
     }
 
-    bool step_theta = false;
-    bool step_rho = false;
+    // NOTE: Don't early return after steps_ended - this was causing timing errors.
+    // RBotFirmware processes accumulator every tick regardless of step endings.
+    // Early return was skipping accumulator updates, causing ~33% slower motion.
 
-    // Use ORIGINAL totals for Bresenham algorithm (not remaining counts!)
-    // This is critical - the algorithm needs constant values throughout the move
-    int32_t thetaS = bresenham_.theta_total;
-    int32_t rhoS = bresenham_.rho_total;
+    // Add step rate to accumulator
+    state_.step_accumulator += state_.step_rate_per_tticks;
 
-    // Bresenham algorithm - exact match to main branch generateSteps()
-    // This is the critical section that must match for identical behavior
-    if (thetaS >= rhoS) {
-        // Theta is primary axis
-        bresenham_.error -= rhoS;
-        if (bresenham_.error < 0) {
-            bresenham_.error += thetaS;
-            step_rho = true;
-        }
-        step_theta = (bresenham_.theta_remaining > 0);
-    } else {
-        // Rho is primary axis
-        bresenham_.error += thetaS;
-        if (bresenham_.error > 0) {
-            bresenham_.error -= rhoS;
-            step_theta = true;
-        }
-        step_rho = (bresenham_.rho_remaining > 0);
+    // Check for accumulator overflow - time to generate steps
+    if (state_.step_accumulator >= TTICKS_VALUE) {
+        // Subtract overflow value (keep remainder for sub-tick precision)
+        state_.step_accumulator -= TTICKS_VALUE;
+
+        // Generate coordinated steps
+        handle_step_motion();
     }
+}
 
-    // Generate step pulses (matching main branch timing)
-    if (step_theta && bresenham_.theta_remaining > 0) {
-        gpio_set_level(theta_step_pin_, 1);
-        esp_rom_delay_us(HardwareConfig::MIN_STEP_PULSE_US);  // 2us pulse
+bool IRAM_ATTR GpTimerStepGenerator::handle_step_end() {
+    bool any_ended = false;
+
+    // End theta step pulse if pending
+    if (state_.theta_step_pending) {
         gpio_set_level(theta_step_pin_, 0);
-
-        bresenham_.theta_remaining--;
-        theta_pos_->fetch_add(bresenham_.theta_dir, std::memory_order_release);
+        state_.theta_step_pending = false;
+        theta_pos_->fetch_add(state_.theta_dir, std::memory_order_release);
+        any_ended = true;
     }
 
-    if (step_rho && bresenham_.rho_remaining > 0) {
-        gpio_set_level(rho_step_pin_, 1);
-        esp_rom_delay_us(HardwareConfig::MIN_STEP_PULSE_US);  // 2us pulse
+    // End rho step pulse if pending
+    if (state_.rho_step_pending) {
         gpio_set_level(rho_step_pin_, 0);
-
-        bresenham_.rho_remaining--;
-        rho_pos_->fetch_add(bresenham_.rho_dir, std::memory_order_release);
+        state_.rho_step_pending = false;
+        rho_pos_->fetch_add(state_.rho_dir, std::memory_order_release);
+        any_ended = true;
     }
 
-    // Check for completion
-    if (bresenham_.theta_remaining == 0 && bresenham_.rho_remaining == 0) {
-        gptimer_stop(step_timer_);
-        executing_.store(false, std::memory_order_release);
-        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-        xSemaphoreGiveFromISR(completion_sem_, &xHigherPriorityTaskWoken);
-        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    return any_ended;
+}
+
+void IRAM_ATTR GpTimerStepGenerator::handle_step_motion() {
+    // Get max axis references
+    uint32_t max_steps = (state_.max_axis == 0) ? state_.theta_total : state_.rho_total;
+    uint32_t& max_count = (state_.max_axis == 0) ? state_.theta_count : state_.rho_count;
+    uint32_t minor_steps = (state_.max_axis == 0) ? state_.rho_total : state_.theta_total;
+    uint32_t& minor_count = (state_.max_axis == 0) ? state_.rho_count : state_.theta_count;
+    gpio_num_t max_pin = (state_.max_axis == 0) ? theta_step_pin_ : rho_step_pin_;
+    gpio_num_t minor_pin = (state_.max_axis == 0) ? rho_step_pin_ : theta_step_pin_;
+    bool& max_pending = (state_.max_axis == 0) ? state_.theta_step_pending : state_.rho_step_pending;
+    bool& minor_pending = (state_.max_axis == 0) ? state_.rho_step_pending : state_.theta_step_pending;
+
+    // Step the major axis if not complete
+    if (max_count < max_steps) {
+        gpio_set_level(max_pin, 1);
+        max_pending = true;
+        max_count++;
+    }
+
+    // Check if minor axis needs to step (relative accumulator approach)
+    // This is equivalent to Bresenham but matches RBotFirmware's implementation
+    if (minor_count < minor_steps) {
+        // Add minor axis total to relative accumulator
+        state_.relative_accumulator += minor_steps;
+
+        // If accumulator overflows max axis total, step the minor axis
+        if (state_.relative_accumulator >= max_steps) {
+            state_.relative_accumulator -= max_steps;
+
+            gpio_set_level(minor_pin, 1);
+            minor_pending = true;
+            minor_count++;
+        }
     }
 }
 

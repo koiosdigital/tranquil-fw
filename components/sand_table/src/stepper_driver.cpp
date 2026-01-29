@@ -636,6 +636,10 @@ Result<void> CoordinatedStepperController::init() {
 void CoordinatedStepperController::enable() {
     theta_.set_enabled(true);
     rho_.set_enabled(true);
+
+    // 250ms warmup delay after enabling motors
+    // TMC drivers need time to stabilize after enable
+    vTaskDelay(pdMS_TO_TICKS(250));
 }
 
 void CoordinatedStepperController::disable() {

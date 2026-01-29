@@ -71,7 +71,7 @@ menu "Theta Axis Configuration"
 
     config ROBOT_THETA_MOTOR_CURRENT
         int "Theta Motor Current (mA)"
-        default 400
+        default 675
 
     config ROBOT_THETA_INVERT_DIRECTION
         bool "Invert Theta Direction"
@@ -109,7 +109,7 @@ menu "Rho Axis Configuration"
 
     config ROBOT_RHO_MOTOR_CURRENT
         int "Rho Motor Current (mA)"
-        default 400
+        default 675
 
     config ROBOT_RHO_INVERT_DIRECTION
         bool "Invert Rho Direction"

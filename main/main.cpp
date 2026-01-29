@@ -68,13 +68,10 @@ extern "C" void app_main(void)
     api_init();
 
     // Development: Skip homing, use estimated calibration values
-    // theta_steps_per_rot = EFFECTIVE_STEPS_PER_REV * THETA_GEAR_RATIO
-    //                     = (200 * 16) * 4 = 12800 steps per rotation
+    // theta_steps_per_rot = STEPS_PER_THETA_ROTATION (integer constant, no float math)
+    //                     = (200 * 16 * 800) / 100 = 25600 steps per rotation
     // rho_max_steps = estimated ~3 rotations of travel = 200 * 16 * 3 = 9600 steps
-    constexpr int32_t theta_steps_per_rot = static_cast<int32_t>(
-        sand_table::MechanicalConfig::EFFECTIVE_STEPS_PER_REV *
-        sand_table::MechanicalConfig::THETA_GEAR_RATIO
-        );
+    constexpr int32_t theta_steps_per_rot = sand_table::MechanicalConfig::STEPS_PER_THETA_ROTATION;
     constexpr int32_t rho_max_steps = 200 * 16 * 3;  // ~3 rotations of travel (estimate)
     g_motion_controller->_set_homed(theta_steps_per_rot, rho_max_steps);
     ESP_LOGI(TAG, "Development mode: Homing skipped (theta=%ld steps/rot, rho=%ld max)",
@@ -82,7 +79,7 @@ extern "C" void app_main(void)
 
     // Draw shapes using linear interpolation in Cartesian space
     // Test pattern: 3 squares, 2 triangles, 1 hexagon, return to center
-    constexpr float feedrate = 25.0f;   // RPM
+    constexpr float feedrate = 10.0f;   // RPM
 
     ESP_LOGI(TAG, "Starting shape demo: 3 squares + 2 triangles + hexagon, feedrate=%.1f RPM", feedrate);
 

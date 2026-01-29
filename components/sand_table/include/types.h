@@ -223,17 +223,21 @@ struct MotionCommand {
 // =============================================================================
 
 /// Normalize angle to [0, 2π) range
+/// Uses fmod for efficiency and to avoid iterative precision loss
 [[nodiscard]] inline double normalize_angle(double angle) noexcept {
-    while (angle < 0.0) angle += 2.0 * M_PI;
-    while (angle >= 2.0 * M_PI) angle -= 2.0 * M_PI;
+    constexpr double TWO_PI = 2.0 * M_PI;
+    angle = std::fmod(angle, TWO_PI);
+    if (angle < 0.0) angle += TWO_PI;
     return angle;
 }
 
 /// Calculate minimum rotation between two angles (returns value in [-π, π])
+/// Uses fmod for efficiency and to avoid iterative precision loss
 [[nodiscard]] inline double calculate_min_rotation(double target, double current) noexcept {
-    double diff = target - current;
-    while (diff > M_PI) diff -= 2.0 * M_PI;
-    while (diff < -M_PI) diff += 2.0 * M_PI;
+    constexpr double TWO_PI = 2.0 * M_PI;
+    double diff = std::fmod(target - current, TWO_PI);
+    if (diff > M_PI) diff -= TWO_PI;
+    else if (diff < -M_PI) diff += TWO_PI;
     return diff;
 }
 

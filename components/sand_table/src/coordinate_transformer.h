@@ -121,8 +121,8 @@ private:
     double rho_fractional_accumulator_ = 0.0;
 
     // Config constants - use double precision for accurate coupling compensation
-    // FIX: Changed from float to double to prevent precision loss over many segments
-    static constexpr double kGearRatio = static_cast<double>(MechanicalConfig::THETA_GEAR_RATIO);
+    // THETA_GEAR_RATIO is now double in config.h (no float intermediate)
+    static constexpr double kGearRatio = MechanicalConfig::THETA_GEAR_RATIO;
 };
 
 } // namespace sand_table

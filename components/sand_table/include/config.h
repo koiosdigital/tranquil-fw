@@ -46,21 +46,30 @@ namespace sand_table {
         static constexpr uint32_t MICROSTEPS = 16;  // TMC2209 microstepping
         static constexpr uint32_t EFFECTIVE_STEPS_PER_REV = STEPS_PER_REV * MICROSTEPS;
 
-        // Theta axis: Belt drive with gear ratio (stored as x100 in config)
-        static constexpr float THETA_GEAR_RATIO = CONFIG_ROBOT_THETA_GEAR_RATIO / 100.0f;
+        // Theta axis: Belt drive with gear ratio
+        // Store as integer x100 to avoid float precision issues in step calculations
+        static constexpr int32_t THETA_GEAR_RATIO_X100 = CONFIG_ROBOT_THETA_GEAR_RATIO;
+        // For calculations that need the actual ratio as double (coupling compensation)
+        static constexpr double THETA_GEAR_RATIO = CONFIG_ROBOT_THETA_GEAR_RATIO / 100.0;
+
+        // Steps per full theta (drive gear) rotation - INTEGER ONLY
+        // = motor_steps * microsteps * gear_ratio
+        // Using x100 ratio: (200 * 16 * 800) / 100 = 25600
+        static constexpr int32_t STEPS_PER_THETA_ROTATION =
+            (STEPS_PER_REV * MICROSTEPS * THETA_GEAR_RATIO_X100) / 100;
 
         // Rho axis: Rack and pinion (only used during homing calibration)
         static constexpr int32_t PINION_PITCH_DIAMETER_MM = CONFIG_ROBOT_PINION_DIAMETER_MM;
-        static constexpr float PINION_CIRCUMFERENCE_MM = PINION_PITCH_DIAMETER_MM * static_cast<float>(M_PI);
+        static constexpr double PINION_CIRCUMFERENCE_MM = PINION_PITCH_DIAMETER_MM * M_PI;
 
         // Rho steps per mm (only used during homing to convert physical movement)
-        static constexpr float RHO_STEPS_PER_MM =
-            static_cast<float>(EFFECTIVE_STEPS_PER_REV) / PINION_CIRCUMFERENCE_MM;
+        static constexpr double RHO_STEPS_PER_MM =
+            static_cast<double>(EFFECTIVE_STEPS_PER_REV) / PINION_CIRCUMFERENCE_MM;
 
         // Coupling compensation: rho steps per theta motor step
         // = 1 / gear_ratio (since rho and theta have same motor/microstep config)
         // When theta rotates, rho moves due to rack-and-pinion coupling
-        static constexpr float RHO_STEPS_PER_THETA_STEP = 1.0f / THETA_GEAR_RATIO;
+        static constexpr double RHO_STEPS_PER_THETA_STEP = 100.0 / THETA_GEAR_RATIO_X100;
     };
 
     // =============================================================================

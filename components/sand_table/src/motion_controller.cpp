@@ -358,6 +358,9 @@ namespace sand_table {
 
         bool wrapped = false;
 
+        // Wrap when theta reaches ± full rotation
+        // Use >= / <= to ensure exact rotation boundary wraps
+        // After wrapping: theta is in range (-theta_rot, theta_rot)
         while (theta_steps >= theta_rot) {
             theta_steps -= theta_rot;
             rho_steps -= rho_per_theta_rot;
@@ -375,10 +378,11 @@ namespace sand_table {
             theta_stepper_->set_position(theta_steps);
             rho_stepper_->set_position(rho_steps);
 
-            // CRITICAL: Reset fractional accumulator when wrapping
-            // The integer adjustment handles the bulk coupling compensation,
-            // fractional error accumulated before wrap is negligible
-            transformer_->reset_accumulators();
+            // NOTE: Do NOT reset fractional accumulators during wrap!
+            // The wrap is a position counter adjustment, not a motion.
+            // Accumulators track fractional step remainders across many segments.
+            // Resetting them here loses up to 0.5 steps per wrap, which accumulates
+            // to significant error over patterns with many rotations.
         }
     }
 
