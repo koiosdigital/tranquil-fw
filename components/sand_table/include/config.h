@@ -58,8 +58,8 @@ namespace sand_table {
         static constexpr int32_t RHO_MAX_MM = CONFIG_ROBOT_RHO_MAX_MM;
 
         // Coupling compensation direction (determined empirically)
-        // If theta CCW causes rho to increase, use -1. If decrease, use +1.
-        static constexpr int8_t COUPLING_DIRECTION = -1;
+        // Must match main branch behavior: ADD theta/gear_ratio to rho
+        static constexpr int8_t COUPLING_DIRECTION = +1;
 
         // ==========================================================================
         // Derived Constants (calculated at compile time from config values)

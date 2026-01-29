@@ -78,7 +78,7 @@ extern "C" void app_main(void)
 
     // Draw a square pattern at constant rho, 4 positions at 90° intervals
     constexpr float rho = 50.0f;       // mm (midpoint of 5-150mm range)
-    constexpr float feedrate = 30.0f;  // mm/s
+    constexpr float feedrate = 50.0f;  // mm/s
 
     ESP_LOGI(TAG, "Starting square demo at rho=%.1fmm, feedrate=%.1fmm/s", rho, feedrate);
 
@@ -90,7 +90,7 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "Queuing move to theta=%.1f°, rho=%.1fmm", pos.theta, pos.rho);
     g_motion_controller->move_to(pos, feedrate);
 
-    pos.theta = 90.0f;
+    pos.theta = 270.0f;
     ESP_LOGI(TAG, "Queuing move to theta=%.1f°, rho=%.1fmm", pos.theta, pos.rho);
     g_motion_controller->move_to(pos, feedrate);
 

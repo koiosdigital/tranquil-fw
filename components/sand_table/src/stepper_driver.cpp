@@ -282,15 +282,16 @@ Result<void> CoordinatedStepperController::execute_segment(
     theta_.set_direction(bresenham_.theta_dir > 0);
     rho_.set_direction(bresenham_.rho_dir > 0);
 
-    // Calculate velocity profile
-    // Use the average steps per mm for coordinated motion
-    const float avg_steps_per_mm = (MechanicalConfig::THETA_STEPS_PER_DEG +
-                                    MechanicalConfig::RHO_STEPS_PER_MM) / 2.0f;
-    const VelocityProfile profile = calculate_velocity_profile(segment, avg_steps_per_mm);
-
     // Calculate total steps for Bresenham (major axis)
     const uint32_t total_steps = static_cast<uint32_t>(
         std::max(bresenham_.theta_remaining, bresenham_.rho_remaining));
+
+    // Calculate velocity profile
+    // Derive steps_per_mm from actual segment: total steps / path length in mm
+    const float steps_per_mm = (segment.length_mm > 0.0f)
+        ? static_cast<float>(total_steps) / segment.length_mm
+        : MechanicalConfig::RHO_STEPS_PER_MM;  // Fallback for zero-length
+    const VelocityProfile profile = calculate_velocity_profile(segment, steps_per_mm);
 
     // No steps to execute
     if (total_steps == 0) {
