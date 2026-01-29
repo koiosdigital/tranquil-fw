@@ -27,10 +27,16 @@ HomingController::HomingController(
 HomingController::~HomingController() {
     abort();
     gpio_isr_handler_remove(PinConfig::THETA_HALL);
+    gpio_isr_handler_remove(PinConfig::RHO_DIAG);
     g_homing_instance = nullptr;
 }
 
 Result<void> HomingController::init() {
+    ESP_LOGI(TAG, "Initializing homing controller...");
+    ESP_LOGI(TAG, "  Hall sensor pin: GPIO%d", PinConfig::THETA_HALL);
+    ESP_LOGI(TAG, "  Rho DIAG pin: GPIO%d", PinConfig::RHO_DIAG);
+    ESP_LOGI(TAG, "  StallGuard threshold: %d", MotionConfig::RHO_STALLGUARD_THRESHOLD);
+
     // Configure Hall sensor GPIO with interrupt
     gpio_config_t hall_config = {
         .pin_bit_mask = (1ULL << PinConfig::THETA_HALL),
@@ -42,6 +48,20 @@ Result<void> HomingController::init() {
 
     if (gpio_config(&hall_config) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to configure Hall sensor GPIO");
+        return Result<void>::err(MotionError::HardwareFault);
+    }
+
+    // Configure StallGuard DIAG pin with interrupt
+    gpio_config_t diag_config = {
+        .pin_bit_mask = (1ULL << PinConfig::RHO_DIAG),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type = GPIO_INTR_POSEDGE,  // DIAG goes high on stall
+    };
+
+    if (gpio_config(&diag_config) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to configure StallGuard DIAG GPIO");
         return Result<void>::err(MotionError::HardwareFault);
     }
 
@@ -58,8 +78,23 @@ Result<void> HomingController::init() {
         return Result<void>::err(MotionError::HardwareFault);
     }
 
+    // Add StallGuard DIAG ISR
+    if (gpio_isr_handler_add(PinConfig::RHO_DIAG, diag_isr_handler, this) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to add StallGuard DIAG ISR");
+        return Result<void>::err(MotionError::HardwareFault);
+    }
+
     // Configure StallGuard for rho axis
+    ESP_LOGI(TAG, "Configuring TMC2209 StallGuard...");
     (void)rho_tmc_.set_stallguard_threshold(MotionConfig::RHO_STALLGUARD_THRESHOLD);
+
+    // CRITICAL: Set TCOOLTHRS to enable StallGuard at all speeds
+    // StallGuard only activates when TSTEP < TCOOLTHRS, so 0xFFFFF enables it always
+    (void)rho_tmc_.set_stallguard_min_speed(0xFFFFF);
+
+    // Read back initial DIAG pin state
+    int diag_level = gpio_get_level(PinConfig::RHO_DIAG);
+    ESP_LOGI(TAG, "Initial DIAG pin level: %d", diag_level);
 
     ESP_LOGI(TAG, "Homing controller initialized");
     return Result<void>::ok();
@@ -68,6 +103,12 @@ Result<void> HomingController::init() {
 void IRAM_ATTR HomingController::hall_isr_handler(void* arg) {
     auto* self = static_cast<HomingController*>(arg);
     self->hall_triggered_ = true;
+}
+
+void IRAM_ATTR HomingController::diag_isr_handler(void* arg) {
+    auto* self = static_cast<HomingController*>(arg);
+    self->rho_stall_triggered_ = true;
+    self->diag_isr_count_++;
 }
 
 void HomingController::rho_stall_callback(uint8_t addr, bool stalled) {
@@ -107,19 +148,44 @@ HomingController::HomingResult HomingController::seek_rho_max() {
 
     ESP_LOGI(TAG, "Seeking rho maximum...");
 
-    // Clear stall flag
+    // Clear stall flag and ISR counter
     rho_stall_triggered_ = false;
+    diag_isr_count_ = 0;
+
+    // Check initial DIAG pin state
+    int diag_level = gpio_get_level(PinConfig::RHO_DIAG);
+    ESP_LOGW(TAG, "seek_rho_max: Initial DIAG=%d, stall_triggered=%d",
+             diag_level, rho_stall_triggered_ ? 1 : 0);
 
     // Move outward (positive direction)
     rho_.set_direction(true);
     rho_.set_enabled(true);
 
     uint32_t steps = 0;
+    uint32_t log_interval = 5000;  // Log every 5000 steps
     while (steps < kMaxHomingSteps && !should_stop_rho()) {
         rho_.step_once();
         steps++;
-        esp_rom_delay_us(kHomingStepIntervalUs);
+        esp_rom_delay_us(kRhoHomingStepIntervalUs);
+
+        // Yield to RTOS periodically to prevent watchdog timeout
+        if (steps % kYieldIntervalSteps == 0) {
+            vTaskDelay(1);
+        }
+
+        // Periodic debug logging
+        if (steps % log_interval == 0) {
+            diag_level = gpio_get_level(PinConfig::RHO_DIAG);
+            bool tmc_stalled = rho_tmc_.is_stalled();
+            ESP_LOGW(TAG, "seek_rho_max: steps=%lu, DIAG=%d, tmc_stalled=%d, isr_count=%lu, triggered=%d",
+                     steps, diag_level, tmc_stalled ? 1 : 0, diag_isr_count_, rho_stall_triggered_ ? 1 : 0);
+        }
     }
+
+    // Final debug info
+    diag_level = gpio_get_level(PinConfig::RHO_DIAG);
+    ESP_LOGW(TAG, "seek_rho_max: Stopped at steps=%lu, DIAG=%d, isr_count=%lu, triggered=%d",
+             steps, diag_level, diag_isr_count_, rho_stall_triggered_ ? 1 : 0);
 
     if (abort_requested_.load(std::memory_order_acquire)) {
         result.error = MotionError::EmergencyStop;
@@ -127,12 +193,12 @@ HomingController::HomingResult HomingController::seek_rho_max() {
     }
 
     if (steps >= kMaxHomingSteps) {
-        ESP_LOGE(TAG, "Rho max homing failed - exceeded max steps");
+        ESP_LOGE(TAG, "Rho max homing failed - exceeded max steps (no stall detected)");
         result.error = MotionError::HomingFailed;
         return result;
     }
 
-    ESP_LOGI(TAG, "Rho max found at step %lu", steps);
+    ESP_LOGI(TAG, "Rho max found at step %lu (stall detected)", steps);
     result.success = true;
     result.position_steps = steps;
     return result;
@@ -144,19 +210,44 @@ HomingController::HomingResult HomingController::seek_rho_min() {
 
     ESP_LOGI(TAG, "Seeking rho minimum...");
 
-    // Clear stall flag
+    // Clear stall flag and ISR counter
     rho_stall_triggered_ = false;
+    diag_isr_count_ = 0;
+
+    // Check initial DIAG pin state
+    int diag_level = gpio_get_level(PinConfig::RHO_DIAG);
+    ESP_LOGW(TAG, "seek_rho_min: Initial DIAG=%d, stall_triggered=%d",
+             diag_level, rho_stall_triggered_ ? 1 : 0);
 
     // Move inward (negative direction)
     rho_.set_direction(false);
     rho_.set_enabled(true);
 
     uint32_t steps = 0;
+    uint32_t log_interval = 5000;  // Log every 5000 steps
     while (steps < kMaxHomingSteps && !should_stop_rho()) {
         rho_.step_once();
         steps++;
-        esp_rom_delay_us(kHomingStepIntervalUs);
+        esp_rom_delay_us(kRhoHomingStepIntervalUs);
+
+        // Yield to RTOS periodically to prevent watchdog timeout
+        if (steps % kYieldIntervalSteps == 0) {
+            vTaskDelay(1);
+        }
+
+        // Periodic debug logging
+        if (steps % log_interval == 0) {
+            diag_level = gpio_get_level(PinConfig::RHO_DIAG);
+            bool tmc_stalled = rho_tmc_.is_stalled();
+            ESP_LOGW(TAG, "seek_rho_min: steps=%lu, DIAG=%d, tmc_stalled=%d, isr_count=%lu, triggered=%d",
+                     steps, diag_level, tmc_stalled ? 1 : 0, diag_isr_count_, rho_stall_triggered_ ? 1 : 0);
+        }
     }
+
+    // Final debug info
+    diag_level = gpio_get_level(PinConfig::RHO_DIAG);
+    ESP_LOGW(TAG, "seek_rho_min: Stopped at steps=%lu, DIAG=%d, isr_count=%lu, triggered=%d",
+             steps, diag_level, diag_isr_count_, rho_stall_triggered_ ? 1 : 0);
 
     if (abort_requested_.load(std::memory_order_acquire)) {
         result.error = MotionError::EmergencyStop;
@@ -164,12 +255,12 @@ HomingController::HomingResult HomingController::seek_rho_min() {
     }
 
     if (steps >= kMaxHomingSteps) {
-        ESP_LOGE(TAG, "Rho min homing failed - exceeded max steps");
+        ESP_LOGE(TAG, "Rho min homing failed - exceeded max steps (no stall detected)");
         result.error = MotionError::HomingFailed;
         return result;
     }
 
-    ESP_LOGI(TAG, "Rho min found after %lu steps", steps);
+    ESP_LOGI(TAG, "Rho min found after %lu steps (stall detected)", steps);
     result.success = true;
     result.position_steps = steps;
     return result;
@@ -207,7 +298,12 @@ HomingController::HomingResult HomingController::calibrate_theta() {
                 rho_.step_once();
             }
 
-            esp_rom_delay_us(kHomingStepIntervalUs);
+            esp_rom_delay_us(kThetaHomingStepIntervalUs);
+
+            // Yield to RTOS periodically to prevent watchdog timeout
+            if (backoff_steps % kYieldIntervalSteps == 0) {
+                vTaskDelay(1);
+            }
 
             if (abort_requested_.load(std::memory_order_acquire)) {
                 result.error = MotionError::EmergencyStop;
@@ -245,7 +341,12 @@ HomingController::HomingResult HomingController::calibrate_theta() {
             rho_.step_once();
         }
 
-        esp_rom_delay_us(kHomingStepIntervalUs);
+        esp_rom_delay_us(kThetaHomingStepIntervalUs);
+
+        // Yield to RTOS periodically to prevent watchdog timeout
+        if (seek_steps % kYieldIntervalSteps == 0) {
+            vTaskDelay(1);
+        }
     }
 
     if (abort_requested_.load(std::memory_order_acquire)) {
@@ -283,7 +384,12 @@ HomingController::HomingResult HomingController::calibrate_theta() {
             rho_.step_once();
         }
 
-        esp_rom_delay_us(kHomingStepIntervalUs);
+        esp_rom_delay_us(kThetaHomingStepIntervalUs);
+
+        // Yield to RTOS periodically to prevent watchdog timeout
+        if (rotation_steps % kYieldIntervalSteps == 0) {
+            vTaskDelay(1);
+        }
     }
 
     if (abort_requested_.load(std::memory_order_acquire)) {

@@ -59,7 +59,7 @@ CONFIG_ROBOT_RHO_MOTOR_CURRENT=400
 #
 # StallGuard Configuration
 #
-CONFIG_ROBOT_RHO_STALLGUARD_THRESHOLD=10
+CONFIG_ROBOT_RHO_STALLGUARD_THRESHOLD=30
 # end of StallGuard Configuration
 # end of Rho Axis Configuration
 # end of Polar Robot Motion System

@@ -15,6 +15,7 @@
 #include "sand_table.h"
 #include "ManifestManager.h"
 #include "SandTablePlayer.h"
+#include "types.h"
 
 #include "api.h"
 #include "usb_pd.h"
@@ -41,7 +42,8 @@ extern "C" void app_main(void)
     auto init_result = g_motion_controller->init();
     if (init_result.is_err()) {
         ESP_LOGE(TAG, "Failed to initialize motion controller");
-    } else {
+    }
+    else {
         auto start_result = g_motion_controller->start();
         if (start_result.is_err()) {
             ESP_LOGE(TAG, "Failed to start motion controller");
@@ -70,6 +72,50 @@ extern "C" void app_main(void)
     if (home_result.is_err()) {
         ESP_LOGE(TAG, "Homing failed");
     }
+    else {
+        ESP_LOGI(TAG, "Homing succeeded");
+    }
+
 
     vTaskSuspend(NULL);
+
+    // Draw a square pattern at constant rho, 4 positions at 90° intervals
+    constexpr float rho = 75.0f;       // mm (midpoint of 5-150mm range)
+    constexpr float feedrate = 30.0f;  // mm/s
+
+    ESP_LOGI(TAG, "Starting square demo at rho=%.1fmm, feedrate=%.1fmm/s", rho, feedrate);
+
+    sand_table::PolarPosition pos;
+    pos.rho = rho;
+
+    // Queue all moves - they execute sequentially via the motion planner
+    pos.theta = 0.0f;
+    ESP_LOGI(TAG, "Queuing move to theta=%.1f°, rho=%.1fmm", pos.theta, pos.rho);
+    g_motion_controller->move_to(pos, feedrate);
+
+    pos.theta = 90.0f;
+    ESP_LOGI(TAG, "Queuing move to theta=%.1f°, rho=%.1fmm", pos.theta, pos.rho);
+    g_motion_controller->move_to(pos, feedrate);
+
+    pos.theta = 180.0f;
+    ESP_LOGI(TAG, "Queuing move to theta=%.1f°, rho=%.1fmm", pos.theta, pos.rho);
+    g_motion_controller->move_to(pos, feedrate);
+
+    pos.theta = 270.0f;
+    ESP_LOGI(TAG, "Queuing move to theta=%.1f°, rho=%.1fmm", pos.theta, pos.rho);
+    g_motion_controller->move_to(pos, feedrate);
+
+    pos.theta = 360.0f;
+    ESP_LOGI(TAG, "Queuing move to theta=%.1f°, rho=%.1fmm", pos.theta, pos.rho);
+    g_motion_controller->move_to(pos, feedrate);
+
+    ESP_LOGI(TAG, "All moves queued. Waiting for completion...");
+
+    // Wait for all motions to complete
+    while (g_motion_controller->get_state() == sand_table::SystemState::Running ||
+        g_motion_controller->get_status().queue_depth > 0) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    ESP_LOGI(TAG, "Square demo complete!");
 }

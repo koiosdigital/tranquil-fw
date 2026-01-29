@@ -2,5 +2,5 @@
 dependencies:
   ## Required IDF version
   idf:
-    version: ">=5.5.1"
+    version: ">=5.5.2"
   espressif/mdns: ^1.8.2

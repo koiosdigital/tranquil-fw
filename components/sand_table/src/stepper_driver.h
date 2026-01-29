@@ -143,17 +143,19 @@ private:
         }
     } bresenham_;
 
-    // Velocity profile state
+    // Pre-computed step intervals for FPU-free ISR execution
+    static constexpr size_t kMaxStepsPerSegment = 256;
+
+    struct IntervalTable {
+        uint16_t intervals[kMaxStepsPerSegment];  // Timer ticks per step
+        uint32_t total_steps = 0;                  // Steps in this segment
+
+        void clear() { total_steps = 0; }
+    } interval_table_;
+
+    // Velocity profile state (used for pre-computation, not in ISR)
     struct VelocityState {
-        uint32_t steps_taken = 0;
-        uint32_t accel_steps = 0;
-        uint32_t cruise_steps = 0;
-        uint32_t decel_steps = 0;
-        float current_velocity = 0.0f;
-        float entry_velocity = 0.0f;
-        float cruise_velocity = 0.0f;
-        float exit_velocity = 0.0f;
-        float acceleration = 0.0f;
+        uint32_t steps_taken = 0;  // Current step index (used by ISR)
     } velocity_;
 
     static bool step_timer_callback(
@@ -163,7 +165,7 @@ private:
     );
 
     void generate_step();
-    uint32_t calculate_next_interval();
+    void prepare_interval_table(const VelocityProfile& profile, uint32_t total_steps);
 
     VelocityProfile calculate_velocity_profile(
         const MotionSegment& segment,

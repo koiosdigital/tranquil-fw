@@ -10,6 +10,9 @@ namespace sand_table {
 
 static const char* TAG = "StepperDriver";
 
+// Debug counter for ISR execution
+static volatile uint32_t g_isr_count = 0;
+
 // =============================================================================
 // StepperDriver Implementation
 // =============================================================================
@@ -213,10 +216,10 @@ VelocityProfile CoordinatedStepperController::calculate_velocity_profile(
     profile.exit_velocity = segment.exit_velocity * steps_per_mm;
     profile.acceleration = segment.acceleration * steps_per_mm;
 
-    // Calculate total steps
+    // Calculate total steps - use max to match Bresenham's major axis count
     const uint32_t total_steps = static_cast<uint32_t>(
-        std::abs(segment.delta_theta_steps) + std::abs(segment.delta_rho_steps)
-    ) / 2;  // Average since we're coordinating
+        std::max(std::abs(segment.delta_theta_steps), std::abs(segment.delta_rho_steps))
+    );
 
     if (total_steps == 0 || profile.acceleration <= 0.0f) {
         return profile;
@@ -285,28 +288,40 @@ Result<void> CoordinatedStepperController::execute_segment(
                                     MechanicalConfig::RHO_STEPS_PER_MM) / 2.0f;
     const VelocityProfile profile = calculate_velocity_profile(segment, avg_steps_per_mm);
 
-    // Setup velocity state
-    velocity_.steps_taken = 0;
-    velocity_.accel_steps = profile.accel_steps;
-    velocity_.cruise_steps = profile.cruise_steps;
-    velocity_.decel_steps = profile.decel_steps;
-    velocity_.entry_velocity = profile.entry_velocity;
-    velocity_.cruise_velocity = profile.cruise_velocity;
-    velocity_.exit_velocity = profile.exit_velocity;
-    velocity_.acceleration = profile.acceleration;
-    velocity_.current_velocity = profile.entry_velocity;
+    // Calculate total steps for Bresenham (major axis)
+    const uint32_t total_steps = static_cast<uint32_t>(
+        std::max(bresenham_.theta_remaining, bresenham_.rho_remaining));
 
     // No steps to execute
-    if (bresenham_.theta_remaining == 0 && bresenham_.rho_remaining == 0) {
+    if (total_steps == 0) {
         return Result<void>::ok();
     }
+
+    // Pre-compute interval table (all FPU operations happen here, in task context)
+    prepare_interval_table(profile, total_steps);
+
+    // Debug: Log profile and interval info
+    ESP_LOGI(TAG, "Segment: theta=%ld, rho=%ld, total_steps=%lu",
+             segment.delta_theta_steps, segment.delta_rho_steps, total_steps);
+    ESP_LOGI(TAG, "Profile: accel=%lu, cruise=%lu, decel=%lu, entry_v=%.1f, cruise_v=%.1f, exit_v=%.1f",
+             profile.accel_steps, profile.cruise_steps, profile.decel_steps,
+             profile.entry_velocity, profile.cruise_velocity, profile.exit_velocity);
+    ESP_LOGI(TAG, "Intervals: [0]=%u, [1]=%u, [mid]=%u, total=%lu",
+             interval_table_.intervals[0],
+             interval_table_.total_steps > 1 ? interval_table_.intervals[1] : 0,
+             interval_table_.total_steps > 2 ? interval_table_.intervals[interval_table_.total_steps/2] : 0,
+             interval_table_.total_steps);
+
+    // Reset step counter for ISR
+    velocity_.steps_taken = 0;
+    g_isr_count = 0;  // Reset ISR counter for debugging
 
     // Clear abort flag
     abort_requested_.store(false, std::memory_order_release);
     moving_.store(true, std::memory_order_release);
 
-    // Calculate initial step interval
-    uint32_t interval = calculate_next_interval();
+    // Get initial interval from pre-computed table
+    uint32_t interval = interval_table_.intervals[0];
 
     // Configure and start timer
     gptimer_alarm_config_t alarm_config = {
@@ -316,20 +331,42 @@ Result<void> CoordinatedStepperController::execute_segment(
             .auto_reload_on_alarm = true,
         },
     };
-    gptimer_set_alarm_action(step_timer_, &alarm_config);
+    esp_err_t err = gptimer_set_alarm_action(step_timer_, &alarm_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set alarm action: %d", err);
+    }
     gptimer_set_raw_count(step_timer_, 0);
-    gptimer_start(step_timer_);
+    err = gptimer_start(step_timer_);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start timer: %d", err);
+    }
+    ESP_LOGI(TAG, "Timer started with interval=%lu", interval);
 
     // Wait for completion
+    uint32_t wait_count = 0;
     while (moving_.load(std::memory_order_acquire)) {
         vTaskDelay(1);
+        wait_count++;
 
         if (abort_requested_.load(std::memory_order_acquire)) {
             gptimer_stop(step_timer_);
             moving_.store(false, std::memory_order_release);
             return Result<void>::err(MotionError::EmergencyStop);
         }
+
+        // Timeout after 10 seconds
+        if (wait_count > 10000) {
+            ESP_LOGE(TAG, "Motion timeout! ISR count=%lu, steps_taken=%lu, theta_rem=%ld, rho_rem=%ld",
+                     g_isr_count, velocity_.steps_taken,
+                     bresenham_.theta_remaining, bresenham_.rho_remaining);
+            gptimer_stop(step_timer_);
+            moving_.store(false, std::memory_order_release);
+            return Result<void>::err(MotionError::Timeout);
+        }
     }
+
+    ESP_LOGI(TAG, "Segment complete: ISR_count=%lu, steps_taken=%lu, wait_cycles=%lu",
+             g_isr_count, velocity_.steps_taken, wait_count);
 
     return Result<void>::ok();
 }
@@ -345,6 +382,8 @@ bool IRAM_ATTR CoordinatedStepperController::step_timer_callback(
 }
 
 void IRAM_ATTR CoordinatedStepperController::generate_step() {
+    g_isr_count++;  // Debug: count ISR calls
+
     bool step_theta = false;
     bool step_rho = false;
 
@@ -397,18 +436,22 @@ void IRAM_ATTR CoordinatedStepperController::generate_step() {
         rho_.position_.store(pos + bresenham_.rho_dir, std::memory_order_release);
     }
 
-    // Update velocity
+    // Update step counter
     velocity_.steps_taken++;
 
     // Check if motion complete
     if (bresenham_.theta_remaining == 0 && bresenham_.rho_remaining == 0) {
         gptimer_stop(step_timer_);
         moving_.store(false, std::memory_order_release);
+        // Note: Can't log from ISR, but g_isr_count will show total calls
         return;
     }
 
-    // Calculate and set next interval
-    uint32_t next_interval = calculate_next_interval();
+    // Get next interval from pre-computed table (NO FPU operations)
+    const uint32_t step_idx = velocity_.steps_taken;
+    uint32_t next_interval = (step_idx < interval_table_.total_steps)
+        ? interval_table_.intervals[step_idx]
+        : interval_table_.intervals[interval_table_.total_steps - 1];
 
     gptimer_alarm_config_t alarm_config = {
         .alarm_count = next_interval,
@@ -420,42 +463,60 @@ void IRAM_ATTR CoordinatedStepperController::generate_step() {
     gptimer_set_alarm_action(step_timer_, &alarm_config);
 }
 
-uint32_t CoordinatedStepperController::calculate_next_interval() {
-    const uint32_t steps = velocity_.steps_taken;
+void CoordinatedStepperController::prepare_interval_table(
+    const VelocityProfile& profile,
+    uint32_t total_steps)
+{
+    interval_table_.clear();
+    interval_table_.total_steps = std::min(total_steps, static_cast<uint32_t>(kMaxStepsPerSegment));
 
-    // Determine which phase we're in and calculate velocity
-    if (steps < velocity_.accel_steps) {
-        // Acceleration phase: v = sqrt(v_entry^2 + 2*a*s)
-        velocity_.current_velocity = std::sqrt(
-            velocity_.entry_velocity * velocity_.entry_velocity +
-            2.0f * velocity_.acceleration * static_cast<float>(steps)
-        );
-    } else if (steps < velocity_.accel_steps + velocity_.cruise_steps) {
-        // Cruise phase
-        velocity_.current_velocity = velocity_.cruise_velocity;
-    } else {
-        // Deceleration phase
-        const uint32_t decel_steps_taken = steps - velocity_.accel_steps - velocity_.cruise_steps;
-        const uint32_t decel_steps_remaining = velocity_.decel_steps - decel_steps_taken;
+    const float timer_hz = static_cast<float>(HardwareConfig::TIMER_RESOLUTION_HZ);
+    const float min_velocity = 100.0f;
+    const float max_velocity = static_cast<float>(HardwareConfig::MAX_STEP_RATE_HZ);
 
-        velocity_.current_velocity = std::sqrt(
-            velocity_.exit_velocity * velocity_.exit_velocity +
-            2.0f * velocity_.acceleration * static_cast<float>(decel_steps_remaining)
-        );
+    for (uint32_t step = 0; step < interval_table_.total_steps; ++step) {
+        float velocity;
+
+        if (step < profile.accel_steps) {
+            // Acceleration phase: v = sqrt(v_entry^2 + 2*a*s)
+            velocity = std::sqrt(
+                profile.entry_velocity * profile.entry_velocity +
+                2.0f * profile.acceleration * static_cast<float>(step)
+            );
+        } else if (step < profile.accel_steps + profile.cruise_steps) {
+            // Cruise phase
+            velocity = profile.cruise_velocity;
+        } else {
+            // Deceleration phase: calculate steps remaining until motion complete
+            const uint32_t decel_steps_taken = step - profile.accel_steps - profile.cruise_steps;
+            const uint32_t decel_steps_remaining = (profile.decel_steps > decel_steps_taken)
+                ? profile.decel_steps - decel_steps_taken
+                : 0;
+            velocity = std::sqrt(
+                profile.exit_velocity * profile.exit_velocity +
+                2.0f * profile.acceleration * static_cast<float>(decel_steps_remaining)
+            );
+        }
+
+        // Clamp velocity
+        velocity = std::max(min_velocity, std::min(velocity, max_velocity));
+
+        // Convert velocity to interval (timer ticks)
+        uint32_t interval = static_cast<uint32_t>(timer_hz / velocity);
+
+        // Clamp interval to safe range
+        // Minimum: 20µs (50kHz max step rate = 1MHz/50000 = 20 ticks)
+        // Maximum: 65535µs (~15Hz min step rate)
+        const uint32_t min_interval = HardwareConfig::TIMER_RESOLUTION_HZ / HardwareConfig::MAX_STEP_RATE_HZ;
+        if (interval < min_interval) {
+            interval = min_interval;
+        }
+        if (interval > 65535) {
+            interval = 65535;
+        }
+
+        interval_table_.intervals[step] = static_cast<uint16_t>(interval);
     }
-
-    // Clamp velocity to reasonable bounds
-    velocity_.current_velocity = std::max(
-        100.0f,  // Minimum velocity to prevent divide by zero
-        std::min(velocity_.current_velocity,
-                 static_cast<float>(HardwareConfig::MAX_STEP_RATE_HZ))
-    );
-
-    // Convert velocity to interval: interval_us = 1,000,000 / velocity_steps_per_sec
-    return static_cast<uint32_t>(
-        static_cast<float>(HardwareConfig::TIMER_RESOLUTION_HZ) /
-        velocity_.current_velocity
-    );
 }
 
 } // namespace sand_table
