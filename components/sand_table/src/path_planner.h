@@ -2,18 +2,17 @@
 
 #include "types.h"
 #include "config.h"
-#include "coordinate_transformer.h"
 
 #include <functional>
 #include <cmath>
 
 namespace sand_table {
 
-/// Path planner that breaks moves into ~1mm segments with coupling compensation.
-/// Works with the VelocityPlanner to feed segments for execution.
+/// Path planner that breaks moves into small segments.
+/// Works with radians for theta and normalized (0-1) for rho.
 class PathPlanner {
 public:
-    /// Callback for emitting segments (typically to VelocityPlanner)
+    /// Callback for emitting segments
     /// Return false to stop segment generation (e.g., if buffer is full)
     using SegmentCallback = std::function<bool(MotionSegment&)>;
 
@@ -24,248 +23,115 @@ public:
         callback_ = std::move(cb);
     }
 
-    /// Plan a linear move from current to target position
-    /// Breaks the move into ~1mm segments and emits them via callback
-    ///
-    /// @param current Current polar position
-    /// @param target Target polar position
-    /// @param feedrate Desired velocity in mm/s
-    /// @return Error if move could not be planned
-    [[nodiscard]] Result<void> plan_linear_move(
-        const PolarPosition& current,
-        const PolarPosition& target,
-        float feedrate
-    );
-
-    /// Plan a spiral move (constant rho change over N rotations)
-    ///
-    /// @param current Current polar position
-    /// @param start_rho Starting radius in mm
-    /// @param end_rho Ending radius in mm
-    /// @param rotations Number of rotations (can be fractional)
-    /// @param feedrate Desired velocity in mm/s
-    /// @return Error if move could not be planned
-    [[nodiscard]] Result<void> plan_spiral(
-        const PolarPosition& current,
-        float start_rho,
-        float end_rho,
-        float rotations,
-        float feedrate
-    );
+    /// Set the current position (e.g., after homing)
+    void set_current_position(const PolarPosition& pos) noexcept {
+        current_position_ = pos;
+    }
 
     /// Get the current position maintained by the path planner
     [[nodiscard]] const PolarPosition& current_position() const noexcept {
         return current_position_;
     }
 
-    /// Set the current position (e.g., after homing)
-    void set_current_position(const PolarPosition& pos) noexcept {
-        current_position_ = pos;
-    }
-
-    /// Reset the rho accumulator (call after homing)
-    void reset_accumulator() noexcept {
-        rho_accumulator_ = 0.0f;
-    }
+    /// Plan a linear move from current to target position
+    /// Breaks the move into small segments and emits them via callback
+    ///
+    /// @param current Current polar position (theta: radians, rho: 0-1)
+    /// @param target Target polar position (theta: radians, rho: 0-1)
+    /// @param feedrate_rpm Speed in RPM
+    /// @return Error if move could not be planned
+    [[nodiscard]] Result<void> plan_linear_move(
+        const PolarPosition& current,
+        const PolarPosition& target,
+        float feedrate_rpm
+    );
 
 private:
     SegmentCallback callback_;
-    CoordinateTransformer transformer_;
-    float rho_accumulator_ = 0.0f;  // Fractional step accumulator
-    PolarPosition current_position_{0.0f, 0.0f};
+    PolarPosition current_position_{0.0, 0.0};
 
-    /// Create a single segment between two positions
-    [[nodiscard]] MotionSegment create_segment(
-        const PolarPosition& start,
-        const PolarPosition& end,
-        float feedrate,
-        float length
-    );
+    // Segment length in normalized units (~1% of table)
+    static constexpr double kSegmentLength = 0.01;
 };
 
 // =============================================================================
-// Inline Implementations
+// Inline Implementation
 // =============================================================================
-
-inline MotionSegment PathPlanner::create_segment(
-    const PolarPosition& start,
-    const PolarPosition& end,
-    float feedrate,
-    float length)
-{
-    MotionSegment segment;
-
-    // Calculate polar deltas
-    segment.delta_theta_deg = CoordinateTransformer::min_angular_distance(start.theta, end.theta);
-    segment.delta_rho_mm = end.rho - start.rho;
-    segment.length_mm = length;
-
-    // Convert to steps with coupling compensation
-    PolarPosition delta{segment.delta_theta_deg, segment.delta_rho_mm};
-    StepPosition steps = transformer_.delta_polar_to_steps(delta, rho_accumulator_);
-
-    segment.delta_theta_steps = steps.theta;
-    segment.delta_rho_steps = steps.rho;
-
-    // Set velocity parameters (will be refined by VelocityPlanner)
-    segment.nominal_velocity = feedrate;
-    segment.acceleration = static_cast<float>(MotionConfig::DEFAULT_ACCEL_MM_S2);
-
-    return segment;
-}
 
 inline Result<void> PathPlanner::plan_linear_move(
     const PolarPosition& current,
     const PolarPosition& target,
-    float feedrate)
+    float feedrate_rpm)
 {
     if (!callback_) {
         return Result<void>::err(MotionError::InvalidState);
     }
 
-    // Check bounds
-    if (!CoordinateTransformer::is_within_bounds(target)) {
-        return Result<void>::err(MotionError::OutOfBounds);
-    }
+    // Convert polar to Cartesian for linear interpolation
+    // x = rho * cos(theta), y = rho * sin(theta)
+    const double start_x = current.rho * std::cos(current.theta);
+    const double start_y = current.rho * std::sin(current.theta);
+    const double end_x = target.rho * std::cos(target.theta);
+    const double end_y = target.rho * std::sin(target.theta);
 
-    // Clamp feedrate
-    feedrate = std::clamp(feedrate,
-                          static_cast<float>(MotionConfig::MIN_VELOCITY_MM_S),
-                          static_cast<float>(MotionConfig::MAX_VELOCITY_MM_S));
+    // Calculate Cartesian distance (in normalized units since rho is 0-1)
+    const double delta_x = end_x - start_x;
+    const double delta_y = end_y - start_y;
+    const double total_distance = std::sqrt(delta_x * delta_x + delta_y * delta_y);
 
-    // Calculate total path length
-    const float total_length = CoordinateTransformer::calculate_path_length(current, target);
-
-    if (total_length < 0.01f) {
-        // Negligible move, skip
+    if (total_distance < 0.001) {
+        // Negligible move
         return Result<void>::ok();
     }
 
-    // Calculate number of segments
+    // Calculate number of segments based on Cartesian distance
     const uint32_t num_segments = std::max<uint32_t>(
-        1u,
-        static_cast<uint32_t>(std::ceil(total_length / MotionConfig::SEGMENT_LENGTH_MM))
+        1u, static_cast<uint32_t>(std::ceil(total_distance / kSegmentLength))
     );
 
-    // Calculate delta per segment
-    const float delta_theta = CoordinateTransformer::min_angular_distance(current.theta, target.theta);
-    const float delta_rho = target.rho - current.rho;
+    const float dist_per_seg = static_cast<float>(total_distance / num_segments);
 
-    const float theta_per_seg = delta_theta / static_cast<float>(num_segments);
-    const float rho_per_seg = delta_rho / static_cast<float>(num_segments);
-    const float length_per_seg = total_length / static_cast<float>(num_segments);
-
-    // Generate segments
-    PolarPosition segment_start = current;
-
+    // Generate segments by interpolating linearly in Cartesian space
+    PolarPosition prev_pos = current;
     for (uint32_t i = 0; i < num_segments; ++i) {
-        PolarPosition segment_end{
-            segment_start.theta + theta_per_seg,
-            segment_start.rho + rho_per_seg
-        };
+        // Linear interpolation parameter (0 to 1)
+        const double t = static_cast<double>(i + 1) / static_cast<double>(num_segments);
 
-        // Create segment
-        MotionSegment segment = create_segment(
-            segment_start, segment_end, feedrate, length_per_seg
-        );
+        // Interpolate in Cartesian space
+        const double seg_x = start_x + t * delta_x;
+        const double seg_y = start_y + t * delta_y;
 
-        // Mark last segment
+        // Convert back to polar
+        const double seg_rho = std::sqrt(seg_x * seg_x + seg_y * seg_y);
+        double seg_theta = std::atan2(seg_y, seg_x);
+        if (seg_theta < 0) {
+            seg_theta += 2.0 * M_PI;  // Normalize to [0, 2π)
+        }
+
+        MotionSegment segment;
+        // Set absolute target position (used for step calculation at execution time)
+        segment.target_theta_rad = seg_theta;
+        segment.target_rho_norm = seg_rho;
+
+        // Set deltas from previous position (used for velocity calculations)
+        segment.delta_theta_rad = calculate_min_rotation(seg_theta, prev_pos.theta);
+        segment.delta_rho_norm = seg_rho - prev_pos.rho;
+        segment.distance = dist_per_seg;
+        segment.nominal_velocity = feedrate_rpm;
         segment.is_last_segment = (i == num_segments - 1);
 
-        // Emit segment
+        // Motor steps will be calculated at execution time, not here
+        segment.delta_theta_steps = 0;
+        segment.delta_rho_steps = 0;
+
         if (!callback_(segment)) {
-            // Callback returned false, buffer might be full
-            // Return error so caller can retry later
             return Result<void>::err(MotionError::QueueFull);
         }
 
-        segment_start = segment_end;
+        prev_pos = {seg_theta, seg_rho};
     }
 
-    // Update current position
     current_position_ = target;
-
-    return Result<void>::ok();
-}
-
-inline Result<void> PathPlanner::plan_spiral(
-    const PolarPosition& current,
-    float start_rho,
-    float end_rho,
-    float rotations,
-    float feedrate)
-{
-    if (!callback_) {
-        return Result<void>::err(MotionError::InvalidState);
-    }
-
-    // Validate bounds
-    if (!MechanicalConfig::is_rho_in_bounds(start_rho) ||
-        !MechanicalConfig::is_rho_in_bounds(end_rho)) {
-        return Result<void>::err(MotionError::OutOfBounds);
-    }
-
-    // Clamp feedrate
-    feedrate = std::clamp(feedrate,
-                          static_cast<float>(MotionConfig::MIN_VELOCITY_MM_S),
-                          static_cast<float>(MotionConfig::MAX_VELOCITY_MM_S));
-
-    // Calculate total angular distance
-    const float total_theta = rotations * 360.0f;
-
-    // Estimate total path length (approximate as spiral arc length)
-    const float avg_rho = (start_rho + end_rho) / 2.0f;
-    const float arc_length = degrees_to_radians(std::abs(total_theta)) * avg_rho;
-    const float radial_length = std::abs(end_rho - start_rho);
-    const float total_length = std::sqrt(arc_length * arc_length + radial_length * radial_length);
-
-    if (total_length < 0.01f) {
-        return Result<void>::ok();
-    }
-
-    // Calculate number of segments
-    const uint32_t num_segments = std::max<uint32_t>(
-        1u,
-        static_cast<uint32_t>(std::ceil(total_length / MotionConfig::SEGMENT_LENGTH_MM))
-    );
-
-    // Calculate delta per segment
-    const float theta_per_seg = total_theta / static_cast<float>(num_segments);
-    const float rho_per_seg = (end_rho - start_rho) / static_cast<float>(num_segments);
-
-    // Generate segments
-    PolarPosition segment_start{current.theta, start_rho};
-
-    for (uint32_t i = 0; i < num_segments; ++i) {
-        PolarPosition segment_end{
-            segment_start.theta + theta_per_seg,
-            segment_start.rho + rho_per_seg
-        };
-
-        // Calculate segment length
-        float segment_length = CoordinateTransformer::calculate_path_length(
-            segment_start, segment_end
-        );
-
-        // Create segment
-        MotionSegment segment = create_segment(
-            segment_start, segment_end, feedrate, segment_length
-        );
-
-        // Mark last segment
-        segment.is_last_segment = (i == num_segments - 1);
-
-        // Emit segment
-        if (!callback_(segment)) {
-            return Result<void>::err(MotionError::QueueFull);
-        }
-
-        segment_start = segment_end;
-    }
-
-    // Update current position
-    current_position_ = {segment_start.theta, end_rho};
-
     return Result<void>::ok();
 }
 

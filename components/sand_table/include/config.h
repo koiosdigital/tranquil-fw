@@ -49,40 +49,18 @@ namespace sand_table {
         // Theta axis: Belt drive with gear ratio (stored as x100 in config)
         static constexpr float THETA_GEAR_RATIO = CONFIG_ROBOT_THETA_GEAR_RATIO / 100.0f;
 
-        // Rho axis: Rack and pinion
+        // Rho axis: Rack and pinion (only used during homing calibration)
         static constexpr int32_t PINION_PITCH_DIAMETER_MM = CONFIG_ROBOT_PINION_DIAMETER_MM;
         static constexpr float PINION_CIRCUMFERENCE_MM = PINION_PITCH_DIAMETER_MM * static_cast<float>(M_PI);
 
-        // Physical limits (integers from config)
-        static constexpr int32_t RHO_MIN_MM = CONFIG_ROBOT_RHO_MIN_MM;
-        static constexpr int32_t RHO_MAX_MM = CONFIG_ROBOT_RHO_MAX_MM;
-
-        // Coupling compensation direction (determined empirically)
-        // Must match main branch behavior: ADD theta/gear_ratio to rho
-        static constexpr int8_t COUPLING_DIRECTION = +1;
-
-        // ==========================================================================
-        // Derived Constants (calculated at compile time from config values)
-        // ==========================================================================
-
-        // Theta: steps per degree of stage rotation
-        // (effective_steps_per_rev * gear_ratio) / 360 degrees
-        static constexpr float THETA_STEPS_PER_DEG =
-            (static_cast<float>(EFFECTIVE_STEPS_PER_REV) * THETA_GEAR_RATIO) / 360.0f;
-
-        // Rho: steps per mm of radial movement
-        // effective_steps_per_rev / pinion_circumference
+        // Rho steps per mm (only used during homing to convert physical movement)
         static constexpr float RHO_STEPS_PER_MM =
             static_cast<float>(EFFECTIVE_STEPS_PER_REV) / PINION_CIRCUMFERENCE_MM;
 
         // Coupling compensation: rho steps per theta motor step
         // = 1 / gear_ratio (since rho and theta have same motor/microstep config)
+        // When theta rotates, rho moves due to rack-and-pinion coupling
         static constexpr float RHO_STEPS_PER_THETA_STEP = 1.0f / THETA_GEAR_RATIO;
-
-        // Validation helper
-        [[nodiscard]] static constexpr bool is_rho_in_bounds(float rho_mm) noexcept {
-            return rho_mm >= RHO_MIN_MM && rho_mm <= RHO_MAX_MM;
-        }
     };
 
     // =============================================================================
@@ -90,21 +68,12 @@ namespace sand_table {
     // =============================================================================
 
     struct MotionConfig {
-        // Velocity limits (integers from config, cast to float when needed)
-        static constexpr int32_t MAX_VELOCITY_MM_S = CONFIG_ROBOT_MAX_VELOCITY_MM_S;
-        static constexpr int32_t DEFAULT_VELOCITY_MM_S = CONFIG_ROBOT_DEFAULT_VELOCITY_MM_S;
-        static constexpr int32_t MIN_VELOCITY_MM_S = 1;
+        // Speed limits (RPM - matches main branch)
+        static constexpr int32_t THETA_MAX_SPEED_RPM = CONFIG_ROBOT_THETA_MAX_SPEED;
+        static constexpr int32_t RHO_MAX_SPEED_RPM = CONFIG_ROBOT_RHO_MAX_SPEED;
 
-        // Acceleration limits
-        static constexpr int32_t MAX_ACCEL_MM_S2 = CONFIG_ROBOT_MAX_ACCEL_MM_S2;
-        static constexpr int32_t DEFAULT_ACCEL_MM_S2 = CONFIG_ROBOT_DEFAULT_ACCEL_MM_S2;
-
-        // Path segmentation
-        static constexpr float SEGMENT_LENGTH_MM = 1.0f;
-
-        // Velocity lookahead
+        // Motion command queue
         static constexpr uint32_t LOOKAHEAD_DEPTH = 32;
-        static constexpr float JUNCTION_DEVIATION_MM = 0.05f;
 
         // Motor current settings (from config, hold = run / 2)
         static constexpr uint16_t THETA_IRUN_MA = CONFIG_ROBOT_THETA_MOTOR_CURRENT;
@@ -114,10 +83,6 @@ namespace sand_table {
 
         // StallGuard threshold for rho homing
         static constexpr uint8_t RHO_STALLGUARD_THRESHOLD = CONFIG_ROBOT_RHO_STALLGUARD_THRESHOLD;
-
-        // Homing speeds (integer mm/s)
-        static constexpr int32_t HOMING_FAST_SPEED = 20;
-        static constexpr int32_t HOMING_SLOW_SPEED = 5;
 
         // Motor inactivity timeout (ms)
         static constexpr uint32_t MOTOR_INACTIVITY_TIMEOUT_MS = 5000;

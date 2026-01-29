@@ -7,171 +7,151 @@
 
 namespace sand_table {
 
-/// Handles coordinate transformations between polar and step domains,
-/// including the critical coupling compensation for the rack-and-pinion mechanism.
+/// Handles coordinate transformations between polar and step domains.
+/// Uses calibrated values from homing for accurate conversions.
+/// Coordinate system:
+///   - theta: radians (0 to 2π)
+///   - rho: normalized (0 = center, 1 = maximum radius)
 class CoordinateTransformer {
 public:
     CoordinateTransformer() = default;
 
-    /// Convert polar position delta to step counts with coupling compensation.
-    /// This is the primary method for motion planning.
-    ///
-    /// @param delta The polar movement delta (theta in degrees, rho in mm)
-    /// @param rho_accumulator Maintains fractional steps between calls to prevent drift
-    /// @return Step counts for both axes
-    [[nodiscard]] StepPosition delta_polar_to_steps(
-        const PolarPosition& delta,
-        float& rho_accumulator
+    /// Set calibrated values from homing
+    void set_calibration(int32_t steps_per_theta_rot, int32_t rho_max_steps) noexcept {
+        steps_per_theta_rot_ = steps_per_theta_rot;
+        rho_max_steps_ = rho_max_steps;
+    }
+
+    /// Check if calibration values are set
+    [[nodiscard]] bool is_calibrated() const noexcept {
+        return steps_per_theta_rot_ > 0 && rho_max_steps_ > 0;
+    }
+
+    /// Convert motor step positions to polar coordinates
+    /// This accounts for coupling: the rack-and-pinion mechanism means
+    /// rho position is affected by theta position
+    [[nodiscard]] PolarPosition steps_to_polar(int32_t theta_steps, int32_t rho_steps) const;
+
+    /// Convert polar delta to motor steps with coupling compensation
+    /// @param start_polar Starting polar position
+    /// @param target_polar Target polar position
+    /// @param theta_motor_steps Output: theta motor steps to execute
+    /// @param rho_motor_steps Output: rho motor steps to execute (includes compensation)
+    void calculate_coupled_motor_steps(
+        const PolarPosition& start_polar,
+        const PolarPosition& target_polar,
+        int32_t& theta_motor_steps,
+        int32_t& rho_motor_steps
     ) const;
 
-    /// Calculate coupling compensation steps for a given theta movement.
-    /// When theta rotates, the rack-and-pinion mechanism causes unintended
-    /// radial movement that must be compensated.
-    ///
-    /// @param theta_motor_steps Number of theta motor steps
-    /// @return Number of rho steps needed to compensate
-    [[nodiscard]] float calculate_coupling_compensation(int32_t theta_motor_steps) const;
+    /// Get calibrated steps per full theta rotation
+    [[nodiscard]] int32_t steps_per_theta_rotation() const noexcept {
+        return steps_per_theta_rot_;
+    }
 
-    /// Convert polar coordinates to Cartesian
-    [[nodiscard]] static CartesianPosition polar_to_cartesian(const PolarPosition& p);
-
-    /// Convert Cartesian coordinates to polar
-    [[nodiscard]] static PolarPosition cartesian_to_polar(const CartesianPosition& c);
-
-    /// Calculate the approximate path length between two polar positions
-    /// Uses Cartesian approximation for short segments
-    [[nodiscard]] static float calculate_path_length(
-        const PolarPosition& start,
-        const PolarPosition& end
-    );
-
-    /// Check if a position is within mechanical bounds
-    [[nodiscard]] static bool is_within_bounds(const PolarPosition& pos);
-
-    /// Convert step position to polar coordinates
-    [[nodiscard]] StepPosition polar_to_steps(const PolarPosition& pos) const;
-
-    /// Convert step position to polar coordinates
-    [[nodiscard]] PolarPosition steps_to_polar(const StepPosition& steps) const;
-
-    /// Get the minimum angular distance between two angles (in degrees)
-    [[nodiscard]] static float min_angular_distance(float from, float to);
+    /// Get calibrated rho max steps
+    [[nodiscard]] int32_t rho_max_steps() const noexcept {
+        return rho_max_steps_;
+    }
 
 private:
-    // Constants derived from MechanicalConfig
-    static constexpr float kThetaStepsPerDeg = MechanicalConfig::THETA_STEPS_PER_DEG;
-    static constexpr float kRhoStepsPerMm = MechanicalConfig::RHO_STEPS_PER_MM;
+    // Calibration values (set during homing)
+    int32_t steps_per_theta_rot_ = 0;
+    int32_t rho_max_steps_ = 0;
+
+    // Config constants
+    static constexpr float kGearRatio = MechanicalConfig::THETA_GEAR_RATIO;
     static constexpr float kRhoStepsPerThetaStep = MechanicalConfig::RHO_STEPS_PER_THETA_STEP;
-    static constexpr int8_t kCouplingDirection = MechanicalConfig::COUPLING_DIRECTION;
+
+    /// Convert polar position to steps (without coupling compensation)
+    void polar_to_steps(const PolarPosition& polar, int32_t& theta_steps, int32_t& rho_steps) const;
+
+    /// Convert normalized rho (0-1) to steps using calibrated maximum
+    [[nodiscard]] int32_t normalized_rho_to_steps(double normalized_rho) const;
+
+    /// Convert steps to normalized rho (0-1) using calibrated maximum
+    [[nodiscard]] double steps_to_normalized_rho(int32_t steps) const;
 };
 
 // =============================================================================
 // Inline Implementations
 // =============================================================================
 
-inline StepPosition CoordinateTransformer::delta_polar_to_steps(
-    const PolarPosition& delta,
-    float& rho_accumulator) const
+inline PolarPosition CoordinateTransformer::steps_to_polar(
+    int32_t theta_steps,
+    int32_t rho_steps) const
 {
-    // Convert theta degrees to motor steps
-    const float theta_steps_float = delta.theta * kThetaStepsPerDeg;
-    const int32_t theta_steps = static_cast<int32_t>(std::round(theta_steps_float));
+    if (steps_per_theta_rot_ <= 0) {
+        return {0.0, 0.0};
+    }
 
-    // Convert rho mm to motor steps (raw, without compensation)
-    const float raw_rho_steps = delta.rho * kRhoStepsPerMm;
+    // Convert theta steps to radians
+    // motor rotations = theta_steps / steps_per_theta_rot
+    // theta_radians = motor_rotations * 2π
+    double motor_rotations = static_cast<double>(theta_steps) / steps_per_theta_rot_;
+    double theta = motor_rotations * 2.0 * M_PI;
+    theta = normalize_angle(theta);
 
-    // Calculate coupling compensation
-    // When theta rotates, the pinion gear pulls/pushes the rack
-    const float compensation = calculate_coupling_compensation(theta_steps);
-
-    // Add compensation and accumulator for sub-step precision
-    const float total_rho = raw_rho_steps + compensation + rho_accumulator;
-
-    // Round to integer steps and store fractional remainder
-    const int32_t rho_steps = static_cast<int32_t>(std::round(total_rho));
-    rho_accumulator = total_rho - static_cast<float>(rho_steps);
-
-    return {theta_steps, rho_steps};
-}
-
-inline float CoordinateTransformer::calculate_coupling_compensation(
-    int32_t theta_motor_steps) const
-{
-    // For each theta motor step, the stage rotates by a small amount.
-    // This rotation causes the rack to move relative to the stationary pinion.
-    //
-    // compensation = theta_steps * (1 / gear_ratio) * direction
-    //
-    // The direction is determined empirically based on the mechanical setup.
-
-    return static_cast<float>(theta_motor_steps) *
-           kRhoStepsPerThetaStep *
-           static_cast<float>(kCouplingDirection);
-}
-
-inline CartesianPosition CoordinateTransformer::polar_to_cartesian(
-    const PolarPosition& p)
-{
-    const float theta_rad = degrees_to_radians(p.theta);
-    return {
-        p.rho * std::cos(theta_rad),
-        p.rho * std::sin(theta_rad)
-    };
-}
-
-inline PolarPosition CoordinateTransformer::cartesian_to_polar(
-    const CartesianPosition& c)
-{
-    const float rho = std::sqrt(c.x * c.x + c.y * c.y);
-    float theta = radians_to_degrees(std::atan2(c.y, c.x));
-
-    // Normalize to [0, 360)
-    while (theta < 0.0f) theta += 360.0f;
-    while (theta >= 360.0f) theta -= 360.0f;
+    // Account for coupling: theta rotation affects rho position
+    // Counteract theta influence on rho
+    double rho_counteract_steps = static_cast<double>(theta_steps) / kGearRatio;
+    double rho = steps_to_normalized_rho(static_cast<int32_t>(
+        static_cast<double>(rho_steps) - rho_counteract_steps
+    ));
 
     return {theta, rho};
 }
 
-inline float CoordinateTransformer::calculate_path_length(
-    const PolarPosition& start,
-    const PolarPosition& end)
+inline void CoordinateTransformer::polar_to_steps(
+    const PolarPosition& polar,
+    int32_t& theta_steps,
+    int32_t& rho_steps) const
 {
-    // For short segments (which is our use case), Cartesian approximation is accurate enough
-    const auto start_cart = polar_to_cartesian(start);
-    const auto end_cart = polar_to_cartesian(end);
+    // Convert theta from radians to steps
+    // drive_gear_rotations = theta / 2π
+    // theta_steps = drive_gear_rotations * steps_per_theta_rot
+    double drive_gear_rotations = polar.theta / (2.0 * M_PI);
+    theta_steps = static_cast<int32_t>(drive_gear_rotations * steps_per_theta_rot_);
 
-    const float dx = end_cart.x - start_cart.x;
-    const float dy = end_cart.y - start_cart.y;
-
-    return std::sqrt(dx * dx + dy * dy);
+    // Convert normalized rho to steps
+    rho_steps = normalized_rho_to_steps(polar.rho);
 }
 
-inline bool CoordinateTransformer::is_within_bounds(const PolarPosition& pos) {
-    return pos.rho >= static_cast<float>(MechanicalConfig::RHO_MIN_MM) &&
-           pos.rho <= static_cast<float>(MechanicalConfig::RHO_MAX_MM);
+inline void CoordinateTransformer::calculate_coupled_motor_steps(
+    const PolarPosition& start_polar,
+    const PolarPosition& target_polar,
+    int32_t& theta_motor_steps,
+    int32_t& rho_motor_steps) const
+{
+    // Calculate delta in polar coordinates
+    PolarPosition delta_polar;
+    delta_polar.theta = calculate_min_rotation(target_polar.theta, start_polar.theta);
+    delta_polar.rho = target_polar.rho - start_polar.rho;
+
+    // Convert delta to base steps
+    int32_t rho_base;
+    polar_to_steps(delta_polar, theta_motor_steps, rho_base);
+
+    // Add coupling compensation:
+    // When theta rotates, the rack-and-pinion coupling causes unintended rho movement.
+    // We must ADD counteracting steps to rho to compensate.
+    // counteract = theta_motor_steps / gear_ratio
+    double rho_counteract_steps = static_cast<double>(theta_motor_steps) / kGearRatio;
+    rho_motor_steps = rho_base + static_cast<int32_t>(rho_counteract_steps);
 }
 
-inline StepPosition CoordinateTransformer::polar_to_steps(const PolarPosition& pos) const {
-    return {
-        static_cast<int32_t>(std::round(pos.theta * kThetaStepsPerDeg)),
-        static_cast<int32_t>(std::round(pos.rho * kRhoStepsPerMm))
-    };
+inline int32_t CoordinateTransformer::normalized_rho_to_steps(double normalized_rho) const {
+    if (rho_max_steps_ <= 0) {
+        return 0;
+    }
+    return static_cast<int32_t>(normalized_rho * static_cast<double>(rho_max_steps_));
 }
 
-inline PolarPosition CoordinateTransformer::steps_to_polar(const StepPosition& steps) const {
-    // Note: This doesn't account for coupling, so it's only accurate after homing
-    // or for small movements where coupling has been compensated
-    return {
-        static_cast<float>(steps.theta) / kThetaStepsPerDeg,
-        static_cast<float>(steps.rho) / kRhoStepsPerMm
-    };
-}
-
-inline float CoordinateTransformer::min_angular_distance(float from, float to) {
-    float diff = to - from;
-    while (diff > 180.0f) diff -= 360.0f;
-    while (diff < -180.0f) diff += 360.0f;
-    return diff;
+inline double CoordinateTransformer::steps_to_normalized_rho(int32_t steps) const {
+    if (rho_max_steps_ <= 0) {
+        return 0.0;
+    }
+    return static_cast<double>(steps) / static_cast<double>(rho_max_steps_);
 }
 
 } // namespace sand_table

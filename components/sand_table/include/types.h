@@ -80,12 +80,12 @@ private:
 // =============================================================================
 
 struct PolarPosition {
-    float theta;  // degrees (no limits, can wrap)
-    float rho;    // mm from center
+    double theta;  // radians (0 to 2π, wraps)
+    double rho;    // normalized radius (0.0 = center, 1.0 = maximum)
 
     [[nodiscard]] bool operator==(const PolarPosition& other) const noexcept {
-        return std::abs(theta - other.theta) < 0.001f &&
-               std::abs(rho - other.rho) < 0.001f;
+        return std::abs(theta - other.theta) < 0.0001 &&
+               std::abs(rho - other.rho) < 0.0001;
     }
 
     [[nodiscard]] bool operator!=(const PolarPosition& other) const noexcept {
@@ -124,19 +124,23 @@ struct StepPosition {
 // =============================================================================
 
 struct MotionSegment {
-    // Motor steps (WITH coupling compensation applied)
+    // Absolute target position for this segment (set by PathPlanner)
+    double target_theta_rad = 0.0;  // radians
+    double target_rho_norm = 0.0;   // normalized (0-1)
+
+    // Motor steps (WITH coupling compensation applied) - calculated at execution time
     int32_t delta_theta_steps = 0;
     int32_t delta_rho_steps = 0;
 
-    // Original polar movement (for direction calculations in lookahead)
-    float delta_theta_deg = 0.0f;
-    float delta_rho_mm = 0.0f;
+    // Delta movement (for velocity calculations)
+    double delta_theta_rad = 0.0;   // radians
+    double delta_rho_norm = 0.0;    // normalized (0-1 scale)
 
-    // Physical segment length in mm
-    float length_mm = 0.0f;
+    // Normalized distance (for velocity planning)
+    float distance = 0.0f;
 
-    // Velocity profile (mm/s) - set by lookahead
-    float entry_velocity = 0.0f;
+    // Velocity profile - set by lookahead
+    float entry_velocity = 0.0f;    // normalized units/s
     float nominal_velocity = 0.0f;
     float exit_velocity = 0.0f;
     float acceleration = 0.0f;
@@ -147,12 +151,9 @@ struct MotionSegment {
     [[nodiscard]] CartesianPosition direction() const noexcept {
         // Convert polar delta to approximate Cartesian direction
         // This is used for junction velocity calculations
-        // For small angles, we can approximate the direction
-        // The theta component contributes perpendicular to the radius
-        // The rho component contributes radially
         return CartesianPosition{
-            delta_rho_mm,
-            delta_theta_deg * 0.1f  // Scale factor for angle contribution
+            static_cast<float>(delta_rho_norm),
+            static_cast<float>(delta_theta_rad)
         }.normalized();
     }
 };
@@ -200,7 +201,7 @@ struct MotorStatus {
 };
 
 struct RobotStatus {
-    PolarPosition position{0.0f, 0.0f};
+    PolarPosition position{0.0, 0.0};
     MotorStatus theta;
     MotorStatus rho;
     SystemState state = SystemState::Idle;
@@ -214,8 +215,8 @@ struct RobotStatus {
 // =============================================================================
 
 struct MotionCommand {
-    PolarPosition target{0.0f, 0.0f};
-    float feedrate_mm_s = 0.0f;
+    PolarPosition target{0.0, 0.0};
+    float feedrate = 0.0f;     // RPM (matches main branch)
     bool is_relative = false;
     uint32_t command_id = 0;
 };
@@ -224,25 +225,25 @@ struct MotionCommand {
 // Utility Functions
 // =============================================================================
 
-[[nodiscard]] inline float degrees_to_radians(float degrees) noexcept {
-    return degrees * (M_PI / 180.0f);
-}
-
-[[nodiscard]] inline float radians_to_degrees(float radians) noexcept {
-    return radians * (180.0f / M_PI);
-}
-
-[[nodiscard]] inline float normalize_angle_degrees(float angle) noexcept {
-    while (angle < 0.0f) angle += 360.0f;
-    while (angle >= 360.0f) angle -= 360.0f;
+/// Normalize angle to [0, 2π) range
+[[nodiscard]] inline double normalize_angle(double angle) noexcept {
+    while (angle < 0.0) angle += 2.0 * M_PI;
+    while (angle >= 2.0 * M_PI) angle -= 2.0 * M_PI;
     return angle;
 }
 
-[[nodiscard]] inline float shortest_angular_distance(float from, float to) noexcept {
-    float diff = to - from;
-    while (diff > 180.0f) diff -= 360.0f;
-    while (diff < -180.0f) diff += 360.0f;
+/// Calculate minimum rotation between two angles (returns value in [-π, π])
+[[nodiscard]] inline double calculate_min_rotation(double target, double current) noexcept {
+    double diff = target - current;
+    while (diff > M_PI) diff -= 2.0 * M_PI;
+    while (diff < -M_PI) diff += 2.0 * M_PI;
     return diff;
+}
+
+/// Check if position is within bounds (theta: [0, 2π], rho: [0, 1])
+[[nodiscard]] inline bool is_in_bounds(const PolarPosition& pos) noexcept {
+    return pos.theta >= 0.0 && pos.theta <= 2.0 * M_PI &&
+           pos.rho >= 0.0 && pos.rho <= 1.0;
 }
 
 } // namespace sand_table

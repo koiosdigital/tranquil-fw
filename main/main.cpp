@@ -67,44 +67,61 @@ extern "C" void app_main(void)
 
     api_init();
 
-    // Home the motion system
-    auto home_result = g_motion_controller->home();
-    if (home_result.is_err()) {
-        ESP_LOGE(TAG, "Homing failed");
-    }
-    else {
-        ESP_LOGI(TAG, "Homing succeeded");
-    }
+    // Development: Skip homing, use estimated calibration values
+    // theta_steps_per_rot = EFFECTIVE_STEPS_PER_REV * THETA_GEAR_RATIO
+    //                     = (200 * 16) * 4 = 12800 steps per rotation
+    // rho_max_steps = estimated ~3 rotations of travel = 200 * 16 * 3 = 9600 steps
+    constexpr int32_t theta_steps_per_rot = static_cast<int32_t>(
+        sand_table::MechanicalConfig::EFFECTIVE_STEPS_PER_REV *
+        sand_table::MechanicalConfig::THETA_GEAR_RATIO
+        );
+    constexpr int32_t rho_max_steps = 200 * 16 * 3;  // ~3 rotations of travel (estimate)
+    g_motion_controller->_set_homed(theta_steps_per_rot, rho_max_steps);
+    ESP_LOGI(TAG, "Development mode: Homing skipped (theta=%ld steps/rot, rho=%ld max)",
+        theta_steps_per_rot, rho_max_steps);
 
-    // Draw a square pattern at constant rho, 4 positions at 90° intervals
-    constexpr float rho = 50.0f;       // mm (midpoint of 5-150mm range)
-    constexpr float feedrate = 50.0f;  // mm/s
+    // Draw a square using linear interpolation in Cartesian space
+    // Square corners at 45°, 135°, 225°, 315° with rho = 0.5
+    // This creates a square with vertices on the diagonals
+    // Coordinates: theta in radians (0-2π), rho normalized (0-1)
+    constexpr double corner_rho = 0.5;  // Distance from center to corners
+    constexpr float feedrate = 10.0f;   // RPM
 
-    ESP_LOGI(TAG, "Starting square demo at rho=%.1fmm, feedrate=%.1fmm/s", rho, feedrate);
+    ESP_LOGI(TAG, "Starting square demo at corner_rho=%.2f (normalized), feedrate=%.1f RPM",
+             corner_rho, feedrate);
 
     sand_table::PolarPosition pos;
-    pos.rho = rho;
 
-    // Queue all moves - they execute sequentially via the motion planner
-    pos.theta = 0.0f;
-    ESP_LOGI(TAG, "Queuing move to theta=%.1f°, rho=%.1fmm", pos.theta, pos.rho);
-    g_motion_controller->move_to(pos, feedrate);
+    // Move to first corner (45° = π/4)
+    pos.theta = M_PI / 4.0;
+    pos.rho = corner_rho;
+    ESP_LOGI(TAG, "Queuing move to corner 1: theta=%.2f rad (45°), rho=%.2f", pos.theta, pos.rho);
+    (void)g_motion_controller->move_to(pos, feedrate);
 
-    pos.theta = 270.0f;
-    ESP_LOGI(TAG, "Queuing move to theta=%.1f°, rho=%.1fmm", pos.theta, pos.rho);
-    g_motion_controller->move_to(pos, feedrate);
+    // Linear move to second corner (135° = 3π/4)
+    // PathPlanner interpolates linearly in Cartesian space, drawing a straight line
+    pos.theta = 3.0 * M_PI / 4.0;
+    pos.rho = corner_rho;
+    ESP_LOGI(TAG, "Queuing move to corner 2: theta=%.2f rad (135°), rho=%.2f", pos.theta, pos.rho);
+    (void)g_motion_controller->move_to(pos, feedrate);
 
-    pos.theta = 180.0f;
-    ESP_LOGI(TAG, "Queuing move to theta=%.1f°, rho=%.1fmm", pos.theta, pos.rho);
-    g_motion_controller->move_to(pos, feedrate);
+    // Linear move to third corner (225° = 5π/4)
+    pos.theta = 5.0 * M_PI / 4.0;
+    pos.rho = corner_rho;
+    ESP_LOGI(TAG, "Queuing move to corner 3: theta=%.2f rad (225°), rho=%.2f", pos.theta, pos.rho);
+    (void)g_motion_controller->move_to(pos, feedrate);
 
-    pos.theta = 270.0f;
-    ESP_LOGI(TAG, "Queuing move to theta=%.1f°, rho=%.1fmm", pos.theta, pos.rho);
-    g_motion_controller->move_to(pos, feedrate);
+    // Linear move to fourth corner (315° = 7π/4)
+    pos.theta = 7.0 * M_PI / 4.0;
+    pos.rho = corner_rho;
+    ESP_LOGI(TAG, "Queuing move to corner 4: theta=%.2f rad (315°), rho=%.2f", pos.theta, pos.rho);
+    (void)g_motion_controller->move_to(pos, feedrate);
 
-    pos.theta = 360.0f;
-    ESP_LOGI(TAG, "Queuing move to theta=%.1f°, rho=%.1fmm", pos.theta, pos.rho);
-    g_motion_controller->move_to(pos, feedrate);
+    // Close the square - back to first corner (45°)
+    pos.theta = M_PI / 4.0;
+    pos.rho = corner_rho;
+    ESP_LOGI(TAG, "Queuing move to corner 1: theta=%.2f rad (45°), rho=%.2f", pos.theta, pos.rho);
+    (void)g_motion_controller->move_to(pos, feedrate);
 
     ESP_LOGI(TAG, "All moves queued. Waiting for completion...");
 

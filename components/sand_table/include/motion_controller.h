@@ -13,13 +13,14 @@
 #include <atomic>
 #include <memory>
 
+#include "ring_buffer.h"
+
 // Forward declarations for private implementation classes
 namespace sand_table {
 class StepperDriver;
 class CoordinatedStepperController;
 class HomingController;
 class CoordinateTransformer;
-class VelocityPlanner;
 class PathPlanner;
 }
 
@@ -67,20 +68,19 @@ public:
         return is_homed_.load(std::memory_order_acquire);
     }
 
+    /// Skip homing and set calibration values directly (for development)
+    /// @param theta_steps_per_rot Steps for one full theta rotation
+    /// @param rho_max Steps for full rho travel
+    void _set_homed(int32_t theta_steps_per_rot, int32_t rho_max);
+
     // =========================================================================
     // Motion Commands
     // =========================================================================
 
     /// Move to a polar position
-    [[nodiscard]] Result<void> move_to(const PolarPosition& target, float feedrate);
-
-    /// Draw a spiral pattern
-    [[nodiscard]] Result<void> draw_spiral(
-        float start_rho,
-        float end_rho,
-        float rotations,
-        float feedrate
-    );
+    /// @param target Target position (theta in radians 0-2π, rho normalized 0-1)
+    /// @param feedrate Speed in RPM
+    [[nodiscard]] Result<void> move_to(const PolarPosition& target, float feedrate = 0);
 
     // =========================================================================
     // Control
@@ -124,9 +124,17 @@ public:
     [[nodiscard]] RobotStatus get_status() const;
 
     /// Get queue depth (segments waiting for execution)
-    [[nodiscard]] size_t queue_depth() const noexcept;
+    [[nodiscard]] size_t queue_depth() const noexcept {
+        return segment_queue_.size();
+    }
 
 private:
+    // Segment queue (64 segments, power of 2)
+    static constexpr size_t kSegmentQueueSize = 64;
+    mutable RingBuffer<MotionSegment, kSegmentQueueSize> segment_queue_;
+
+    // Path planner
+    std::unique_ptr<PathPlanner> path_planner_;
     // TMC UART bus (shared by both drivers)
     std::unique_ptr<tmc::UartBus> tmc_bus_;
 
@@ -144,10 +152,8 @@ private:
     // Homing controller
     std::unique_ptr<HomingController> homing_controller_;
 
-    // Planning components (pimpl pattern for private headers)
+    // Coordinate transformer (handles calibrated conversions)
     std::unique_ptr<CoordinateTransformer> transformer_;
-    std::unique_ptr<VelocityPlanner> velocity_planner_;
-    std::unique_ptr<PathPlanner> path_planner_;
 
     // State
     std::atomic<SystemState> state_{SystemState::Idle};
@@ -156,9 +162,9 @@ private:
     std::atomic<bool> paused_{false};
     std::atomic<bool> running_{false};
 
-    // Current position tracking
+    // Current position tracking (theta: radians, rho: normalized 0-1)
     mutable SemaphoreHandle_t position_mutex_;
-    PolarPosition current_position_{0.0f, static_cast<float>(MechanicalConfig::RHO_MIN_MM)};
+    PolarPosition current_position_{0.0, 0.0};  // Home position
 
     // FreeRTOS tasks
     TaskHandle_t stepper_task_ = nullptr;
@@ -176,9 +182,13 @@ private:
     static void inactivity_timer_callback(TimerHandle_t timer);
 
     // Internal helpers
-    void update_position(const StepPosition& steps);
+    void update_position(int32_t theta_steps, int32_t rho_steps);
     void reset_inactivity_timer();
     Result<void> init_tmc();
+
+    // Segment handling
+    bool enqueue_segment(MotionSegment& segment);
+    Result<void> execute_segment_constant_velocity(const MotionSegment& segment);
 };
 
 } // namespace sand_table

@@ -38,24 +38,6 @@ InterpolationState SandTablePlayer::interpolation_state_;
 double SandTablePlayer::feed_rate_ = 5.0;
 
 // =============================================================================
-// Coordinate Conversion Helpers
-// =============================================================================
-
-float SandTablePlayer::radiansToMm(double rho_normalized) {
-    // Convert normalized 0-1 to mm
-    // rho_normalized 0 = center = RHO_MIN_MM
-    // rho_normalized 1 = edge = RHO_MAX_MM
-    const float range = static_cast<float>(sand_table::MechanicalConfig::RHO_MAX_MM) -
-                        static_cast<float>(sand_table::MechanicalConfig::RHO_MIN_MM);
-    return static_cast<float>(sand_table::MechanicalConfig::RHO_MIN_MM) +
-           static_cast<float>(rho_normalized) * range;
-}
-
-float SandTablePlayer::radiansToDegrees(double theta_rad) {
-    return static_cast<float>(theta_rad) * (180.0f / M_PI);
-}
-
-// =============================================================================
 // Initialization / Shutdown
 // =============================================================================
 
@@ -857,28 +839,21 @@ void SandTablePlayer::serviceInterpolation() {
 
 void SandTablePlayer::sendMoveCommand(double theta_rad, double rho_normalized) {
     // Don't normalize theta - pattern files use continuous rotation (can exceed 2π)
-    // The motion controller handles continuous angles correctly
+    // The motion controller uses radians (0-2π) and normalized rho (0-1) directly
+    // No conversion needed - pattern files use the same coordinate system
 
-    // Convert from legacy format (radians, 0-1) to new format (degrees, mm)
-    float theta_deg = radiansToDegrees(theta_rad);
-    float rho_mm = radiansToMm(rho_normalized);
-
-    // Convert feed rate (legacy RPM-like value) to mm/s
-    // Use approximate conversion: feed_rate is roughly 1-20, map to reasonable mm/s
-    float feedrate_mm_s = static_cast<float>(feed_rate_) * 5.0f;  // Rough scaling
-    if (feedrate_mm_s < static_cast<float>(sand_table::MotionConfig::MIN_VELOCITY_MM_S)) {
-        feedrate_mm_s = static_cast<float>(sand_table::MotionConfig::MIN_VELOCITY_MM_S);
-    }
-    if (feedrate_mm_s > static_cast<float>(sand_table::MotionConfig::MAX_VELOCITY_MM_S)) {
-        feedrate_mm_s = static_cast<float>(sand_table::MotionConfig::MAX_VELOCITY_MM_S);
+    // Feed rate is in RPM
+    float feedrate_rpm = static_cast<float>(feed_rate_);
+    if (feedrate_rpm <= 0) {
+        feedrate_rpm = static_cast<float>(sand_table::MotionConfig::RHO_MAX_SPEED_RPM);
     }
 
-    sand_table::PolarPosition target{theta_deg, rho_mm};
-    auto result = motion_controller_->move_to(target, feedrate_mm_s);
+    sand_table::PolarPosition target{theta_rad, rho_normalized};
+    auto result = motion_controller_->move_to(target, feedrate_rpm);
 
     if (result.is_err()) {
-        ESP_LOGW(TAG, "Failed to send move command: (%.2f deg, %.2f mm)",
-                 theta_deg, rho_mm);
+        ESP_LOGW(TAG, "Failed to send move command: (%.4f rad, %.4f)",
+                 theta_rad, rho_normalized);
         if (result.error() != sand_table::MotionError::QueueFull) {
             ESP_LOGE(TAG, "Stopping due to motion error");
             stop();

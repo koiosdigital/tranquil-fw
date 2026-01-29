@@ -206,54 +206,54 @@ void CoordinatedStepperController::emergency_stop() {
 
 VelocityProfile CoordinatedStepperController::calculate_velocity_profile(
     const MotionSegment& segment,
-    float steps_per_mm) const
+    float steps_per_unit) const
 {
     VelocityProfile profile;
-
-    // Convert velocities from mm/s to steps/s
-    profile.entry_velocity = segment.entry_velocity * steps_per_mm;
-    profile.cruise_velocity = segment.nominal_velocity * steps_per_mm;
-    profile.exit_velocity = segment.exit_velocity * steps_per_mm;
-    profile.acceleration = segment.acceleration * steps_per_mm;
 
     // Calculate total steps - use max to match Bresenham's major axis count
     const uint32_t total_steps = static_cast<uint32_t>(
         std::max(std::abs(segment.delta_theta_steps), std::abs(segment.delta_rho_steps))
     );
 
-    if (total_steps == 0 || profile.acceleration <= 0.0f) {
+    if (total_steps == 0) {
         return profile;
     }
 
-    // Calculate acceleration and deceleration distances
-    // d = (v_final^2 - v_initial^2) / (2 * a)
-    const float accel_dist = (profile.cruise_velocity * profile.cruise_velocity -
-                              profile.entry_velocity * profile.entry_velocity) /
-                             (2.0f * profile.acceleration);
-
-    const float decel_dist = (profile.cruise_velocity * profile.cruise_velocity -
-                              profile.exit_velocity * profile.exit_velocity) /
-                             (2.0f * profile.acceleration);
-
-    profile.accel_steps = static_cast<uint32_t>(std::max(0.0f, accel_dist));
-    profile.decel_steps = static_cast<uint32_t>(std::max(0.0f, decel_dist));
-
-    // Check if we can reach cruise velocity (triangular profile if not)
-    if (profile.accel_steps + profile.decel_steps > total_steps) {
-        // Triangular profile - recalculate peak velocity
-        // v_peak = sqrt((2*a*d + v_entry^2 + v_exit^2) / 2)
-        const float v_peak_sq = (profile.acceleration * total_steps +
-                                  0.5f * (profile.entry_velocity * profile.entry_velocity +
-                                         profile.exit_velocity * profile.exit_velocity));
-        profile.cruise_velocity = std::sqrt(std::max(0.0f, v_peak_sq));
-
-        // Recalculate step counts
-        profile.accel_steps = total_steps / 2;
-        profile.decel_steps = total_steps - profile.accel_steps;
-        profile.cruise_steps = 0;
-    } else {
-        profile.cruise_steps = total_steps - profile.accel_steps - profile.decel_steps;
+    // Simplified constant velocity profile (like main branch)
+    // nominal_velocity is in RPM
+    // For normalized distance motion, calculate step rate based on RPM and motion distance
+    float feedrate_rpm = segment.nominal_velocity;
+    if (feedrate_rpm <= 0) {
+        feedrate_rpm = static_cast<float>(MotionConfig::RHO_MAX_SPEED_RPM);
     }
+
+    // Calculate motion time based on distance and RPM
+    // motion_time = distance / (RPM / 60) for normalized distance
+    float motion_time_seconds = 0.0f;
+    if (segment.distance > 0.0f) {
+        motion_time_seconds = segment.distance / (feedrate_rpm / 60.0f);
+    }
+
+    // Calculate steps per second for constant velocity
+    if (motion_time_seconds > 0.0f) {
+        profile.cruise_velocity = static_cast<float>(total_steps) / motion_time_seconds;
+    } else {
+        // Fallback: use a reasonable default step rate
+        profile.cruise_velocity = feedrate_rpm * steps_per_unit / 60.0f;
+    }
+
+    // Clamp to hardware limits
+    const float max_step_rate = static_cast<float>(HardwareConfig::MAX_STEP_RATE_HZ);
+    const float min_step_rate = 100.0f;  // 100 Hz minimum
+    profile.cruise_velocity = std::max(min_step_rate, std::min(profile.cruise_velocity, max_step_rate));
+
+    // No acceleration for now (constant velocity like main branch)
+    profile.entry_velocity = profile.cruise_velocity;
+    profile.exit_velocity = profile.cruise_velocity;
+    profile.acceleration = 0.0f;
+    profile.accel_steps = 0;
+    profile.decel_steps = 0;
+    profile.cruise_steps = total_steps;
 
     return profile;
 }
@@ -287,11 +287,11 @@ Result<void> CoordinatedStepperController::execute_segment(
         std::max(bresenham_.theta_remaining, bresenham_.rho_remaining));
 
     // Calculate velocity profile
-    // Derive steps_per_mm from actual segment: total steps / path length in mm
-    const float steps_per_mm = (segment.length_mm > 0.0f)
-        ? static_cast<float>(total_steps) / segment.length_mm
-        : MechanicalConfig::RHO_STEPS_PER_MM;  // Fallback for zero-length
-    const VelocityProfile profile = calculate_velocity_profile(segment, steps_per_mm);
+    // For RPM-based velocity, steps_per_unit is total_steps / distance (normalized units)
+    const float steps_per_unit = (segment.distance > 0.0f)
+        ? static_cast<float>(total_steps) / segment.distance
+        : static_cast<float>(total_steps);  // Fallback
+    const VelocityProfile profile = calculate_velocity_profile(segment, steps_per_unit);
 
     // No steps to execute
     if (total_steps == 0) {

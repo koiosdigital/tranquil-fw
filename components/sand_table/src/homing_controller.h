@@ -86,6 +86,16 @@ namespace sand_table {
         /// Abort current homing operation
         void abort();
 
+        /// Set homed state without running homing sequence (for development)
+        /// @param theta_steps_per_rot Steps for one full theta rotation
+        /// @param rho_max Steps for full rho travel
+        void _set_homed(int32_t theta_steps_per_rot, int32_t rho_max) {
+            theta_steps_per_rotation_ = theta_steps_per_rot;
+            rho_max_steps_ = rho_max;
+            state_.store(HomingState::Complete, std::memory_order_release);
+            homing_active_.store(false, std::memory_order_release);
+        }
+
         /// Get calibration results (valid after successful homing)
         [[nodiscard]] int32_t rho_max_steps() const noexcept { return rho_max_steps_; }
         [[nodiscard]] int32_t theta_steps_per_rotation() const noexcept { return theta_steps_per_rotation_; }

@@ -149,10 +149,6 @@ private:
     static void serviceInterpolation();
     static void sendMoveCommand(double theta_rad, double rho_normalized);
 
-    // Coordinate conversion (radians/normalized -> degrees/mm)
-    static float radiansToMm(double rho_normalized);
-    static float radiansToDegrees(double theta_rad);
-
     // State
     static sand_table::MotionController* motion_controller_;
     static bool initialized_;

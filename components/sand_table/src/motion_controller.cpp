@@ -2,7 +2,6 @@
 #include "stepper_driver.h"
 #include "homing_controller.h"
 #include "coordinate_transformer.h"
-#include "velocity_planner.h"
 #include "path_planner.h"
 
 #include "esp_log.h"
@@ -12,11 +11,15 @@ namespace sand_table {
     static const char* TAG = "MotionController";
 
     MotionController::MotionController()
-        : transformer_(std::make_unique<CoordinateTransformer>())
-        , velocity_planner_(std::make_unique<VelocityPlanner>())
-        , path_planner_(std::make_unique<PathPlanner>())
+        : path_planner_(std::make_unique<PathPlanner>())
+        , transformer_(std::make_unique<CoordinateTransformer>())
     {
         position_mutex_ = xSemaphoreCreateMutex();
+
+        // Set up PathPlanner callback to enqueue segments
+        path_planner_->set_segment_callback([this](MotionSegment& seg) {
+            return this->enqueue_segment(seg);
+            });
     }
 
     MotionController::~MotionController() {
@@ -93,17 +96,6 @@ namespace sand_table {
             ESP_LOGE(TAG, "Failed to initialize homing controller");
             return homing_result;
         }
-
-        // Setup path planner callback to feed velocity planner
-        // This callback blocks until queue space is available to ensure
-        // all segments of a move are queued before returning
-        path_planner_->set_segment_callback([this](MotionSegment& segment) -> bool {
-            // Wait for queue space (stepper task consumes segments on Core 1)
-            while (velocity_planner_->full()) {
-                vTaskDelay(1);  // Minimal delay, let stepper task consume segments
-            }
-            return velocity_planner_->add_segment(segment);
-        });
 
         // Create inactivity timer
         inactivity_timer_ = xTimerCreate(
@@ -209,7 +201,6 @@ namespace sand_table {
         }
 
         disable_motors();
-        velocity_planner_->clear();
         state_.store(SystemState::Idle, std::memory_order_release);
 
         ESP_LOGI(TAG, "Motion controller stopped");
@@ -226,6 +217,7 @@ namespace sand_table {
         while (running_.load(std::memory_order_acquire)) {
             // Check for emergency stop
             if (emergency_stop_.load(std::memory_order_acquire)) {
+                segment_queue_.clear();
                 stepper_controller_->emergency_stop();
                 state_.store(SystemState::EStop, std::memory_order_release);
                 vTaskDelay(pdMS_TO_TICKS(100));
@@ -239,36 +231,51 @@ namespace sand_table {
                 continue;
             }
 
-            // Try to get next segment
-            auto segment = velocity_planner_->pop_segment();
-            if (!segment) {
-                // No segments available, idle
+            // Try to get next segment from queue
+            MotionSegment segment;
+            if (segment_queue_.pop(segment)) {
+                // Calculate motor steps from current position to segment target
+                // This is done at execution time to use actual current position
+                PolarPosition current_pos = get_position();
+                PolarPosition target_pos{ segment.target_theta_rad, segment.target_rho_norm };
+
+                transformer_->calculate_coupled_motor_steps(
+                    current_pos, target_pos,
+                    segment.delta_theta_steps, segment.delta_rho_steps
+                );
+
+                // Execute segment at constant velocity
+                auto result = execute_segment_constant_velocity(segment);
+
+                // Yield to other tasks to prevent watchdog timeout
+                taskYIELD();
+
+                if (result.is_err()) {
+                    ESP_LOGE(TAG, "Segment execution failed");
+                    state_.store(SystemState::Error, std::memory_order_release);
+                    continue;
+                }
+
+                // Update position tracking to segment target
+                if (xSemaphoreTake(position_mutex_, pdMS_TO_TICKS(10))) {
+                    current_position_ = target_pos;
+                    xSemaphoreGive(position_mutex_);
+                }
+
+                // Check if this was the last segment
+                if (segment.is_last_segment && segment_queue_.empty()) {
+                    state_.store(SystemState::Idle, std::memory_order_release);
+                    reset_inactivity_timer();
+                }
+            }
+            else {
+                // Queue empty, check if we should go idle
                 if (state_.load(std::memory_order_acquire) == SystemState::Running) {
                     state_.store(SystemState::Idle, std::memory_order_release);
                     reset_inactivity_timer();
                 }
-                vTaskDelay(1);  // Raw tick (pdMS_TO_TICKS(1)=0 at 100Hz)
-                continue;
+                vTaskDelay(pdMS_TO_TICKS(10));  // Small delay when idle
             }
-
-            // Execute segment
-            state_.store(SystemState::Running, std::memory_order_release);
-            xTimerStop(inactivity_timer_, 0);
-
-            auto result = stepper_controller_->execute_segment(*segment);
-
-            if (result.is_err()) {
-                if (result.error() == MotionError::EmergencyStop) {
-                    state_.store(SystemState::EStop, std::memory_order_release);
-                }
-                else {
-                    state_.store(SystemState::Error, std::memory_order_release);
-                }
-                continue;
-            }
-
-            // Update position
-            update_position(stepper_controller_->get_position());
         }
 
         ESP_LOGI(TAG, "Stepper task exiting");
@@ -309,14 +316,24 @@ namespace sand_table {
         if (result.is_ok()) {
             is_homed_.store(true, std::memory_order_release);
 
-            // Reset position tracking
+            // Pass calibration values to coordinate transformer
+            transformer_->set_calibration(
+                homing_controller_->theta_steps_per_rotation(),
+                homing_controller_->rho_max_steps()
+            );
+
+            ESP_LOGI(TAG, "Calibration set: theta=%ld steps/rot, rho=%ld max steps",
+                homing_controller_->theta_steps_per_rotation(),
+                homing_controller_->rho_max_steps());
+
+            // Reset position tracking to home position (0 radians, 0 normalized rho)
             if (xSemaphoreTake(position_mutex_, portMAX_DELAY)) {
-                current_position_ = { 0.0f, static_cast<float>(MechanicalConfig::RHO_MIN_MM) };
+                current_position_ = { 0.0, 0.0 };
                 xSemaphoreGive(position_mutex_);
             }
 
-            path_planner_->set_current_position({ 0.0f, static_cast<float>(MechanicalConfig::RHO_MIN_MM) });
-            path_planner_->reset_accumulator();
+            // Reset path planner position
+            path_planner_->set_current_position({ 0.0, 0.0 });
 
             state_.store(SystemState::Idle, std::memory_order_release);
             ESP_LOGI(TAG, "Homing complete");
@@ -329,6 +346,32 @@ namespace sand_table {
         return result;
     }
 
+    void MotionController::_set_homed(int32_t theta_steps_per_rot, int32_t rho_max) {
+        ESP_LOGI(TAG, "Setting homed state: theta=%ld steps/rot, rho=%ld max steps",
+            theta_steps_per_rot, rho_max);
+
+        // Set homing controller calibration
+        homing_controller_->_set_homed(theta_steps_per_rot, rho_max);
+
+        // Pass calibration to coordinate transformer
+        transformer_->set_calibration(theta_steps_per_rot, rho_max);
+
+        // Reset position to home
+        if (xSemaphoreTake(position_mutex_, portMAX_DELAY)) {
+            current_position_ = { 0.0, 0.0 };
+            xSemaphoreGive(position_mutex_);
+        }
+
+        // Reset path planner position
+        path_planner_->set_current_position({ 0.0, 0.0 });
+
+        // Mark as homed
+        is_homed_.store(true, std::memory_order_release);
+        state_.store(SystemState::Idle, std::memory_order_release);
+
+        ESP_LOGI(TAG, "Homed state set (development mode)");
+    }
+
     Result<void> MotionController::move_to(const PolarPosition& target, float feedrate) {
         if (!is_homed_.load(std::memory_order_acquire)) {
             return Result<void>::err(MotionError::NotHomed);
@@ -338,40 +381,41 @@ namespace sand_table {
             return Result<void>::err(MotionError::EmergencyStop);
         }
 
-        enable_motors();
-
-        PolarPosition current;
-        if (xSemaphoreTake(position_mutex_, portMAX_DELAY)) {
-            current = current_position_;
-            xSemaphoreGive(position_mutex_);
+        // Check bounds
+        if (!is_in_bounds(target)) {
+            ESP_LOGW(TAG, "Target out of bounds: theta=%.4f, rho=%.4f", target.theta, target.rho);
+            return Result<void>::err(MotionError::OutOfBounds);
         }
 
-        return path_planner_->plan_linear_move(current, target, feedrate);
-    }
+        // Get current planning position from PathPlanner
+        // This represents where the arm will be after all currently queued moves
+        // (not the actual position, which is tracked separately)
+        const PolarPosition& current = path_planner_->current_position();
 
-    Result<void> MotionController::draw_spiral(
-        float start_rho,
-        float end_rho,
-        float rotations,
-        float feedrate)
-    {
-        if (!is_homed_.load(std::memory_order_acquire)) {
-            return Result<void>::err(MotionError::NotHomed);
+        // Set default feedrate if not specified
+        float actual_feedrate = feedrate;
+        if (actual_feedrate <= 0) {
+            actual_feedrate = static_cast<float>(MotionConfig::RHO_MAX_SPEED_RPM);
         }
 
-        if (emergency_stop_.load(std::memory_order_acquire)) {
-            return Result<void>::err(MotionError::EmergencyStop);
+        ESP_LOGD(TAG, "Queueing move: (%.4f, %.4f) -> (%.4f, %.4f) @ %.1f RPM",
+            current.theta, current.rho, target.theta, target.rho, actual_feedrate);
+
+        // Plan the move (this enqueues segments via callback)
+        // PathPlanner updates its internal position to target after planning
+        auto result = path_planner_->plan_linear_move(current, target, actual_feedrate);
+
+        if (result.is_ok()) {
+            // Don't update current_position_ here - that's the actual executed position
+            // which is updated by stepper_task_loop after each segment completes.
+            // PathPlanner tracks the planning position internally.
+
+            // Ensure motors are enabled and state is Running
+            enable_motors();
+            state_.store(SystemState::Running, std::memory_order_release);
         }
 
-        enable_motors();
-
-        PolarPosition current;
-        if (xSemaphoreTake(position_mutex_, portMAX_DELAY)) {
-            current = current_position_;
-            xSemaphoreGive(position_mutex_);
-        }
-
-        return path_planner_->plan_spiral(current, start_rho, end_rho, rotations, feedrate);
+        return result;  // Returns immediately after queueing
     }
 
     void MotionController::pause() {
@@ -387,7 +431,6 @@ namespace sand_table {
     void MotionController::emergency_stop() {
         emergency_stop_.store(true, std::memory_order_release);
         stepper_controller_->emergency_stop();
-        velocity_planner_->clear();
         state_.store(SystemState::EStop, std::memory_order_release);
         ESP_LOGW(TAG, "Emergency stop activated");
     }
@@ -407,15 +450,39 @@ namespace sand_table {
         return pos;
     }
 
-    void MotionController::update_position(const StepPosition& steps) {
-        PolarPosition pos = transformer_->steps_to_polar(steps);
+    void MotionController::update_position(int32_t theta_steps, int32_t rho_steps) {
+        PolarPosition pos = transformer_->steps_to_polar(theta_steps, rho_steps);
 
         if (xSemaphoreTake(position_mutex_, portMAX_DELAY)) {
             current_position_ = pos;
             xSemaphoreGive(position_mutex_);
         }
+    }
 
-        path_planner_->set_current_position(pos);
+    bool MotionController::enqueue_segment(MotionSegment& segment) {
+        // Wait for queue space (provides natural backpressure)
+        // This blocks the caller until there's room in the queue
+        // Using 10ms delay to avoid starving IDLE task (watchdog)
+        while (segment_queue_.full()) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+
+        // Motor steps are calculated at execution time, not here
+        // The segment already has target_theta_rad and target_rho_norm set by PathPlanner
+        return segment_queue_.push(segment);
+    }
+
+    Result<void> MotionController::execute_segment_constant_velocity(const MotionSegment& segment) {
+        // Create a copy with simplified constant velocity profile
+        MotionSegment exec_segment = segment;
+
+        // Set entry/exit velocity equal to nominal (constant velocity)
+        exec_segment.entry_velocity = segment.nominal_velocity;
+        exec_segment.exit_velocity = segment.nominal_velocity;
+        exec_segment.acceleration = 0.0f;
+
+        // Execute via stepper controller (this is blocking per-segment)
+        return stepper_controller_->execute_segment(exec_segment);
     }
 
     RobotStatus MotionController::get_status() const {
@@ -424,8 +491,8 @@ namespace sand_table {
         status.position = get_position();
         status.state = get_state();
         status.is_homed = is_homed_.load(std::memory_order_acquire);
-        status.queue_depth = velocity_planner_->segment_count();
-        status.queue_capacity = VelocityPlanner::kLookaheadDepth;
+        status.queue_depth = segment_queue_.size();
+        status.queue_capacity = kSegmentQueueSize - 1;  // One slot reserved
 
         if (theta_stepper_) {
             status.theta.position_steps = theta_stepper_->position();
