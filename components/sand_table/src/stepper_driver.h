@@ -5,13 +5,19 @@
 
 #include "driver/gpio.h"
 #include "driver/rmt_tx.h"
-#include "driver/gptimer.h"
+#include "driver/rmt_encoder.h"
+#include "esp_attr.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 #include <atomic>
 #include <cstdint>
 #include <memory>
 
 namespace sand_table {
+
+// Forward declaration
+struct BresenhamState;
 
 /// Low-level stepper motor driver using RMT for precise step generation
 class StepperDriver {
@@ -67,8 +73,12 @@ public:
     /// Get step pin (for direct access in ISR)
     [[nodiscard]] gpio_num_t step_pin() const noexcept { return pins_.step; }
 
+    /// Get direction pin
+    [[nodiscard]] gpio_num_t dir_pin() const noexcept { return pins_.dir; }
+
 private:
     friend class CoordinatedStepperController;
+    friend class RmtStepSequencer;
 
     Pins pins_;
     const char* name_;
@@ -85,6 +95,118 @@ private:
     Result<void> init_rmt();
 };
 
+// =============================================================================
+// Bresenham State (shared between sequencer and controller)
+// =============================================================================
+
+struct BresenhamState {
+    int32_t theta_remaining = 0;  // Decremented during execution
+    int32_t rho_remaining = 0;    // Decremented during execution
+    int32_t theta_total = 0;      // Original total (fixed during execution)
+    int32_t rho_total = 0;        // Original total (fixed during execution)
+    int32_t error = 0;
+    int8_t theta_dir = 0;
+    int8_t rho_dir = 0;
+
+    void clear() {
+        theta_remaining = rho_remaining = error = 0;
+        theta_total = rho_total = 0;
+        theta_dir = rho_dir = 0;
+    }
+};
+
+// =============================================================================
+// RMT Step Sequencer
+// =============================================================================
+
+/// Generates step pulses using RMT peripheral with DMA
+/// Uses chunked Bresenham algorithm with TX-done callbacks for continuous streaming
+class RmtStepSequencer {
+public:
+    static constexpr size_t kChunkSize = 64;  // Steps per chunk
+
+    RmtStepSequencer() = default;
+    ~RmtStepSequencer();
+
+    // Non-copyable
+    RmtStepSequencer(const RmtStepSequencer&) = delete;
+    RmtStepSequencer& operator=(const RmtStepSequencer&) = delete;
+
+    /// Initialize RMT channels for both axes
+    [[nodiscard]] Result<void> init(gpio_num_t theta_step, gpio_num_t rho_step);
+
+    /// Deinitialize and release resources
+    void deinit();
+
+    /// Execute a motion segment (blocking)
+    /// @param bresenham Bresenham state (will be modified during execution)
+    /// @param intervals Pre-computed interval table (in microseconds)
+    /// @param total_steps Total steps on major axis
+    /// @param theta_pos Atomic position counter for theta (updated during execution)
+    /// @param rho_pos Atomic position counter for rho (updated during execution)
+    [[nodiscard]] Result<void> execute(
+        BresenhamState& bresenham,
+        const uint16_t* intervals,
+        uint32_t total_steps,
+        std::atomic<int32_t>& theta_pos,
+        std::atomic<int32_t>& rho_pos
+    );
+
+    /// Emergency stop - immediately halt transmission
+    void stop();
+
+    /// Check if currently executing
+    [[nodiscard]] bool is_executing() const noexcept {
+        return executing_.load(std::memory_order_acquire);
+    }
+
+private:
+    // RMT handles
+    rmt_channel_handle_t theta_channel_ = nullptr;
+    rmt_channel_handle_t rho_channel_ = nullptr;
+    rmt_sync_manager_handle_t sync_manager_ = nullptr;
+    rmt_encoder_handle_t copy_encoder_ = nullptr;
+
+    // Double-buffered symbol chunks (ping-pong)
+    rmt_symbol_word_t theta_symbols_[2][kChunkSize];
+    rmt_symbol_word_t rho_symbols_[2][kChunkSize];
+    size_t symbol_counts_[2] = {0, 0};
+    uint8_t active_buffer_ = 0;
+
+    // Execution state
+    std::atomic<bool> executing_{false};
+    std::atomic<bool> stop_requested_{false};
+    std::atomic<int32_t> pending_tx_{0};  // Count of pending transmissions
+    uint32_t steps_encoded_ = 0;
+    uint32_t total_steps_ = 0;
+    BresenhamState* bresenham_ = nullptr;
+    const uint16_t* intervals_ = nullptr;
+    std::atomic<int32_t>* theta_pos_ = nullptr;
+    std::atomic<int32_t>* rho_pos_ = nullptr;
+
+    // Completion signaling
+    SemaphoreHandle_t completion_sem_ = nullptr;
+
+    // Callback for TX done
+    static bool IRAM_ATTR tx_done_callback(
+        rmt_channel_handle_t channel,
+        const rmt_tx_done_event_data_t* edata,
+        void* user_ctx
+    );
+
+    // Encode next chunk of steps into RMT symbols (called from ISR)
+    void IRAM_ATTR encode_chunk(uint8_t buffer_idx);
+
+    // Helper to create step and idle symbols (called from ISR)
+    static rmt_symbol_word_t IRAM_ATTR make_step_symbol(uint16_t interval_us);
+    static rmt_symbol_word_t IRAM_ATTR make_idle_symbol(uint16_t interval_us);
+
+    // Run one Bresenham iteration (called from ISR)
+    void IRAM_ATTR bresenham_step(bool& step_theta, bool& step_rho);
+
+    bool initialized_ = false;
+};
+
 /// Coordinates two stepper motors for synchronized motion using Bresenham
 class CoordinatedStepperController {
 public:
@@ -95,7 +217,7 @@ public:
     CoordinatedStepperController(const CoordinatedStepperController&) = delete;
     CoordinatedStepperController& operator=(const CoordinatedStepperController&) = delete;
 
-    /// Initialize the controller (creates timer)
+    /// Initialize the controller (creates RMT sequencer)
     [[nodiscard]] Result<void> init();
 
     /// Execute a motion segment with velocity profile
@@ -113,7 +235,7 @@ public:
 
     /// Check if motion is in progress
     [[nodiscard]] bool is_moving() const noexcept {
-        return moving_.load(std::memory_order_acquire);
+        return rmt_sequencer_.is_executing();
     }
 
     /// Get current positions
@@ -125,51 +247,25 @@ private:
     StepperDriver& theta_;
     StepperDriver& rho_;
 
-    gptimer_handle_t step_timer_ = nullptr;
-    std::atomic<bool> moving_{false};
-    std::atomic<bool> abort_requested_{false};
+    RmtStepSequencer rmt_sequencer_;
+    BresenhamState bresenham_;
 
-    // Bresenham state (used during motion execution)
-    struct BresenhamState {
-        int32_t theta_remaining = 0;
-        int32_t rho_remaining = 0;
-        int32_t error = 0;
-        int8_t theta_dir = 0;
-        int8_t rho_dir = 0;
-
-        void clear() {
-            theta_remaining = rho_remaining = error = 0;
-            theta_dir = rho_dir = 0;
-        }
-    } bresenham_;
-
-    // Pre-computed step intervals for FPU-free ISR execution
-    static constexpr size_t kMaxStepsPerSegment = 256;
+    // Pre-computed step intervals for velocity profiles
+    // RMT can handle arbitrary segment lengths via chunking
+    static constexpr size_t kMaxIntervalsPerSegment = 4096;
 
     struct IntervalTable {
-        uint16_t intervals[kMaxStepsPerSegment];  // Timer ticks per step
-        uint32_t total_steps = 0;                  // Steps in this segment
+        uint16_t intervals[kMaxIntervalsPerSegment];  // Microseconds per step
+        uint32_t total_steps = 0;
 
         void clear() { total_steps = 0; }
     } interval_table_;
 
-    // Velocity profile state (used for pre-computation, not in ISR)
-    struct VelocityState {
-        uint32_t steps_taken = 0;  // Current step index (used by ISR)
-    } velocity_;
-
-    static bool step_timer_callback(
-        gptimer_handle_t timer,
-        const gptimer_alarm_event_data_t* edata,
-        void* user_ctx
-    );
-
-    void generate_step();
     void prepare_interval_table(const VelocityProfile& profile, uint32_t total_steps);
 
     VelocityProfile calculate_velocity_profile(
         const MotionSegment& segment,
-        float steps_per_mm
+        float steps_per_unit
     ) const;
 };
 

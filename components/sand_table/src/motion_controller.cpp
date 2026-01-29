@@ -234,13 +234,30 @@ namespace sand_table {
             // Try to get next segment from queue
             MotionSegment segment;
             if (segment_queue_.pop(segment)) {
-                // Calculate motor steps from current position to segment target
-                // This is done at execution time to use actual current position
-                PolarPosition current_pos = get_position();
-                PolarPosition target_pos{ segment.target_theta_rad, segment.target_rho_norm };
+                // Convert target polar to absolute step position (one-time conversion)
+                PolarPosition target_polar{ segment.target_theta_rad, segment.target_rho_norm };
+                int32_t new_target_theta_steps, new_target_rho_steps;
+                transformer_->polar_to_absolute_steps(
+                    target_polar,
+                    new_target_theta_steps, new_target_rho_steps
+                );
 
-                transformer_->calculate_coupled_motor_steps(
-                    current_pos, target_pos,
+                // Get current target steps (protected by mutex)
+                int32_t curr_theta_steps, curr_rho_steps;
+                if (xSemaphoreTake(position_mutex_, pdMS_TO_TICKS(10))) {
+                    curr_theta_steps = target_theta_steps_;
+                    curr_rho_steps = target_rho_steps_;
+                    xSemaphoreGive(position_mutex_);
+                } else {
+                    ESP_LOGE(TAG, "Failed to acquire position mutex");
+                    continue;
+                }
+
+                // Calculate motor step deltas using pure integer arithmetic
+                // This avoids floating-point accumulation errors
+                transformer_->calculate_coupled_delta_steps(
+                    curr_theta_steps, curr_rho_steps,
+                    new_target_theta_steps, new_target_rho_steps,
                     segment.delta_theta_steps, segment.delta_rho_steps
                 );
 
@@ -256,9 +273,10 @@ namespace sand_table {
                     continue;
                 }
 
-                // Update position tracking to segment target
+                // Update position tracking with new target steps (integer)
                 if (xSemaphoreTake(position_mutex_, pdMS_TO_TICKS(10))) {
-                    current_position_ = target_pos;
+                    target_theta_steps_ = new_target_theta_steps;
+                    target_rho_steps_ = new_target_rho_steps;
                     xSemaphoreGive(position_mutex_);
                 }
 
@@ -326,9 +344,10 @@ namespace sand_table {
                 homing_controller_->theta_steps_per_rotation(),
                 homing_controller_->rho_max_steps());
 
-            // Reset position tracking to home position (0 radians, 0 normalized rho)
+            // Reset position tracking to home position (0 steps)
             if (xSemaphoreTake(position_mutex_, portMAX_DELAY)) {
-                current_position_ = { 0.0, 0.0 };
+                target_theta_steps_ = 0;
+                target_rho_steps_ = 0;
                 xSemaphoreGive(position_mutex_);
             }
 
@@ -356,9 +375,10 @@ namespace sand_table {
         // Pass calibration to coordinate transformer
         transformer_->set_calibration(theta_steps_per_rot, rho_max);
 
-        // Reset position to home
+        // Reset position to home (0 steps)
         if (xSemaphoreTake(position_mutex_, portMAX_DELAY)) {
-            current_position_ = { 0.0, 0.0 };
+            target_theta_steps_ = 0;
+            target_rho_steps_ = 0;
             xSemaphoreGive(position_mutex_);
         }
 
@@ -442,19 +462,23 @@ namespace sand_table {
     }
 
     PolarPosition MotionController::get_position() const {
-        PolarPosition pos;
+        // Derive polar position from step counts (only for display/API)
+        int32_t theta_steps, rho_steps;
         if (xSemaphoreTake(position_mutex_, portMAX_DELAY)) {
-            pos = current_position_;
+            theta_steps = target_theta_steps_;
+            rho_steps = target_rho_steps_;
             xSemaphoreGive(position_mutex_);
+        } else {
+            return {0.0, 0.0};
         }
-        return pos;
+        return transformer_->steps_to_polar(theta_steps, rho_steps);
     }
 
     void MotionController::update_position(int32_t theta_steps, int32_t rho_steps) {
-        PolarPosition pos = transformer_->steps_to_polar(theta_steps, rho_steps);
-
+        // Store step counts directly (no floating-point conversion)
         if (xSemaphoreTake(position_mutex_, portMAX_DELAY)) {
-            current_position_ = pos;
+            target_theta_steps_ = theta_steps;
+            target_rho_steps_ = rho_steps;
             xSemaphoreGive(position_mutex_);
         }
     }

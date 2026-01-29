@@ -234,7 +234,7 @@ inline void VelocityPlanner::reverse_pass() {
         // v_entry = sqrt(v_exit^2 + 2 * a * d)
         const float max_entry = std::sqrt(
             seg.exit_velocity * seg.exit_velocity +
-            2.0f * seg.acceleration * seg.length_mm
+            2.0f * seg.acceleration * seg.distance
         );
 
         // Take minimum of current entry and max achievable
@@ -262,7 +262,7 @@ inline void VelocityPlanner::forward_pass() {
         // v_exit = sqrt(v_entry^2 + 2 * a * d)
         const float max_exit = std::sqrt(
             seg.entry_velocity * seg.entry_velocity +
-            2.0f * seg.acceleration * seg.length_mm
+            2.0f * seg.acceleration * seg.distance
         );
 
         // Take minimum of current exit and max achievable

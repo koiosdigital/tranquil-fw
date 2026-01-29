@@ -80,47 +80,75 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "Development mode: Homing skipped (theta=%ld steps/rot, rho=%ld max)",
         theta_steps_per_rot, rho_max_steps);
 
-    // Draw a square using linear interpolation in Cartesian space
-    // Square corners at 45°, 135°, 225°, 315° with rho = 0.5
-    // This creates a square with vertices on the diagonals
-    // Coordinates: theta in radians (0-2π), rho normalized (0-1)
-    constexpr double corner_rho = 0.5;  // Distance from center to corners
-    constexpr float feedrate = 10.0f;   // RPM
+    // Draw 3 squares using linear interpolation in Cartesian space
+    // Square corners at 45°, 135°, 225°, 315°
+    constexpr float feedrate = 25.0f;   // RPM
 
-    ESP_LOGI(TAG, "Starting square demo at corner_rho=%.2f (normalized), feedrate=%.1f RPM",
-             corner_rho, feedrate);
+    ESP_LOGI(TAG, "Starting 3-square demo, feedrate=%.1f RPM", feedrate);
 
     sand_table::PolarPosition pos;
 
-    // Move to first corner (45° = π/4)
+    // === Square 1: rho=0.4, forward direction (CCW) ===
+    constexpr double rho1 = 0.4;
+    ESP_LOGI(TAG, "Square 1: rho=%.2f, forward", rho1);
+
     pos.theta = M_PI / 4.0;
-    pos.rho = corner_rho;
-    ESP_LOGI(TAG, "Queuing move to corner 1: theta=%.2f rad (45°), rho=%.2f", pos.theta, pos.rho);
+    pos.rho = rho1;
     (void)g_motion_controller->move_to(pos, feedrate);
 
-    // Linear move to second corner (135° = 3π/4)
-    // PathPlanner interpolates linearly in Cartesian space, drawing a straight line
     pos.theta = 3.0 * M_PI / 4.0;
-    pos.rho = corner_rho;
-    ESP_LOGI(TAG, "Queuing move to corner 2: theta=%.2f rad (135°), rho=%.2f", pos.theta, pos.rho);
     (void)g_motion_controller->move_to(pos, feedrate);
 
-    // Linear move to third corner (225° = 5π/4)
     pos.theta = 5.0 * M_PI / 4.0;
-    pos.rho = corner_rho;
-    ESP_LOGI(TAG, "Queuing move to corner 3: theta=%.2f rad (225°), rho=%.2f", pos.theta, pos.rho);
     (void)g_motion_controller->move_to(pos, feedrate);
 
-    // Linear move to fourth corner (315° = 7π/4)
     pos.theta = 7.0 * M_PI / 4.0;
-    pos.rho = corner_rho;
-    ESP_LOGI(TAG, "Queuing move to corner 4: theta=%.2f rad (315°), rho=%.2f", pos.theta, pos.rho);
     (void)g_motion_controller->move_to(pos, feedrate);
 
-    // Close the square - back to first corner (45°)
     pos.theta = M_PI / 4.0;
-    pos.rho = corner_rho;
-    ESP_LOGI(TAG, "Queuing move to corner 1: theta=%.2f rad (45°), rho=%.2f", pos.theta, pos.rho);
+    (void)g_motion_controller->move_to(pos, feedrate);
+
+    // === Square 2: rho=0.2, reversed direction (CW) ===
+    constexpr double rho2 = 0.2;
+    ESP_LOGI(TAG, "Square 2: rho=%.2f, reversed", rho2);
+
+    pos.theta = M_PI / 4.0;
+    pos.rho = rho2;
+    (void)g_motion_controller->move_to(pos, feedrate);
+
+    pos.theta = 7.0 * M_PI / 4.0;
+    (void)g_motion_controller->move_to(pos, feedrate);
+
+    pos.theta = 5.0 * M_PI / 4.0;
+    (void)g_motion_controller->move_to(pos, feedrate);
+
+    pos.theta = 3.0 * M_PI / 4.0;
+    (void)g_motion_controller->move_to(pos, feedrate);
+
+    pos.theta = M_PI / 4.0;
+    (void)g_motion_controller->move_to(pos, feedrate);
+
+    // === Square 3: rho=0.6, forward direction (CCW) ===
+    constexpr double rho3 = 0.6;
+    ESP_LOGI(TAG, "Square 3: rho=%.2f, forward", rho3);
+
+    pos.theta = M_PI / 4.0;
+    pos.rho = rho3;
+    (void)g_motion_controller->move_to(pos, feedrate);
+
+    pos.theta = 3.0 * M_PI / 4.0;
+    (void)g_motion_controller->move_to(pos, feedrate);
+
+    pos.theta = 5.0 * M_PI / 4.0;
+    (void)g_motion_controller->move_to(pos, feedrate);
+
+    pos.theta = 7.0 * M_PI / 4.0;
+    (void)g_motion_controller->move_to(pos, feedrate);
+
+    pos.theta = M_PI / 4.0;
+    (void)g_motion_controller->move_to(pos, feedrate);
+
+    pos.rho = 0;
     (void)g_motion_controller->move_to(pos, feedrate);
 
     ESP_LOGI(TAG, "All moves queued. Waiting for completion...");
@@ -131,5 +159,5 @@ extern "C" void app_main(void)
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 
-    ESP_LOGI(TAG, "Square demo complete!");
+    ESP_LOGI(TAG, "3-square demo complete!");
 }

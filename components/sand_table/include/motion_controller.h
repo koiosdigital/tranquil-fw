@@ -162,9 +162,12 @@ private:
     std::atomic<bool> paused_{false};
     std::atomic<bool> running_{false};
 
-    // Current position tracking (theta: radians, rho: normalized 0-1)
+    // Current position tracking
+    // We track position in STEPS (integer) to avoid floating-point accumulation errors.
+    // Polar position is derived from steps only when needed for display/API.
     mutable SemaphoreHandle_t position_mutex_;
-    PolarPosition current_position_{0.0, 0.0};  // Home position
+    int32_t target_theta_steps_{0};  // Accumulated target theta position in steps
+    int32_t target_rho_steps_{0};    // Accumulated target rho position in steps
 
     // FreeRTOS tasks
     TaskHandle_t stepper_task_ = nullptr;
