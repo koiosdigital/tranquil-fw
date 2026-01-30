@@ -228,60 +228,13 @@ namespace sand_table {
             // Try to get next segment from queue
             MotionSegment segment;
             if (segment_queue_.pop(segment)) {
-                // Convert polar deltas to motor steps (simple, direct conversion)
+                // Convert polar deltas to motor steps
                 transformer_->delta_polar_to_motor_steps(
                     segment.delta_theta_rad,
                     segment.delta_rho_norm,
                     segment.delta_theta_steps,
                     segment.delta_rho_steps
                 );
-
-                // Debug: Track cumulative steps to find drift source
-                static int debug_segment_count = 0;
-                static int64_t cumulative_theta_steps = 0;
-                static int64_t cumulative_rho_steps = 0;
-                static double cumulative_theta_rad = 0.0;
-                static double cumulative_rho_norm = 0.0;
-
-                cumulative_theta_steps += segment.delta_theta_steps;
-                cumulative_rho_steps += segment.delta_rho_steps;
-                cumulative_theta_rad += segment.delta_theta_rad;
-                cumulative_rho_norm += segment.delta_rho_norm;
-
-                if (debug_segment_count < 5) {
-                    ESP_LOGI(TAG, "Seg[%d]: d_theta=%.6f rad, d_rho=%.6f, theta_s=%ld, rho_s=%ld, dist=%.4f",
-                        debug_segment_count, segment.delta_theta_rad, segment.delta_rho_norm,
-                        segment.delta_theta_steps, segment.delta_rho_steps, segment.distance);
-                    debug_segment_count++;
-                }
-
-                // Log cumulative totals and at end
-                static int total_segments = 0;
-                total_segments++;
-                if (segment.is_last_segment) {
-                    // Get actual motor positions
-                    int32_t actual_theta = theta_stepper_->position();
-                    int32_t actual_rho = rho_stepper_->position();
-
-                    ESP_LOGI(TAG, "=== Move Complete ===");
-                    ESP_LOGI(TAG, "  Segments: %d", total_segments);
-                    ESP_LOGI(TAG, "  Commanded: theta=%lld steps (%.4f rad), rho=%lld steps (%.4f norm)",
-                        cumulative_theta_steps, cumulative_theta_rad,
-                        cumulative_rho_steps, cumulative_rho_norm);
-                    ESP_LOGI(TAG, "  Actual pos: theta=%ld, rho=%ld",
-                        actual_theta, actual_rho);
-                    ESP_LOGI(TAG, "  Accumulators: theta=%.6f, rho=%.6f",
-                        transformer_->theta_accumulator(), transformer_->rho_accumulator());
-                    ESP_LOGI(TAG, "=====================");
-
-                    // Reset for next move
-                    total_segments = 0;
-                    cumulative_theta_steps = 0;
-                    cumulative_rho_steps = 0;
-                    cumulative_theta_rad = 0.0;
-                    cumulative_rho_norm = 0.0;
-                    debug_segment_count = 0;
-                }
 
                 // Execute segment at constant velocity
                 auto result = execute_segment_constant_velocity(segment);

@@ -24,14 +24,50 @@ static const char* TAG = "main";
 
 static sand_table::MotionController* g_motion_controller = nullptr;
 
+// Wait for all queued motion to complete
+static void wait_for_motion() {
+    while (g_motion_controller->is_moving() || g_motion_controller->queue_depth() > 0) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));  // Brief settle time
+}
+
+// Draw a circle at the given radius using 8 segments of pi/4 each
+// direction: +1 for CCW, -1 for CW
+static void draw_circle(double& current_theta, float rho, int direction, float feedrate) {
+    constexpr double QUARTER_PI = M_PI / 4.0;
+    sand_table::PolarPosition pos;
+    pos.rho = rho;
+
+    for (int i = 0; i < 8; i++) {
+        current_theta += direction * QUARTER_PI;
+        pos.theta = current_theta;
+        (void)g_motion_controller->move_to(pos, feedrate);
+        wait_for_motion();
+    }
+}
+
+// Draw a triangle at the given radius
+// Vertices are evenly spaced at 120 degrees apart
+static void draw_triangle(double start_theta, float rho, float feedrate) {
+    constexpr double TWO_PI_THIRDS = 2.0 * M_PI / 3.0;
+    sand_table::PolarPosition pos;
+    pos.rho = rho;
+
+    // Draw three sides connecting vertices at 0, 120, 240 degrees from start
+    for (int i = 0; i < 3; i++) {
+        pos.theta = start_theta + (i + 1) * TWO_PI_THIRDS;
+        (void)g_motion_controller->move_to(pos, feedrate);
+        wait_for_motion();
+    }
+}
+
 extern "C" void app_main(void)
 {
-    //event loop
     esp_event_loop_create_default();
 
     stusb_init();
 
-    //use protocomm security version 0
     kd_common_set_provisioning_pop_token_format(ProvisioningPOPTokenFormat_t::NONE);
     kd_common_init();
 
@@ -50,10 +86,9 @@ extern "C" void app_main(void)
         }
     }
 
-    // Initialize player with motion controller
     SandTablePlayer::initialize(g_motion_controller);
 
-    PixelDriver::initialize(60); // 60Hz update rate
+    PixelDriver::initialize(60);
 
 #if defined(CONFIG_LED_TYPE_RGB) && CONFIG_LED_TYPE_RGB
     PixelFormat format = PixelFormat::RGB;
@@ -62,166 +97,89 @@ extern "C" void app_main(void)
 #endif
 
     PixelDriver::addChannel(ChannelConfig((gpio_num_t)CONFIG_LED_PIN, CONFIG_LED_NUM_LEDS, format));
-    PixelDriver::setCurrentLimit(1750); // Set current limit to 1750mA (1.75A)
+    PixelDriver::setCurrentLimit(1750);
     PixelDriver::start();
 
     api_init();
 
     // Development: Skip homing, use estimated calibration values
-    // theta_steps_per_rot = STEPS_PER_THETA_ROTATION (integer constant, no float math)
-    //                     = (200 * 16 * 800) / 100 = 25600 steps per rotation
-    // rho_max_steps = estimated ~3 rotations of travel = 200 * 16 * 3 = 9600 steps
     constexpr int32_t theta_steps_per_rot = sand_table::MechanicalConfig::STEPS_PER_THETA_ROTATION;
-    constexpr int32_t rho_max_steps = 200 * 16 * 3;  // ~3 rotations of travel (estimate)
+    constexpr int32_t rho_max_steps = 200 * 16 * 3;  // ~3 rotations of travel
     g_motion_controller->_set_homed(theta_steps_per_rot, rho_max_steps);
     ESP_LOGI(TAG, "Development mode: Homing skipped (theta=%ld steps/rot, rho=%ld max)",
         theta_steps_per_rot, rho_max_steps);
 
     // ==========================================================================
-    // CIRCLE TEST PATTERN
+    // DEMO PATTERN: 3 circles, 2 triangles, return to center
     // ==========================================================================
-    // Draws 3 circles CCW at different radii, then 3 circles CW, then returns to center.
-    // Each circle is split into 8 segments of π/4 to avoid wrap-around issues.
 
-    constexpr float feedrate = 15.0f;   // RPM
-    constexpr double QUARTER_PI = M_PI / 4.0;
+    constexpr float feedrate = 15.0f;  // RPM
     sand_table::PolarPosition pos;
-
-    ESP_LOGI(TAG, "=== CIRCLE TEST PATTERN ===");
-    ESP_LOGI(TAG, "Feedrate: %.1f RPM", feedrate);
-    ESP_LOGI(TAG, "Steps/theta_rot: %ld", theta_steps_per_rot);
-    ESP_LOGI(TAG, "Rho max steps: %ld", rho_max_steps);
-
-    // Helper lambda to wait for motion completion
-    auto wait_for_motion = []() {
-        while (g_motion_controller->is_moving() || g_motion_controller->queue_depth() > 0) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
-        vTaskDelay(pdMS_TO_TICKS(50));  // Brief settle time
-    };
-
-    // Helper lambda to draw a circle in π/4 segments
-    // direction: +1 for CCW, -1 for CW
-    auto draw_circle = [&](double& current_theta, float rho, int direction) {
-        pos.rho = rho;
-        for (int i = 0; i < 8; i++) {
-            current_theta += direction * QUARTER_PI;
-            pos.theta = current_theta;
-            (void)g_motion_controller->move_to(pos, feedrate);
-            wait_for_motion();
-        }
-    };
-
     double current_theta = 0.0;
 
-    // Move to starting radius
     ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "=== Moving to starting position ===");
+    ESP_LOGI(TAG, "=== DEMO PATTERN ===");
+    ESP_LOGI(TAG, "3 circles, 2 triangles, return to center");
+    ESP_LOGI(TAG, "Feedrate: %.1f RPM", feedrate);
+
+    // --- CIRCLE 1: CCW at rho=0.3 ---
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "Circle 1: CCW at rho=0.3");
     pos.theta = 0.0;
-    pos.rho = 0.3;
+    pos.rho = 0.3f;
     (void)g_motion_controller->move_to(pos, feedrate);
     wait_for_motion();
+    draw_circle(current_theta, 0.3f, +1, feedrate);
 
-    // ========== CIRCLE 1: CCW at rho=0.3 ==========
-    ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "=== CIRCLE 1: CCW at rho=0.3 ===");
-    draw_circle(current_theta, 0.3f, +1);
-
-    auto status1 = g_motion_controller->get_status();
-    ESP_LOGI(TAG, "After circle 1: theta=%ld steps, rho=%ld steps, displayed rho=%.3f",
-        status1.theta.position_steps, status1.rho.position_steps, status1.position.rho);
-
-    // ========== CIRCLE 2: CCW at rho=0.5 ==========
-    ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "=== CIRCLE 2: CCW at rho=0.5 ===");
+    // --- CIRCLE 2: CCW at rho=0.5 ---
+    ESP_LOGI(TAG, "Circle 2: CCW at rho=0.5");
     pos.theta = current_theta;
-    pos.rho = 0.5;
+    pos.rho = 0.5f;
     (void)g_motion_controller->move_to(pos, feedrate);
     wait_for_motion();
-    draw_circle(current_theta, 0.5f, +1);
+    draw_circle(current_theta, 0.5f, +1, feedrate);
 
-    auto status2 = g_motion_controller->get_status();
-    ESP_LOGI(TAG, "After circle 2: theta=%ld steps, rho=%ld steps, displayed rho=%.3f",
-        status2.theta.position_steps, status2.rho.position_steps, status2.position.rho);
-
-    // ========== CIRCLE 3: CCW at rho=0.7 ==========
-    ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "=== CIRCLE 3: CCW at rho=0.7 ===");
+    // --- CIRCLE 3: CCW at rho=0.7 ---
+    ESP_LOGI(TAG, "Circle 3: CCW at rho=0.7");
     pos.theta = current_theta;
-    pos.rho = 0.7;
+    pos.rho = 0.7f;
     (void)g_motion_controller->move_to(pos, feedrate);
     wait_for_motion();
-    draw_circle(current_theta, 0.7f, +1);
+    draw_circle(current_theta, 0.7f, +1, feedrate);
 
-    auto status3 = g_motion_controller->get_status();
-    ESP_LOGI(TAG, "After circle 3: theta=%ld steps, rho=%ld steps, displayed rho=%.3f",
-        status3.theta.position_steps, status3.rho.position_steps, status3.position.rho);
-
-    // ========== CIRCLE 4: CW at rho=0.6 ==========
+    // --- TRIANGLE 1: at rho=0.6 ---
     ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "=== CIRCLE 4: CW (reverse) at rho=0.6 ===");
+    ESP_LOGI(TAG, "Triangle 1: at rho=0.6");
     pos.theta = current_theta;
-    pos.rho = 0.6;
+    pos.rho = 0.6f;
     (void)g_motion_controller->move_to(pos, feedrate);
     wait_for_motion();
-    draw_circle(current_theta, 0.6f, -1);
+    draw_triangle(current_theta, 0.6f, feedrate);
+    current_theta += 2.0 * M_PI;  // Triangle completes a full rotation
 
-    auto status4 = g_motion_controller->get_status();
-    ESP_LOGI(TAG, "After circle 4: theta=%ld steps, rho=%ld steps, displayed rho=%.3f",
-        status4.theta.position_steps, status4.rho.position_steps, status4.position.rho);
-
-    // ========== CIRCLE 5: CW at rho=0.4 ==========
-    ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "=== CIRCLE 5: CW (reverse) at rho=0.4 ===");
+    // --- TRIANGLE 2: at rho=0.4 ---
+    ESP_LOGI(TAG, "Triangle 2: at rho=0.4");
     pos.theta = current_theta;
-    pos.rho = 0.4;
+    pos.rho = 0.4f;
     (void)g_motion_controller->move_to(pos, feedrate);
     wait_for_motion();
-    draw_circle(current_theta, 0.4f, -1);
+    draw_triangle(current_theta, 0.4f, feedrate);
+    current_theta += 2.0 * M_PI;
 
-    auto status5 = g_motion_controller->get_status();
-    ESP_LOGI(TAG, "After circle 5: theta=%ld steps, rho=%ld steps, displayed rho=%.3f",
-        status5.theta.position_steps, status5.rho.position_steps, status5.position.rho);
-
-    // ========== CIRCLE 6: CW at rho=0.2 ==========
+    // --- RETURN TO CENTER ---
     ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "=== CIRCLE 6: CW (reverse) at rho=0.2 ===");
+    ESP_LOGI(TAG, "Returning to center");
     pos.theta = current_theta;
-    pos.rho = 0.2;
-    (void)g_motion_controller->move_to(pos, feedrate);
-    wait_for_motion();
-    draw_circle(current_theta, 0.2f, -1);
-
-    auto status6 = g_motion_controller->get_status();
-    ESP_LOGI(TAG, "After circle 6: theta=%ld steps, rho=%ld steps, displayed rho=%.3f",
-        status6.theta.position_steps, status6.rho.position_steps, status6.position.rho);
-
-    // ========== RETURN TO CENTER ==========
-    ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "=== RETURNING TO CENTER ===");
-    pos.theta = current_theta;
-    pos.rho = 0.0;
+    pos.rho = 0.0f;
     (void)g_motion_controller->move_to(pos, feedrate);
     wait_for_motion();
 
-    auto status_final = g_motion_controller->get_status();
-
+    // --- FINAL STATUS ---
+    auto status = g_motion_controller->get_status();
     ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "============================================");
-    ESP_LOGI(TAG, "=== CIRCLE TEST COMPLETE ===");
-    ESP_LOGI(TAG, "============================================");
-    ESP_LOGI(TAG, "Final motor position:");
-    ESP_LOGI(TAG, "  Theta: %ld steps (%.2f rotations)",
-        status_final.theta.position_steps,
-        static_cast<float>(status_final.theta.position_steps) / theta_steps_per_rot);
-    ESP_LOGI(TAG, "  Rho:   %ld steps", status_final.rho.position_steps);
-    ESP_LOGI(TAG, "Final displayed position:");
-    ESP_LOGI(TAG, "  Theta: %.4f rad (%.1f deg)",
-        status_final.position.theta, status_final.position.theta * 180.0 / M_PI);
-    ESP_LOGI(TAG, "  Rho:   %.4f (expected: 0.0)", status_final.position.rho);
-    ESP_LOGI(TAG, "============================================");
-    ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "Net theta rotations: 3 CCW - 3 CW = 0 (should return to start)");
-    ESP_LOGI(TAG, "Expected final theta: %.4f rad", current_theta);
-    ESP_LOGI(TAG, "If rho drifted, coupling compensation may have issues.");
+    ESP_LOGI(TAG, "=== DEMO COMPLETE ===");
+    ESP_LOGI(TAG, "Final position: theta=%ld steps, rho=%ld steps",
+        status.theta.position_steps, status.rho.position_steps);
+    ESP_LOGI(TAG, "Polar: theta=%.4f rad, rho=%.4f",
+        status.position.theta, status.position.rho);
 }
