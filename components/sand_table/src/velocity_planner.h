@@ -60,8 +60,14 @@ private:
     float acceleration_ = static_cast<float>(MotionConfig::DEFAULT_ACCEL_MM_S2);
     float junction_deviation_ = MotionConfig::JUNCTION_DEVIATION_MM;
 
-    /// Calculate junction velocity between two segments based on direction change
-    [[nodiscard]] float calculate_junction_velocity(
+    /// Calculate theta motor junction velocity (only affected by theta direction changes)
+    [[nodiscard]] float calculate_theta_junction_velocity(
+        const MotionSegment& prev,
+        const MotionSegment& next
+    ) const;
+
+    /// Calculate rho motor junction velocity (only affected by rho direction changes)
+    [[nodiscard]] float calculate_rho_junction_velocity(
         const MotionSegment& prev,
         const MotionSegment& next
     ) const;
@@ -143,46 +149,57 @@ inline std::optional<MotionSegment> VelocityPlanner::peek_segment() const {
     return segments_[tail_];
 }
 
-inline float VelocityPlanner::calculate_junction_velocity(
+inline float VelocityPlanner::calculate_theta_junction_velocity(
     const MotionSegment& prev,
     const MotionSegment& next) const
 {
-    // Get direction vectors for both segments
-    const auto prev_dir = prev.direction();
-    const auto next_dir = next.direction();
+    // Independent velocity for theta motor - only affected by theta direction changes
+    auto sign = [](int32_t v) -> int {
+        if (v > 0) return 1;
+        if (v < 0) return -1;
+        return 0;
+    };
 
-    // Calculate dot product (cosine of angle between directions)
-    const float cos_angle = prev_dir.dot(next_dir);
+    const int prev_dir = sign(prev.delta_theta_steps);
+    const int next_dir = sign(next.delta_theta_steps);
 
-    // Handle edge cases
-    if (cos_angle <= -0.99f) {
-        // Near reversal (180 degrees) - must stop
+    // A reversal is when direction changes from +1 to -1 or vice versa
+    // (not when going from 0 to +/-1 or from +/-1 to 0)
+    bool reverses = (prev_dir != 0 && next_dir != 0 && prev_dir != next_dir);
+
+    if (reverses) {
+        // Theta motor reversal - must stop at junction
         return 0.0f;
     }
 
-    if (cos_angle >= 0.99f) {
-        // Near straight line - can maintain velocity
-        return std::min(prev.nominal_velocity, next.nominal_velocity);
+    // No reversal - can maintain velocity through junction
+    return std::min(prev.nominal_velocity, next.nominal_velocity);
+}
+
+inline float VelocityPlanner::calculate_rho_junction_velocity(
+    const MotionSegment& prev,
+    const MotionSegment& next) const
+{
+    // Independent velocity for rho motor - only affected by rho direction changes
+    auto sign = [](int32_t v) -> int {
+        if (v > 0) return 1;
+        if (v < 0) return -1;
+        return 0;
+    };
+
+    const int prev_dir = sign(prev.delta_rho_steps);
+    const int next_dir = sign(next.delta_rho_steps);
+
+    // A reversal is when direction changes from +1 to -1 or vice versa
+    bool reverses = (prev_dir != 0 && next_dir != 0 && prev_dir != next_dir);
+
+    if (reverses) {
+        // Rho motor reversal - must stop at junction
+        return 0.0f;
     }
 
-    // Calculate junction velocity based on deviation
-    // Using the formula from Grbl/Marlin:
-    // v_junction = sqrt(a * deviation / sin(theta/2))
-    //
-    // Where theta is the angle between segment directions
-    // sin(theta/2) = sqrt((1 - cos(theta)) / 2)
-
-    const float sin_half_theta = std::sqrt((1.0f - cos_angle) / 2.0f);
-    const float v_junction = std::sqrt(
-        acceleration_ * junction_deviation_ / sin_half_theta
-    );
-
-    // Clamp to the lower of the two segment velocities
-    return std::min({
-        v_junction,
-        prev.nominal_velocity,
-        next.nominal_velocity
-    });
+    // No reversal - can maintain velocity through junction
+    return std::min(prev.nominal_velocity, next.nominal_velocity);
 }
 
 inline void VelocityPlanner::recalculate() {
@@ -193,29 +210,44 @@ inline void VelocityPlanner::recalculate() {
     // Single segment - simple case
     if (count_ == 1) {
         MotionSegment& seg = at(0);
-        seg.entry_velocity = 0.0f;
-        seg.exit_velocity = seg.is_last_segment ? 0.0f : seg.nominal_velocity;
+        // Both motors start from zero
+        seg.theta_entry_velocity = 0.0f;
+        seg.rho_entry_velocity = 0.0f;
+        // Exit at nominal unless it's the last segment
+        if (seg.is_last_segment) {
+            seg.theta_exit_velocity = 0.0f;
+            seg.rho_exit_velocity = 0.0f;
+        } else {
+            seg.theta_exit_velocity = seg.nominal_velocity;
+            seg.rho_exit_velocity = seg.nominal_velocity;
+        }
         return;
     }
 
-    // Calculate junction velocities between segments
+    // Calculate junction velocities between segments - INDEPENDENTLY per motor
     for (size_t i = 0; i < count_ - 1; ++i) {
         MotionSegment& curr = at(i);
         MotionSegment& next = at(i + 1);
 
-        const float junction_vel = calculate_junction_velocity(curr, next);
+        // Theta motor junction - only affected by theta direction changes
+        const float theta_junction = calculate_theta_junction_velocity(curr, next);
+        curr.theta_exit_velocity = theta_junction;
+        next.theta_entry_velocity = theta_junction;
 
-        // This will be refined by the two-pass algorithm
-        curr.exit_velocity = junction_vel;
-        next.entry_velocity = junction_vel;
+        // Rho motor junction - only affected by rho direction changes
+        const float rho_junction = calculate_rho_junction_velocity(curr, next);
+        curr.rho_exit_velocity = rho_junction;
+        next.rho_entry_velocity = rho_junction;
     }
 
     // First segment starts from zero (or current velocity if resuming)
-    at(0).entry_velocity = 0.0f;
+    at(0).theta_entry_velocity = 0.0f;
+    at(0).rho_entry_velocity = 0.0f;
 
     // Last segment ends at zero if marked as last
     if (at(count_ - 1).is_last_segment) {
-        at(count_ - 1).exit_velocity = 0.0f;
+        at(count_ - 1).theta_exit_velocity = 0.0f;
+        at(count_ - 1).rho_exit_velocity = 0.0f;
     }
 
     // Run two-pass algorithm
@@ -225,56 +257,70 @@ inline void VelocityPlanner::recalculate() {
 
 inline void VelocityPlanner::reverse_pass() {
     // Work backward from end to start
-    // Ensure each segment can decelerate to its exit velocity
+    // Ensure each motor can decelerate to its exit velocity (independently)
 
     for (size_t i = count_; i > 0; --i) {
         MotionSegment& seg = at(i - 1);
 
         // Maximum entry velocity that allows deceleration to exit velocity
         // v_entry = sqrt(v_exit^2 + 2 * a * d)
-        const float max_entry = std::sqrt(
-            seg.exit_velocity * seg.exit_velocity +
+
+        // Theta motor
+        const float max_theta_entry = std::sqrt(
+            seg.theta_exit_velocity * seg.theta_exit_velocity +
             2.0f * seg.acceleration * seg.distance
         );
+        seg.theta_entry_velocity = std::min(seg.theta_entry_velocity, max_theta_entry);
+        seg.theta_entry_velocity = std::min(seg.theta_entry_velocity, seg.nominal_velocity);
 
-        // Take minimum of current entry and max achievable
-        seg.entry_velocity = std::min(seg.entry_velocity, max_entry);
-
-        // Clamp to nominal
-        seg.entry_velocity = std::min(seg.entry_velocity, seg.nominal_velocity);
+        // Rho motor
+        const float max_rho_entry = std::sqrt(
+            seg.rho_exit_velocity * seg.rho_exit_velocity +
+            2.0f * seg.acceleration * seg.distance
+        );
+        seg.rho_entry_velocity = std::min(seg.rho_entry_velocity, max_rho_entry);
+        seg.rho_entry_velocity = std::min(seg.rho_entry_velocity, seg.nominal_velocity);
 
         // Propagate to previous segment's exit velocity
         if (i > 1) {
             MotionSegment& prev = at(i - 2);
-            prev.exit_velocity = std::min(prev.exit_velocity, seg.entry_velocity);
+            prev.theta_exit_velocity = std::min(prev.theta_exit_velocity, seg.theta_entry_velocity);
+            prev.rho_exit_velocity = std::min(prev.rho_exit_velocity, seg.rho_entry_velocity);
         }
     }
 }
 
 inline void VelocityPlanner::forward_pass() {
     // Work forward from start to end
-    // Ensure each segment can accelerate from its entry velocity
+    // Ensure each motor can accelerate from its entry velocity (independently)
 
     for (size_t i = 0; i < count_; ++i) {
         MotionSegment& seg = at(i);
 
         // Maximum exit velocity achievable from entry velocity
         // v_exit = sqrt(v_entry^2 + 2 * a * d)
-        const float max_exit = std::sqrt(
-            seg.entry_velocity * seg.entry_velocity +
+
+        // Theta motor
+        const float max_theta_exit = std::sqrt(
+            seg.theta_entry_velocity * seg.theta_entry_velocity +
             2.0f * seg.acceleration * seg.distance
         );
+        seg.theta_exit_velocity = std::min(seg.theta_exit_velocity, max_theta_exit);
+        seg.theta_exit_velocity = std::min(seg.theta_exit_velocity, seg.nominal_velocity);
 
-        // Take minimum of current exit and max achievable
-        seg.exit_velocity = std::min(seg.exit_velocity, max_exit);
-
-        // Clamp to nominal
-        seg.exit_velocity = std::min(seg.exit_velocity, seg.nominal_velocity);
+        // Rho motor
+        const float max_rho_exit = std::sqrt(
+            seg.rho_entry_velocity * seg.rho_entry_velocity +
+            2.0f * seg.acceleration * seg.distance
+        );
+        seg.rho_exit_velocity = std::min(seg.rho_exit_velocity, max_rho_exit);
+        seg.rho_exit_velocity = std::min(seg.rho_exit_velocity, seg.nominal_velocity);
 
         // Propagate to next segment's entry velocity
         if (i < count_ - 1) {
             MotionSegment& next = at(i + 1);
-            next.entry_velocity = std::min(next.entry_velocity, seg.exit_velocity);
+            next.theta_entry_velocity = std::min(next.theta_entry_velocity, seg.theta_exit_velocity);
+            next.rho_entry_velocity = std::min(next.rho_entry_velocity, seg.rho_exit_velocity);
         }
     }
 }

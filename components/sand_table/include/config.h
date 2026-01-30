@@ -81,8 +81,10 @@ namespace sand_table {
         static constexpr int32_t THETA_MAX_SPEED_RPM = CONFIG_ROBOT_THETA_MAX_SPEED;
         static constexpr int32_t RHO_MAX_SPEED_RPM = CONFIG_ROBOT_RHO_MAX_SPEED;
 
-        // Motion command queue
+        // Velocity planning
         static constexpr uint32_t LOOKAHEAD_DEPTH = 32;
+        static constexpr float DEFAULT_ACCEL_MM_S2 = 50.0f;    // Default acceleration (mm/s^2)
+        static constexpr float JUNCTION_DEVIATION_MM = 0.05f;  // Cornering deviation (mm)
 
         // Motor current settings (from config, hold = run / 2)
         static constexpr uint16_t THETA_IRUN_MA = CONFIG_ROBOT_THETA_MOTOR_CURRENT;

@@ -136,10 +136,13 @@ struct MotionSegment {
     // Normalized distance (for velocity planning)
     float distance = 0.0f;
 
-    // Velocity profile - set by lookahead
-    float entry_velocity = 0.0f;    // normalized units/s
-    float nominal_velocity = 0.0f;
-    float exit_velocity = 0.0f;
+    // Velocity profile - set by lookahead (per-motor, independent)
+    // Each motor has its own entry/exit velocities - only slows when that motor reverses
+    float theta_entry_velocity = 0.0f;   // RPM
+    float theta_exit_velocity = 0.0f;    // RPM
+    float rho_entry_velocity = 0.0f;     // RPM
+    float rho_exit_velocity = 0.0f;      // RPM
+    float nominal_velocity = 0.0f;       // RPM (shared nominal/cruise target)
     float acceleration = 0.0f;
 
     // Flags

@@ -22,6 +22,7 @@ class CoordinatedStepperController;
 class HomingController;
 class CoordinateTransformer;
 class PathPlanner;
+class VelocityPlanner;
 }
 
 namespace sand_table {
@@ -133,8 +134,10 @@ private:
     static constexpr size_t kSegmentQueueSize = 64;
     mutable RingBuffer<MotionSegment, kSegmentQueueSize> segment_queue_;
 
-    // Path planner
+    // Path planner and velocity planner (lookahead)
     std::unique_ptr<PathPlanner> path_planner_;
+    std::unique_ptr<VelocityPlanner> velocity_planner_;
+
     // TMC UART bus (shared by both drivers)
     std::unique_ptr<tmc::UartBus> tmc_bus_;
 
@@ -191,7 +194,8 @@ private:
 
     // Segment handling
     bool enqueue_segment(MotionSegment& segment);
-    Result<void> execute_segment_constant_velocity(const MotionSegment& segment);
+    void transfer_ready_segments();
+    Result<void> execute_segment(const MotionSegment& segment);
 };
 
 } // namespace sand_table

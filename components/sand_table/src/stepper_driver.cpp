@@ -671,49 +671,99 @@ VelocityProfile CoordinatedStepperController::calculate_velocity_profile(
         return profile;
     }
 
-    // Simplified constant velocity profile (like main branch)
-    // nominal_velocity is in RPM
-    float feedrate_rpm = segment.nominal_velocity;
-    if (feedrate_rpm <= 0) {
-        feedrate_rpm = static_cast<float>(MotionConfig::RHO_MAX_SPEED_RPM);
-    }
-
-    // Calculate motion time based on distance and RPM
-    // motion_time = distance / (RPM / 60) for normalized distance
-    float motion_time_seconds = 0.0f;
-    if (segment.distance > 0.0f) {
-        motion_time_seconds = segment.distance / (feedrate_rpm / 60.0f);
-    }
-
-    // CRITICAL: Ensure minimum motion time based on step count and max velocity
-    // This prevents extremely fast moves when Cartesian distance is small but step count is large
-    // (happens when theta changes significantly at small rho values)
+    // Hardware limits
     const float max_step_rate = static_cast<float>(HardwareConfig::MAX_STEP_RATE_HZ);
-    const float min_motion_time = static_cast<float>(total_steps) / max_step_rate;
-    if (motion_time_seconds < min_motion_time) {
-        motion_time_seconds = min_motion_time;
-    }
-
-    // Calculate steps per second for constant velocity
-    if (motion_time_seconds > 0.0f) {
-        profile.cruise_velocity = static_cast<float>(total_steps) / motion_time_seconds;
-    } else {
-        // Fallback: use max step rate
-        profile.cruise_velocity = max_step_rate;
-    }
-
-    // Clamp to hardware limits
-    // Min velocity limited by RMT symbol max duration (~3278µs = 305 steps/s)
     const float min_step_rate = 310.0f;  // Limited by RMT symbol duration
-    profile.cruise_velocity = std::max(min_step_rate, std::min(profile.cruise_velocity, max_step_rate));
 
-    // No acceleration for now (constant velocity like main branch)
-    profile.entry_velocity = profile.cruise_velocity;
-    profile.exit_velocity = profile.cruise_velocity;
-    profile.acceleration = 0.0f;
-    profile.accel_steps = 0;
-    profile.decel_steps = 0;
-    profile.cruise_steps = total_steps;
+    // Use the DOMINANT motor's velocity profile (more steps = controls timing)
+    // Each motor has independent velocity planning - rho reversal doesn't affect theta velocity
+    const bool theta_is_dominant = std::abs(segment.delta_theta_steps) >= std::abs(segment.delta_rho_steps);
+
+    // Select the dominant motor's velocities
+    const float entry_rpm = theta_is_dominant ? segment.theta_entry_velocity : segment.rho_entry_velocity;
+    const float exit_rpm = theta_is_dominant ? segment.theta_exit_velocity : segment.rho_exit_velocity;
+
+    // Convert RPM to steps/s using the relationship:
+    //   motion_time = distance / (rpm / 60)
+    //   velocity_steps_s = total_steps / motion_time
+    //                    = total_steps * (rpm / 60) / distance
+    //                    = rpm * (total_steps / distance) / 60
+    //                    = rpm * steps_per_unit / 60
+    const float rpm_to_steps_s = steps_per_unit / 60.0f;
+
+    float entry_steps_s = entry_rpm * rpm_to_steps_s;
+    float exit_steps_s = exit_rpm * rpm_to_steps_s;
+    float nominal_steps_s = segment.nominal_velocity * rpm_to_steps_s;
+
+    // Clamp velocities to hardware limits
+    entry_steps_s = std::max(min_step_rate, std::min(entry_steps_s, max_step_rate));
+    exit_steps_s = std::max(min_step_rate, std::min(exit_steps_s, max_step_rate));
+    nominal_steps_s = std::max(min_step_rate, std::min(nominal_steps_s, max_step_rate));
+
+    // Ensure minimum motion time based on max step rate
+    const float min_motion_time = static_cast<float>(total_steps) / max_step_rate;
+    const float nominal_motion_time = static_cast<float>(total_steps) / nominal_steps_s;
+    if (nominal_motion_time < min_motion_time) {
+        nominal_steps_s = max_step_rate;
+    }
+
+    // Acceleration in steps/s^2
+    // Use a reasonable default that gives smooth motion
+    // For sand table: accelerate from 0 to max in ~0.5s = 50000/0.5 = 100000 steps/s^2
+    // But that's aggressive. Use 10000 steps/s^2 for gentler acceleration.
+    const float accel_steps_s2 = 10000.0f;  // steps/s^2
+
+    // Calculate distances (in steps) for acceleration and deceleration
+    // Using kinematic equation: v^2 = v0^2 + 2*a*d  =>  d = (v^2 - v0^2) / (2*a)
+    float accel_dist = 0.0f;
+    float decel_dist = 0.0f;
+
+    if (nominal_steps_s > entry_steps_s) {
+        accel_dist = (nominal_steps_s * nominal_steps_s - entry_steps_s * entry_steps_s) /
+                     (2.0f * accel_steps_s2);
+    }
+    if (nominal_steps_s > exit_steps_s) {
+        decel_dist = (nominal_steps_s * nominal_steps_s - exit_steps_s * exit_steps_s) /
+                     (2.0f * accel_steps_s2);
+    }
+
+    // Check if we can reach cruise velocity (trapezoidal profile)
+    // or if we need a triangle profile
+    const float total_dist = static_cast<float>(total_steps);
+
+    if (accel_dist + decel_dist <= total_dist) {
+        // Trapezoidal profile: we reach cruise velocity
+        profile.accel_steps = static_cast<uint32_t>(accel_dist);
+        profile.decel_steps = static_cast<uint32_t>(decel_dist);
+        profile.cruise_steps = total_steps - profile.accel_steps - profile.decel_steps;
+        profile.cruise_velocity = nominal_steps_s;
+    } else {
+        // Triangle profile: can't reach cruise velocity
+        // Find peak velocity: v_peak^2 = (v_entry^2 + v_exit^2 + 2*a*d) / 2
+        float v_peak_sq = (entry_steps_s * entry_steps_s +
+                          exit_steps_s * exit_steps_s +
+                          2.0f * accel_steps_s2 * total_dist) / 2.0f;
+
+        if (v_peak_sq < min_step_rate * min_step_rate) {
+            v_peak_sq = min_step_rate * min_step_rate;
+        }
+
+        float v_peak = std::sqrt(v_peak_sq);
+        v_peak = std::min(v_peak, max_step_rate);
+
+        // Recalculate accel/decel distances with peak velocity
+        accel_dist = (v_peak * v_peak - entry_steps_s * entry_steps_s) / (2.0f * accel_steps_s2);
+        decel_dist = total_dist - accel_dist;
+
+        profile.accel_steps = static_cast<uint32_t>(std::max(0.0f, accel_dist));
+        profile.decel_steps = total_steps - profile.accel_steps;
+        profile.cruise_steps = 0;
+        profile.cruise_velocity = v_peak;
+    }
+
+    profile.entry_velocity = entry_steps_s;
+    profile.exit_velocity = exit_steps_s;
+    profile.acceleration = accel_steps_s2;
 
     return profile;
 }

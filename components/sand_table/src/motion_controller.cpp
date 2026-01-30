@@ -3,6 +3,7 @@
 #include "homing_controller.h"
 #include "coordinate_transformer.h"
 #include "path_planner.h"
+#include "velocity_planner.h"
 
 #include "esp_log.h"
 
@@ -12,12 +13,13 @@ namespace sand_table {
 
     MotionController::MotionController()
         : path_planner_(std::make_unique<PathPlanner>())
+        , velocity_planner_(std::make_unique<VelocityPlanner>())
         , transformer_(std::make_unique<CoordinateTransformer>())
     {
-        // Set up PathPlanner callback to enqueue segments
+        // Set up PathPlanner callback to enqueue segments via VelocityPlanner
         path_planner_->set_segment_callback([this](MotionSegment& seg) {
             return this->enqueue_segment(seg);
-            });
+        });
     }
 
     MotionController::~MotionController() {
@@ -212,6 +214,7 @@ namespace sand_table {
             // Check for emergency stop
             if (emergency_stop_.load(std::memory_order_acquire)) {
                 segment_queue_.clear();
+                velocity_planner_->clear();
                 stepper_controller_->emergency_stop();
                 state_.store(SystemState::EStop, std::memory_order_release);
                 vTaskDelay(pdMS_TO_TICKS(100));
@@ -225,19 +228,16 @@ namespace sand_table {
                 continue;
             }
 
+            // Transfer ready segments from velocity planner to execution queue
+            transfer_ready_segments();
+
             // Try to get next segment from queue
             MotionSegment segment;
             if (segment_queue_.pop(segment)) {
-                // Convert polar deltas to motor steps
-                transformer_->delta_polar_to_motor_steps(
-                    segment.delta_theta_rad,
-                    segment.delta_rho_norm,
-                    segment.delta_theta_steps,
-                    segment.delta_rho_steps
-                );
+                // Motor steps already calculated in enqueue_segment() before velocity planning
 
-                // Execute segment at constant velocity
-                auto result = execute_segment_constant_velocity(segment);
+                // Execute segment with trapezoidal velocity profile
+                auto result = execute_segment(segment);
 
                 // Yield to other tasks to prevent watchdog timeout
                 taskYIELD();
@@ -252,14 +252,15 @@ namespace sand_table {
                 handle_position_overflow();
 
                 // Check if this was the last segment
-                if (segment.is_last_segment && segment_queue_.empty()) {
+                if (segment.is_last_segment && segment_queue_.empty() && velocity_planner_->empty()) {
                     state_.store(SystemState::Idle, std::memory_order_release);
                     reset_inactivity_timer();
                 }
             }
             else {
                 // Queue empty, check if we should go idle
-                if (state_.load(std::memory_order_acquire) == SystemState::Running) {
+                if (state_.load(std::memory_order_acquire) == SystemState::Running &&
+                    velocity_planner_->empty()) {
                     state_.store(SystemState::Idle, std::memory_order_release);
                     reset_inactivity_timer();
                 }
@@ -504,27 +505,55 @@ namespace sand_table {
     }
 
     bool MotionController::enqueue_segment(MotionSegment& segment) {
-        // Wait for queue space (provides natural backpressure)
-        // This blocks the caller until there's room in the queue
-        // Using 10ms delay to avoid starving IDLE task (watchdog)
-        while (segment_queue_.full()) {
+        // Calculate motor steps BEFORE velocity planning
+        // This allows VelocityPlanner to see actual motor directions after coupling compensation
+        transformer_->delta_polar_to_motor_steps(
+            segment.delta_theta_rad,
+            segment.delta_rho_norm,
+            segment.delta_theta_steps,
+            segment.delta_rho_steps
+        );
+
+        // Push segment to velocity planner for lookahead processing
+        // VelocityPlanner calculates entry/exit velocities based on motor directions
+        while (velocity_planner_->full()) {
             vTaskDelay(pdMS_TO_TICKS(10));
         }
-
-        return segment_queue_.push(segment);
+        return velocity_planner_->add_segment(segment);
     }
 
-    Result<void> MotionController::execute_segment_constant_velocity(const MotionSegment& segment) {
-        // Create a copy with simplified constant velocity profile
-        MotionSegment exec_segment = segment;
+    void MotionController::transfer_ready_segments() {
+        // Transfer segments from velocity planner to execution queue when ready
+        // A segment is ready when:
+        // - VelocityPlanner has >1 segment (entry velocity is stable from lookahead), OR
+        // - Segment has is_last_segment=true (flush pipeline)
 
-        // Set entry/exit velocity equal to nominal (constant velocity)
-        exec_segment.entry_velocity = segment.nominal_velocity;
-        exec_segment.exit_velocity = segment.nominal_velocity;
-        exec_segment.acceleration = 0.0f;
+        while (!velocity_planner_->empty() && !segment_queue_.full()) {
+            auto maybe_seg = velocity_planner_->peek_segment();
+            if (!maybe_seg) break;
 
+            const MotionSegment& seg = *maybe_seg;
+
+            // Transfer if: this is the last segment, or we have lookahead buffer
+            bool should_transfer = seg.is_last_segment ||
+                                   velocity_planner_->segment_count() > 1;
+
+            if (should_transfer) {
+                auto popped = velocity_planner_->pop_segment();
+                if (popped) {
+                    segment_queue_.push(*popped);
+                }
+            } else {
+                // Not enough lookahead yet, wait for more segments
+                break;
+            }
+        }
+    }
+
+    Result<void> MotionController::execute_segment(const MotionSegment& segment) {
+        // Segment already has entry/exit velocities from VelocityPlanner
         // Execute via stepper controller (this is blocking per-segment)
-        return stepper_controller_->execute_segment(exec_segment);
+        return stepper_controller_->execute_segment(segment);
     }
 
     RobotStatus MotionController::get_status() const {
