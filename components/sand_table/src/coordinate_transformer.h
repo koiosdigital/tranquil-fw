@@ -2,6 +2,7 @@
 
 #include "types.h"
 #include "config.h"
+#include "esp_log.h"
 
 #include <cmath>
 
@@ -29,7 +30,19 @@ public:
     void reset_accumulators() noexcept {
         theta_fractional_accumulator_ = 0.0;
         rho_fractional_accumulator_ = 0.0;
+        // Also reset debug tracking
+        reset_debug_tracking();
     }
+
+    /// Reset debug cumulative tracking
+    static void reset_debug_tracking() noexcept {
+        debug_cumulative_steps_ = 0;
+        debug_cumulative_theta_ = 0.0;
+    }
+
+    // Debug tracking (static so it persists across segments)
+    static inline int64_t debug_cumulative_steps_ = 0;
+    static inline double debug_cumulative_theta_ = 0.0;
 
     /// Convert polar deltas to motor step deltas with coupling compensation.
     /// Uses fractional accumulation to eliminate rounding drift.
@@ -51,6 +64,18 @@ public:
         theta_fractional_accumulator_ += theta_steps_exact;
         theta_motor_steps = static_cast<int32_t>(std::round(theta_fractional_accumulator_));
         theta_fractional_accumulator_ -= static_cast<double>(theta_motor_steps);
+
+        // Track cumulative for drift debugging
+        debug_cumulative_theta_ += delta_theta_rad;
+        debug_cumulative_steps_ += theta_motor_steps;
+
+        // Log drift between mathematical expectation and actual commanded steps
+        double expected_cumulative = (debug_cumulative_theta_ / (2.0 * M_PI)) * steps_per_theta_rot_;
+        double drift = static_cast<double>(debug_cumulative_steps_) - expected_cumulative;
+        if (std::fabs(drift) > 0.1) {
+            ESP_LOGW("CoordTrans", "DRIFT: cum_theta=%.6f rad, expect=%.2f, cmd=%lld, drift=%.4f, accum=%.6f",
+                     debug_cumulative_theta_, expected_cumulative, debug_cumulative_steps_, drift, theta_fractional_accumulator_);
+        }
 
         // Convert rho delta to base steps
         double rho_base_exact = delta_rho_norm * static_cast<double>(rho_max_steps_);

@@ -48,7 +48,7 @@ Result<void> StepperDriver::init() {
 }
 
 Result<void> StepperDriver::init_gpio() {
-    // Configure step pin
+    // Configure step pin with maximum drive strength for TMC2209
     gpio_config_t step_config = {
         .pin_bit_mask = (1ULL << pins_.step),
         .mode = GPIO_MODE_OUTPUT,
@@ -60,9 +60,10 @@ Result<void> StepperDriver::init_gpio() {
         ESP_LOGE(TAG, "%s: Failed to configure step pin", name_);
         return Result<void>::err(MotionError::HardwareFault);
     }
+    gpio_set_drive_capability(pins_.step, GPIO_DRIVE_CAP_3);  // 40mA max drive
     gpio_set_level(pins_.step, 0);
 
-    // Configure direction pin
+    // Configure direction pin with maximum drive strength
     gpio_config_t dir_config = {
         .pin_bit_mask = (1ULL << pins_.dir),
         .mode = GPIO_MODE_OUTPUT,
@@ -74,6 +75,7 @@ Result<void> StepperDriver::init_gpio() {
         ESP_LOGE(TAG, "%s: Failed to configure dir pin", name_);
         return Result<void>::err(MotionError::HardwareFault);
     }
+    gpio_set_drive_capability(pins_.dir, GPIO_DRIVE_CAP_3);  // 40mA max drive
     gpio_set_level(pins_.dir, 0);
 
     // Configure enable pin (active low typically)
@@ -143,6 +145,19 @@ Result<void> RmtStepSequencer::init(gpio_num_t theta_step, gpio_num_t rho_step) 
     if (initialized_) {
         return Result<void>::ok();
     }
+
+    // Configure GPIO with maximum drive strength BEFORE RMT takes over
+    // TMC2209 requires clean step edges - use strongest drive capability
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << theta_step) | (1ULL << rho_step),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf);
+    gpio_set_drive_capability(theta_step, GPIO_DRIVE_CAP_3);  // 40mA max drive
+    gpio_set_drive_capability(rho_step, GPIO_DRIVE_CAP_3);    // 40mA max drive
 
     // Create completion semaphore
     completion_sem_ = xSemaphoreCreateBinary();
@@ -563,7 +578,17 @@ Result<void> RmtStepSequencer::execute(
         return Result<void>::err(MotionError::EmergencyStop);
     }
 
-    ESP_LOGD(TAG, "RMT execution complete: %lu steps encoded", steps_encoded_);
+    // Log step execution summary for debugging position drift
+    ESP_LOGI(TAG, "RMT done: encoded=%lu, theta_rem=%ld, rho_rem=%ld, theta_dir=%d",
+             steps_encoded_, bresenham_->theta_remaining, bresenham_->rho_remaining,
+             bresenham_->theta_dir);
+
+    // Check for incomplete step execution
+    if (bresenham_->theta_remaining != 0 || bresenham_->rho_remaining != 0) {
+        ESP_LOGE(TAG, "INCOMPLETE: theta_remaining=%ld, rho_remaining=%ld",
+                 bresenham_->theta_remaining, bresenham_->rho_remaining);
+    }
+
     return Result<void>::ok();
 }
 
@@ -603,33 +628,12 @@ CoordinatedStepperController::~CoordinatedStepperController() {
 }
 
 Result<void> CoordinatedStepperController::init() {
-    // IMPORTANT: Only initialize ONE step generator because they both use the same GPIO pins.
-    // RMT takes ownership of pins when initialized, preventing direct GPIO access.
-    // GPTimer uses direct GPIO access for step pulses.
-    //
-    // TO SWITCH BACK TO RMT-ONLY: Change step_mode_ default to StepGeneratorMode::RMT
-
-    if (step_mode_ == StepGeneratorMode::GPTimer) {
-        // Initialize GPTimer step generator (direct GPIO access like main branch)
-        auto gptimer_result = gptimer_generator_.init(
-            theta_.step_pin(), theta_.dir_pin(),
-            rho_.step_pin(), rho_.dir_pin()
-        );
-        if (gptimer_result.is_err()) {
-            ESP_LOGE(TAG, "Failed to initialize GPTimer step generator");
-            return gptimer_result;
-        }
-        ESP_LOGI(TAG, "Coordinated stepper controller initialized (GPTimer mode)");
-    } else {
-        // Initialize RMT step sequencer (takes ownership of step pins)
-        auto result = rmt_sequencer_.init(theta_.step_pin(), rho_.step_pin());
-        if (result.is_err()) {
-            ESP_LOGE(TAG, "Failed to initialize RMT step sequencer");
-            return result;
-        }
-        ESP_LOGI(TAG, "Coordinated stepper controller initialized (RMT mode)");
+    auto result = rmt_sequencer_.init(theta_.step_pin(), rho_.step_pin());
+    if (result.is_err()) {
+        ESP_LOGE(TAG, "Failed to initialize RMT step sequencer");
+        return result;
     }
-
+    ESP_LOGI(TAG, "Coordinated stepper controller initialized");
     return Result<void>::ok();
 }
 
@@ -649,7 +653,6 @@ void CoordinatedStepperController::disable() {
 
 void CoordinatedStepperController::emergency_stop() {
     rmt_sequencer_.stop();
-    gptimer_generator_.stop();
     bresenham_.clear();
 }
 
@@ -718,15 +721,8 @@ VelocityProfile CoordinatedStepperController::calculate_velocity_profile(
 Result<void> CoordinatedStepperController::execute_segment(
     const MotionSegment& segment)
 {
-    // Check if already executing based on current mode
-    if (step_mode_ == StepGeneratorMode::GPTimer) {
-        if (gptimer_generator_.is_executing()) {
-            return Result<void>::err(MotionError::InvalidState);
-        }
-    } else {
-        if (rmt_sequencer_.is_executing()) {
-            return Result<void>::err(MotionError::InvalidState);
-        }
+    if (rmt_sequencer_.is_executing()) {
+        return Result<void>::err(MotionError::InvalidState);
     }
 
     // Calculate total steps for Bresenham (major axis)
@@ -742,26 +738,6 @@ Result<void> CoordinatedStepperController::execute_segment(
     theta_.set_direction(segment.delta_theta_steps >= 0);
     rho_.set_direction(segment.delta_rho_steps >= 0);
 
-    // Branch based on step generator mode
-    // TO SWITCH BACK TO RMT-ONLY: Remove GPTimer branch or set step_mode_ = RMT
-    if (step_mode_ == StepGeneratorMode::GPTimer) {
-        // GPTimer mode: Direct execution like main branch
-        // Uses single Bresenham calculation, simpler timing
-        ESP_LOGD(TAG, "GPTimer segment: theta=%ld, rho=%ld, dist=%.4f, rpm=%.1f",
-                 segment.delta_theta_steps, segment.delta_rho_steps,
-                 segment.distance, segment.nominal_velocity);
-
-        return gptimer_generator_.execute(
-            segment.delta_theta_steps,
-            segment.delta_rho_steps,
-            segment.nominal_velocity,
-            segment.distance,
-            theta_.position_,
-            rho_.position_
-        );
-    }
-
-    // RMT mode: Original implementation with interval table
     // Setup Bresenham state
     bresenham_.theta_remaining = std::abs(segment.delta_theta_steps);
     bresenham_.rho_remaining = std::abs(segment.delta_rho_steps);
@@ -790,18 +766,33 @@ Result<void> CoordinatedStepperController::execute_segment(
                  interval_table_.intervals[0], min_interval_us);
     }
 
+    // Capture position before execution for drift debugging
+    int32_t theta_before = theta_.position();
+    int32_t rho_before = rho_.position();
+
     ESP_LOGD(TAG, "RMT segment: theta=%ld, rho=%ld, total=%lu, cruise_v=%.1f, interval[0]=%u us",
              segment.delta_theta_steps, segment.delta_rho_steps,
              total_steps, profile.cruise_velocity, interval_table_.intervals[0]);
 
     // Execute via RMT sequencer (blocking)
-    return rmt_sequencer_.execute(
+    auto result = rmt_sequencer_.execute(
         bresenham_,
         interval_table_.intervals,
         interval_table_.total_steps,
         theta_.position_,
         rho_.position_
     );
+
+    // Check for position drift
+    int32_t theta_after = theta_.position();
+    int32_t theta_delta = theta_after - theta_before;
+    int32_t expected_delta = segment.delta_theta_steps;
+    if (theta_delta != expected_delta) {
+        ESP_LOGW(TAG, "THETA DRIFT: expected=%ld, actual=%ld, diff=%ld",
+                 expected_delta, theta_delta, theta_delta - expected_delta);
+    }
+
+    return result;
 }
 
 void CoordinatedStepperController::prepare_interval_table(

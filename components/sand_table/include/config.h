@@ -109,7 +109,8 @@ namespace sand_table {
         static constexpr uint32_t RMT_RESOLUTION_HZ = 10000000;  // 10 MHz for RMT
 
         // Minimum step pulse width (microseconds)
-        static constexpr uint32_t MIN_STEP_PULSE_US = 2;
+        // TMC2209 requires 100ns minimum, but use 5µs for reliable edge detection
+        static constexpr uint32_t MIN_STEP_PULSE_US = 5;
 
         // Maximum step rate (steps per second)
         static constexpr uint32_t MAX_STEP_RATE_HZ = 50000;

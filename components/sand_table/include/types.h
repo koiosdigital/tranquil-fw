@@ -241,10 +241,11 @@ struct MotionCommand {
     return diff;
 }
 
-/// Check if position is within bounds (theta: [0, 2π], rho: [0, 1])
+/// Check if position is within bounds (rho: [0, 1], theta unbounded for multi-rotation)
 [[nodiscard]] inline bool is_in_bounds(const PolarPosition& pos) noexcept {
-    return pos.theta >= 0.0 && pos.theta <= 2.0 * M_PI &&
-           pos.rho >= 0.0 && pos.rho <= 1.0;
+    // Theta is unbounded to support cumulative rotation tracking
+    // (needed for coupling compensation in multi-rotation patterns)
+    return pos.rho >= 0.0 && pos.rho <= 1.0;
 }
 
 } // namespace sand_table
