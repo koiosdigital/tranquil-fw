@@ -13,6 +13,7 @@
 #include "kd_pixdriver.h"
 
 #include "sand_table.h"
+#include "config_manager.h"
 #include "ManifestManager.h"
 #include "SandTablePlayer.h"
 #include "types.h"
@@ -71,6 +72,12 @@ extern "C" void app_main(void)
     kd_common_set_provisioning_pop_token_format(ProvisioningPOPTokenFormat_t::NONE);
     kd_common_init();
 
+    // Initialize ConfigManager early (before components that need config)
+    auto cfg_err = sand_table::ConfigManager::instance().init();
+    if (cfg_err != ESP_OK) {
+        ESP_LOGW(TAG, "ConfigManager init failed: %s, using defaults", esp_err_to_name(cfg_err));
+    }
+
     ManifestManager::initialize();
 
     // Initialize motion controller
@@ -88,19 +95,25 @@ extern "C" void app_main(void)
 
     SandTablePlayer::initialize(g_motion_controller);
 
-    PixelDriver::initialize(60);
+    // Initialize LED driver using runtime config from NVS
+    const auto& led_config = sand_table::ConfigManager::instance().led_config();
 
-#if defined(CONFIG_LED_TYPE_RGB) && CONFIG_LED_TYPE_RGB
-    PixelFormat format = PixelFormat::RGB;
-#else
-    PixelFormat format = PixelFormat::RGBW;
-#endif
+    if (led_config.has_leds && led_config.led_count > 0) {
+        PixelDriver::initialize(60);
 
-    PixelDriver::addChannel(ChannelConfig((gpio_num_t)CONFIG_LED_PIN, CONFIG_LED_NUM_LEDS, format));
-    PixelDriver::setCurrentLimit(1750);
-    PixelDriver::start();
+        PixelFormat format = led_config.is_rgbw ? PixelFormat::RGBW : PixelFormat::RGB;
+        // LED pin stays in sdkconfig (hardware config)
+        PixelDriver::addChannel(ChannelConfig((gpio_num_t)CONFIG_LED_PIN, led_config.led_count, format));
+        PixelDriver::setCurrentLimit(1750);
+        PixelDriver::start();
 
-    api_init();
+        ESP_LOGI(TAG, "LED driver initialized: %d LEDs, %s format",
+                 led_config.led_count, led_config.is_rgbw ? "RGBW" : "RGB");
+    } else {
+        ESP_LOGI(TAG, "LEDs disabled in configuration");
+    }
+
+    tranquil_api_init();
 
     // Development: Skip homing, use estimated calibration values
     constexpr int32_t theta_steps_per_rot = sand_table::MechanicalConfig::STEPS_PER_THETA_ROTATION;

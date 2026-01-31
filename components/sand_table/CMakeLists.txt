@@ -3,6 +3,7 @@ idf_component_register(
         "src/stepper_driver.cpp"
         "src/homing_controller.cpp"
         "src/motion_controller.cpp"
+        "src/config_manager.cpp"
     INCLUDE_DIRS
         "include"
     PRIV_INCLUDE_DIRS
@@ -14,4 +15,6 @@ idf_component_register(
         esp_system
         esp_hw_support
         tmcstepper
+        nvs_flash
+        kd_common
 )

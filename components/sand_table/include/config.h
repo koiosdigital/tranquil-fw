@@ -7,8 +7,11 @@
 
 namespace sand_table {
 
+    // Forward declaration - include config_manager.h for full definition
+    class ConfigManager;
+
     // =============================================================================
-    // Pin Configuration (from sdkconfig)
+    // Pin Configuration (from sdkconfig - hardware, stays compile-time)
     // =============================================================================
 
     struct PinConfig {
@@ -37,66 +40,82 @@ namespace sand_table {
     };
 
     // =============================================================================
-    // Mechanical Configuration (from sdkconfig with derived calculations)
+    // Mechanical Configuration (runtime from NVS via ConfigManager)
     // =============================================================================
 
     struct MechanicalConfig {
-        // Motor specifications
-        static constexpr uint32_t STEPS_PER_REV = CONFIG_ROBOT_THETA_STEPS_PER_ROT;
-        static constexpr uint32_t MICROSTEPS = 16;  // TMC2209 microstepping
+        // Compile-time defaults (fallback if ConfigManager not initialized)
+        static constexpr uint32_t kDefaultStepsPerRev = 200;
+        static constexpr uint32_t kDefaultMicrosteps = 16;
+        static constexpr int32_t kDefaultGearRatioX100 = 805;  // 8.05:1
+        static constexpr int32_t kDefaultPinionDiaMm = 12;
+
+        // Runtime accessors (delegate to ConfigManager)
+        static uint32_t steps_per_rev();
+        static uint32_t microsteps();
+        static uint32_t effective_steps_per_rev();
+        static int32_t theta_gear_ratio_x100();
+        static double theta_gear_ratio();
+        static int32_t steps_per_theta_rotation();
+        static int32_t pinion_diameter_mm();
+        static double pinion_circumference_mm();
+        static double rho_steps_per_mm();
+        static double rho_steps_per_theta_step();
+
+        // Legacy constexpr for compile-time contexts (uses defaults)
+        static constexpr uint32_t STEPS_PER_REV = kDefaultStepsPerRev;
+        static constexpr uint32_t MICROSTEPS = kDefaultMicrosteps;
         static constexpr uint32_t EFFECTIVE_STEPS_PER_REV = STEPS_PER_REV * MICROSTEPS;
-
-        // Theta axis: Belt drive with gear ratio
-        // Store as integer x100 to avoid float precision issues in step calculations
-        static constexpr int32_t THETA_GEAR_RATIO_X100 = CONFIG_ROBOT_THETA_GEAR_RATIO;
-        // For calculations that need the actual ratio as double (coupling compensation)
-        static constexpr double THETA_GEAR_RATIO = CONFIG_ROBOT_THETA_GEAR_RATIO / 100.0;
-
-        // Steps per full theta (drive gear) rotation - INTEGER ONLY
-        // = motor_steps * microsteps * gear_ratio
-        // Using x100 ratio: (200 * 16 * 800) / 100 = 25600
+        static constexpr int32_t THETA_GEAR_RATIO_X100 = kDefaultGearRatioX100;
+        static constexpr double THETA_GEAR_RATIO = kDefaultGearRatioX100 / 100.0;
         static constexpr int32_t STEPS_PER_THETA_ROTATION =
             (STEPS_PER_REV * MICROSTEPS * THETA_GEAR_RATIO_X100) / 100;
-
-        // Rho axis: Rack and pinion (only used during homing calibration)
-        static constexpr int32_t PINION_PITCH_DIAMETER_MM = CONFIG_ROBOT_PINION_DIAMETER_MM;
+        static constexpr int32_t PINION_PITCH_DIAMETER_MM = kDefaultPinionDiaMm;
         static constexpr double PINION_CIRCUMFERENCE_MM = PINION_PITCH_DIAMETER_MM * M_PI;
-
-        // Rho steps per mm (only used during homing to convert physical movement)
         static constexpr double RHO_STEPS_PER_MM =
             static_cast<double>(EFFECTIVE_STEPS_PER_REV) / PINION_CIRCUMFERENCE_MM;
-
-        // Coupling compensation: rho steps per theta motor step
-        // = 1 / gear_ratio (since rho and theta have same motor/microstep config)
-        // When theta rotates, rho moves due to rack-and-pinion coupling
         static constexpr double RHO_STEPS_PER_THETA_STEP = 100.0 / THETA_GEAR_RATIO_X100;
     };
 
     // =============================================================================
-    // Motion Configuration (from sdkconfig)
+    // Motion Configuration (runtime from NVS via ConfigManager)
     // =============================================================================
 
     struct MotionConfig {
-        // Speed limits (RPM - matches main branch)
-        static constexpr int32_t THETA_MAX_SPEED_RPM = CONFIG_ROBOT_THETA_MAX_SPEED;
-        static constexpr int32_t RHO_MAX_SPEED_RPM = CONFIG_ROBOT_RHO_MAX_SPEED;
+        // Compile-time defaults (fallback if ConfigManager not initialized)
+        static constexpr int32_t kDefaultThetaMaxRpm = 15;
+        static constexpr int32_t kDefaultRhoMaxRpm = 15;
+        static constexpr uint16_t kDefaultThetaCurrentMa = 400;
+        static constexpr uint16_t kDefaultRhoCurrentMa = 400;
+        static constexpr uint8_t kDefaultStallguardThreshold = 30;
+        static constexpr float kDefaultAccelMmS2 = 100.0f;
+        static constexpr float kDefaultMaxAccelMmS2 = 200.0f;
 
-        // Velocity planning
+        // Runtime accessors (delegate to ConfigManager)
+        static int32_t theta_max_rpm();
+        static int32_t rho_max_rpm();
+        static uint16_t theta_irun_ma();
+        static uint16_t theta_ihold_ma();
+        static uint16_t rho_irun_ma();
+        static uint16_t rho_ihold_ma();
+        static uint8_t stallguard_threshold();
+        static float default_accel();
+        static float max_accel();
+
+        // Constants that don't change at runtime
         static constexpr uint32_t LOOKAHEAD_DEPTH = 32;
-        static constexpr float DEFAULT_ACCEL_MM_S2 = 100.0f;    // Default acceleration (mm/s^2)
-        static constexpr float JUNCTION_DEVIATION_MM = 0.05f;  // Cornering deviation (mm)
-
-        // Motor current settings (from config, hold = run / 2)
-        static constexpr uint16_t THETA_IRUN_MA = CONFIG_ROBOT_THETA_MOTOR_CURRENT;
-        static constexpr uint16_t THETA_IHOLD_MA = CONFIG_ROBOT_THETA_MOTOR_CURRENT / 2;
-        static constexpr uint16_t RHO_IRUN_MA = CONFIG_ROBOT_RHO_MOTOR_CURRENT;
-        static constexpr uint16_t RHO_IHOLD_MA = CONFIG_ROBOT_RHO_MOTOR_CURRENT / 2;
-
-        // StallGuard threshold for rho homing
-        static constexpr uint8_t RHO_STALLGUARD_THRESHOLD = CONFIG_ROBOT_RHO_STALLGUARD_THRESHOLD;
-
-        // Motor inactivity timeout (ms)
+        static constexpr float JUNCTION_DEVIATION_MM = 0.05f;
         static constexpr uint32_t MOTOR_INACTIVITY_TIMEOUT_MS = 5000;
+
+        // Legacy constexpr for compile-time contexts (uses defaults)
+        static constexpr int32_t THETA_MAX_SPEED_RPM = kDefaultThetaMaxRpm;
+        static constexpr int32_t RHO_MAX_SPEED_RPM = kDefaultRhoMaxRpm;
+        static constexpr float DEFAULT_ACCEL_MM_S2 = kDefaultAccelMmS2;
+        static constexpr uint16_t THETA_IRUN_MA = kDefaultThetaCurrentMa;
+        static constexpr uint16_t THETA_IHOLD_MA = kDefaultThetaCurrentMa / 2;
+        static constexpr uint16_t RHO_IRUN_MA = kDefaultRhoCurrentMa;
+        static constexpr uint16_t RHO_IHOLD_MA = kDefaultRhoCurrentMa / 2;
+        static constexpr uint8_t RHO_STALLGUARD_THRESHOLD = kDefaultStallguardThreshold;
     };
 
     // =============================================================================

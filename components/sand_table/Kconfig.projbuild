@@ -54,25 +54,7 @@ menu "TMC Stepper Configuration"
         default 2
 endmenu
 
-menu "Theta Axis Configuration"
-    config ROBOT_THETA_MAX_SPEED
-        int "Theta Max Speed (mm/s)"
-        default 15
-
-    config ROBOT_THETA_STEPS_PER_ROT
-        int "Theta Steps Per Revolution"
-        default 200
-
-    config ROBOT_THETA_GEAR_RATIO
-        int "Theta Gear Ratio (x100)"
-        default 800
-        help
-            Gear ratio multiplied by 100. E.g., 800 = 8:1 ratio, 400 = 4:1 ratio.
-
-    config ROBOT_THETA_MOTOR_CURRENT
-        int "Theta Motor Current (mA)"
-        default 675
-
+menu "Theta Axis Hardware"
     config ROBOT_THETA_INVERT_DIRECTION
         bool "Invert Theta Direction"
         default n
@@ -98,62 +80,14 @@ menu "Theta Axis Configuration"
     endmenu
 endmenu
 
-menu "Rho Axis Configuration"
-    config ROBOT_RHO_MAX_SPEED
-        int "Rho Max Speed (mm/s)"
-        default 15
-
-    config ROBOT_RHO_STEPS_PER_ROT
-        int "Rho Steps Per Revolution"
-        default 200
-
-    config ROBOT_RHO_MOTOR_CURRENT
-        int "Rho Motor Current (mA)"
-        default 675
-
+menu "Rho Axis Hardware"
     config ROBOT_RHO_INVERT_DIRECTION
         bool "Invert Rho Direction"
         default n
-
-    config ROBOT_RHO_STALLGUARD_THRESHOLD
-        int "Rho StallGuard Threshold"
-        default 10
-
-    config ROBOT_RHO_MIN_MM
-        int "Rho Minimum (mm)"
-        default 5
-        help
-            Center exclusion zone radius in mm.
-
-    config ROBOT_RHO_MAX_MM
-        int "Rho Maximum (mm)"
-        default 150
-        help
-            Maximum radial travel in mm.
-
-    config ROBOT_PINION_DIAMETER_MM
-        int "Pinion Pitch Diameter (mm)"
-        default 12
-        help
-            Pitch diameter of the rack and pinion gear.
 endmenu
 
-menu "Motion Parameters"
-    config ROBOT_MAX_VELOCITY_MM_S
-        int "Max Velocity (mm/s)"
-        default 50
-
-    config ROBOT_DEFAULT_VELOCITY_MM_S
-        int "Default Velocity (mm/s)"
-        default 30
-
-    config ROBOT_MAX_ACCEL_MM_S2
-        int "Max Acceleration (mm/s^2)"
-        default 200
-
-    config ROBOT_DEFAULT_ACCEL_MM_S2
-        int "Default Acceleration (mm/s^2)"
-        default 100
-endmenu
+# Note: Motion parameters (steps/rev, gear ratio, motor current, stallguard threshold,
+# velocities, acceleration, pinion diameter) are now stored in NVS and configured
+# via the ConfigManager preset system. See config_manager.h and presets.h.
 
 endmenu

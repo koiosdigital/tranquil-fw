@@ -1,14 +1,11 @@
 #
-# LED Configuration
+# LED Hardware Configuration
 #
 CONFIG_LED_PIN=18
-CONFIG_LED_TYPE_RGB=n
-CONFIG_LED_TYPE_RGBW=y
-CONFIG_LED_NUM_LEDS=143
-# end of LED Configuration
+# end of LED Hardware Configuration
 
 #
-# Polar Robot Motion System
+# Polar Robot Motion System - Hardware Configuration
 #
 
 #
@@ -30,12 +27,8 @@ CONFIG_ROBOT_THETA_STALLGUARD_DIAG_PIN=2
 # end of TMC Stepper Configuration
 
 #
-# Theta Axis Configuration
+# Theta Axis Hardware
 #
-CONFIG_ROBOT_THETA_MAX_SPEED=15
-CONFIG_ROBOT_THETA_STEPS_PER_ROT=200
-CONFIG_ROBOT_THETA_GEAR_RATIO=805
-CONFIG_ROBOT_THETA_MOTOR_CURRENT=400
 # CONFIG_ROBOT_THETA_INVERT_DIRECTION is not set
 CONFIG_ROBOT_THETA_HAS_ENDSTOP=y
 
@@ -46,20 +39,16 @@ CONFIG_ROBOT_THETA_ENDSTOP_PIN=17
 # CONFIG_ROBOT_THETA_ENDSTOP_INVERT is not set
 CONFIG_ROBOT_THETA_ENDSTOP_PULLUP=y
 # end of Theta Endstop Configuration
-# end of Theta Axis Configuration
+# end of Theta Axis Hardware
 
 #
-# Rho Axis Configuration
+# Rho Axis Hardware
 #
-CONFIG_ROBOT_RHO_MAX_SPEED=15
-CONFIG_ROBOT_RHO_STEPS_PER_ROT=200
-CONFIG_ROBOT_RHO_MOTOR_CURRENT=400
 # CONFIG_ROBOT_RHO_INVERT_DIRECTION is not set
+# end of Rho Axis Hardware
 
-#
-# StallGuard Configuration
-#
-CONFIG_ROBOT_RHO_STALLGUARD_THRESHOLD=30
-# end of StallGuard Configuration
-# end of Rho Axis Configuration
 # end of Polar Robot Motion System
+
+# Note: Motion parameters (steps/rev, gear ratio, motor current, stallguard threshold,
+# velocities, acceleration, pinion diameter, LED count/type) are now stored in NVS.
+# Use the "tranquil4_tabletop" preset via ConfigManager to load these values.

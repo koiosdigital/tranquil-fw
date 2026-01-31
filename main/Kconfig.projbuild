@@ -5,20 +5,7 @@ config LED_PIN
     help
         GPIO pin number for the LED strip data line.
 
-config LED_TYPE
-    choice
-        prompt "LED Type"
-        help
-            Select the type of LED strip.
-    config LED_TYPE_RGB
-        bool "RGB"
-    config LED_TYPE_RGBW
-        bool "RGBW"
-    endchoice
-
-config LED_NUM_LEDS
-    int "Number of LEDs"
-    help
-        Total number of LEDs in the strip.
+# Note: LED count and type (RGB/RGBW) are now stored in NVS and configured
+# via the ConfigManager preset system. See config_manager.h and presets.h.
 
 endmenu

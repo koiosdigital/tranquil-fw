@@ -1,6 +1,8 @@
 #include "homing_controller.h"
+#include "config_manager.h"
 #include "stepper_driver.h"
 #include "esp_log.h"
+#include <ctime>
 
 namespace sand_table {
 
@@ -391,7 +393,18 @@ namespace sand_table {
         return result;
     }
 
-    Result<void> HomingController::home_all() {
+    Result<void> HomingController::home_all(bool force_full) {
+        // Check if we can use cached calibration
+        const auto& calib = ConfigManager::instance().calibration();
+
+        if (!force_full && calib.is_valid) {
+            ESP_LOGI(TAG, "Using cached calibration (theta=%ld, rho_max=%ld)",
+                calib.theta_steps_per_rotation, calib.rho_max_steps);
+            return home_quick();
+        }
+
+        ESP_LOGI(TAG, "Performing full calibration homing...");
+
         homing_active_.store(true, std::memory_order_release);
         abort_requested_.store(false, std::memory_order_release);
 
@@ -434,13 +447,199 @@ namespace sand_table {
         theta_.reset_position();
         rho_.reset_position();
 
-        ESP_LOGI(TAG, "Homing complete - Rho: %ld steps, Theta: %ld steps/rev",
+        // Save calibration to NVS
+        save_calibration_to_nvs();
+
+        ESP_LOGI(TAG, "Full homing complete - Rho: %ld steps, Theta: %ld steps/rev",
             rho_max_steps_, theta_steps_per_rotation_);
 
         homing_active_.store(false, std::memory_order_release);
         state_.store(HomingState::Complete, std::memory_order_release);
 
         return Result<void>::ok();
+    }
+
+    Result<void> HomingController::home_quick() {
+        const auto& calib = ConfigManager::instance().calibration();
+
+        if (!calib.is_valid) {
+            ESP_LOGW(TAG, "No valid calibration for quick home, falling back to full");
+            return home_all(true);
+        }
+
+        ESP_LOGI(TAG, "Quick homing with cached calibration...");
+
+        homing_active_.store(true, std::memory_order_release);
+        abort_requested_.store(false, std::memory_order_release);
+
+        // Load cached values
+        theta_steps_per_rotation_ = calib.theta_steps_per_rotation;
+        rho_max_steps_ = calib.rho_max_steps;
+
+        // Enable motors
+        theta_.set_enabled(true);
+        rho_.set_enabled(true);
+
+        // Home rho to center using known max
+        auto rho_result = home_rho_to_center(rho_max_steps_);
+        if (!rho_result.success) {
+            homing_active_.store(false, std::memory_order_release);
+            state_.store(HomingState::Error, std::memory_order_release);
+            return Result<void>::err(rho_result.error);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(100));
+
+        // Home theta to single Hall edge
+        auto theta_result = home_theta_single();
+        if (!theta_result.success) {
+            homing_active_.store(false, std::memory_order_release);
+            state_.store(HomingState::Error, std::memory_order_release);
+            return Result<void>::err(theta_result.error);
+        }
+
+        // Reset positions
+        theta_.reset_position();
+        rho_.reset_position();
+
+        ESP_LOGI(TAG, "Quick homing complete");
+
+        homing_active_.store(false, std::memory_order_release);
+        state_.store(HomingState::Complete, std::memory_order_release);
+
+        return Result<void>::ok();
+    }
+
+    Result<void> HomingController::force_recalibrate() {
+        ESP_LOGI(TAG, "Force recalibrating - clearing cached calibration");
+
+        // Clear calibration in NVS
+        ConfigManager::instance().clear_calibration();
+
+        // Perform full homing
+        return home_all(true);
+    }
+
+    HomingController::HomingResult HomingController::home_rho_to_center(int32_t rho_max_steps) {
+        ESP_LOGI(TAG, "Homing rho to center (max=%ld)...", rho_max_steps);
+        state_.store(HomingState::RhoSeekingMin, std::memory_order_release);
+
+        // Move inward until we stall at center (rho=0.0)
+        rho_stall_triggered_ = false;
+        rho_.set_direction(false);  // Inward
+
+        int32_t total_steps = 0;
+        while (total_steps < static_cast<int32_t>(kMaxHomingSteps)) {
+            if (abort_requested_.load(std::memory_order_acquire)) {
+                HomingResult result;
+                result.error = MotionError::EmergencyStop;
+                return result;
+            }
+
+            int32_t chunk_steps = std::min(static_cast<int32_t>(kChunkSize),
+                static_cast<int32_t>(kMaxHomingSteps) - total_steps);
+
+            int32_t actual_steps = execute_homing_chunk(0, -chunk_steps, kRhoHomingIntervalUs);
+            total_steps += actual_steps;
+
+            if (rho_stall_triggered_) {
+                ESP_LOGD(TAG, "Rho center found after %ld steps", total_steps);
+                break;
+            }
+        }
+
+        if (!rho_stall_triggered_) {
+            ESP_LOGE(TAG, "Rho center not found");
+            HomingResult result;
+            result.error = MotionError::HomingFailed;
+            return result;
+        }
+
+        ESP_LOGI(TAG, "Rho homed to center");
+
+        HomingResult result;
+        result.success = true;
+        result.position_steps = 0;
+        return result;
+    }
+
+    HomingController::HomingResult HomingController::home_theta_single() {
+        ESP_LOGI(TAG, "Quick theta homing (single edge)...");
+        state_.store(HomingState::ThetaCalibrating, std::memory_order_release);
+
+        // If already on Hall sensor, back off first
+        if (is_hall_triggered()) {
+            ESP_LOGD(TAG, "Backing off Hall sensor...");
+            hall_triggered_ = false;
+            theta_.set_direction(false);  // Reverse
+            rho_.set_direction(false);    // Rho follows theta due to coupling
+
+            int32_t backoff_steps = 0;
+            while (is_hall_triggered() && backoff_steps < static_cast<int32_t>(kMaxHomingSteps)) {
+                if (abort_requested_.load(std::memory_order_acquire)) {
+                    HomingResult result;
+                    result.error = MotionError::EmergencyStop;
+                    return result;
+                }
+
+                int32_t theta_chunk = std::min(static_cast<int32_t>(kChunkSize),
+                    static_cast<int32_t>(kMaxHomingSteps) - backoff_steps);
+                int32_t rho_chunk = theta_chunk / static_cast<int32_t>(kGearRatio);
+
+                int32_t actual = execute_homing_chunk(-theta_chunk, -rho_chunk, kThetaHomingIntervalUs);
+                backoff_steps += actual;
+            }
+        }
+
+        // Seek forward to first Hall edge only (no full rotation measurement)
+        ESP_LOGD(TAG, "Seeking Hall edge...");
+        hall_triggered_ = false;
+        theta_.set_direction(true);   // Forward
+        rho_.set_direction(true);     // Rho follows theta
+
+        int32_t total_steps = 0;
+        while (total_steps < static_cast<int32_t>(kMaxHomingSteps)) {
+            if (abort_requested_.load(std::memory_order_acquire)) {
+                HomingResult result;
+                result.error = MotionError::EmergencyStop;
+                return result;
+            }
+
+            int32_t theta_chunk = std::min(static_cast<int32_t>(kChunkSize),
+                static_cast<int32_t>(kMaxHomingSteps) - total_steps);
+            int32_t rho_chunk = theta_chunk / static_cast<int32_t>(kGearRatio);
+
+            int32_t actual = execute_homing_chunk(theta_chunk, rho_chunk, kThetaHomingIntervalUs);
+            total_steps += actual;
+
+            if (hall_triggered_) {
+                ESP_LOGI(TAG, "Theta home found at step %ld", total_steps);
+                HomingResult result;
+                result.success = true;
+                result.position_steps = total_steps;
+                return result;
+            }
+        }
+
+        ESP_LOGE(TAG, "Theta home not found");
+        HomingResult result;
+        result.error = MotionError::HomingFailed;
+        return result;
+    }
+
+    void HomingController::save_calibration_to_nvs() {
+        CalibrationData calib;
+        calib.theta_steps_per_rotation = theta_steps_per_rotation_;
+        calib.rho_max_steps = rho_max_steps_;
+        calib.is_valid = true;
+        calib.timestamp = static_cast<uint32_t>(time(nullptr));
+
+        esp_err_t err = ConfigManager::instance().save_calibration(calib);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to save calibration to NVS: %s", esp_err_to_name(err));
+        } else {
+            ESP_LOGI(TAG, "Calibration saved to NVS");
+        }
     }
 
 } // namespace sand_table

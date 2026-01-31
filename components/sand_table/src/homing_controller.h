@@ -13,8 +13,9 @@
 
 namespace sand_table {
 
-    // Forward declaration
+    // Forward declarations
     class CoordinatedStepperController;
+    class ConfigManager;
 
     /// Controls the homing sequence for both axes using RMT-based stepping.
     /// - Theta uses Hall effect sensor
@@ -66,8 +67,16 @@ namespace sand_table {
         /// Home rho axis using StallGuard
         [[nodiscard]] HomingResult home_rho();
 
-        /// Full homing sequence (rho first for safety, then theta)
-        [[nodiscard]] Result<void> home_all();
+        /// Full homing sequence - uses cached calibration if available
+        /// If force_full is true, always performs full calibration
+        [[nodiscard]] Result<void> home_all(bool force_full = false);
+
+        /// Quick homing using cached calibration data
+        /// Requires valid calibration in ConfigManager
+        [[nodiscard]] Result<void> home_quick();
+
+        /// Force full recalibration (clears calibration and performs full home)
+        [[nodiscard]] Result<void> force_recalibrate();
 
         /// Check if Hall sensor is currently triggered
         [[nodiscard]] bool is_hall_triggered() const;
@@ -134,14 +143,21 @@ namespace sand_table {
         static void IRAM_ATTR hall_isr_handler(void* arg);
         static void IRAM_ATTR diag_isr_handler(void* arg);
 
-        // Internal homing methods
+        // Internal homing methods (full calibration)
         HomingResult seek_rho_max();
         HomingResult seek_rho_min();
         HomingResult calibrate_theta();
 
+        // Internal homing methods (quick mode - uses cached values)
+        HomingResult home_rho_to_center(int32_t rho_max_steps);
+        HomingResult home_theta_single();
+
         // Execute a homing segment via RMT at constant speed, returns steps actually taken
         // Returns early if sensor ISR triggers
         int32_t execute_homing_chunk(int32_t theta_steps, int32_t rho_steps, uint32_t interval_us);
+
+        // Save calibration results to NVS
+        void save_calibration_to_nvs();
     };
 
 } // namespace sand_table
