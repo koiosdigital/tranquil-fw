@@ -15,7 +15,7 @@
 
 namespace sand_table {
 
-/// Library version
-constexpr const char* VERSION = "1.0.0";
+    /// Library version
+    constexpr const char* VERSION = "1.0.0";
 
 } // namespace sand_table

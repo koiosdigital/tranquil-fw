@@ -105,9 +105,13 @@ extern "C" void app_main(void)
     // Development: Skip homing, use estimated calibration values
     constexpr int32_t theta_steps_per_rot = sand_table::MechanicalConfig::STEPS_PER_THETA_ROTATION;
     constexpr int32_t rho_max_steps = 200 * 16 * 3;  // ~3 rotations of travel
-    g_motion_controller->_set_homed(theta_steps_per_rot, rho_max_steps);
-    ESP_LOGI(TAG, "Development mode: Homing skipped (theta=%ld steps/rot, rho=%ld max)",
-        theta_steps_per_rot, rho_max_steps);
+    g_motion_controller->home();
+
+    while (!g_motion_controller->is_homed()) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    ESP_LOGI(TAG, "Homing complete");
 
     // ==========================================================================
     // DEMO PATTERN: 3 circles, 2 triangles, return to center

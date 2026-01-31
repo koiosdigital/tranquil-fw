@@ -19,7 +19,7 @@ namespace sand_table {
         // Set up PathPlanner callback to enqueue segments via VelocityPlanner
         path_planner_->set_segment_callback([this](MotionSegment& seg) {
             return this->enqueue_segment(seg);
-        });
+            });
     }
 
     MotionController::~MotionController() {
@@ -31,8 +31,6 @@ namespace sand_table {
     }
 
     Result<void> MotionController::init() {
-        ESP_LOGI(TAG, "Initializing motion controller...");
-
         // Initialize TMC UART bus
         auto tmc_result = init_tmc();
         if (tmc_result.is_err()) {
@@ -93,6 +91,9 @@ namespace sand_table {
             return homing_result;
         }
 
+        // Give homing controller access to stepper controller for RMT-based motion
+        homing_controller_->set_stepper_controller(stepper_controller_.get());
+
         // Create inactivity timer
         inactivity_timer_ = xTimerCreate(
             "MotorInactivity",
@@ -107,7 +108,6 @@ namespace sand_table {
             return Result<void>::err(MotionError::HardwareFault);
         }
 
-        ESP_LOGI(TAG, "Motion controller initialized");
         return Result<void>::ok();
     }
 
@@ -162,8 +162,6 @@ namespace sand_table {
             return Result<void>::ok();  // Already running
         }
 
-        ESP_LOGI(TAG, "Starting motion controller tasks...");
-
         // Create stepper task on Core 1 for real-time performance
         BaseType_t result = xTaskCreatePinnedToCore(
             stepper_task_entry,
@@ -183,7 +181,6 @@ namespace sand_table {
         running_.store(true, std::memory_order_release);
         state_.store(SystemState::Idle, std::memory_order_release);
 
-        ESP_LOGI(TAG, "Motion controller started");
         return Result<void>::ok();
     }
 
@@ -198,8 +195,6 @@ namespace sand_table {
 
         disable_motors();
         state_.store(SystemState::Idle, std::memory_order_release);
-
-        ESP_LOGI(TAG, "Motion controller stopped");
     }
 
     void MotionController::stepper_task_entry(void* arg) {
@@ -208,8 +203,6 @@ namespace sand_table {
     }
 
     void MotionController::stepper_task_loop() {
-        ESP_LOGI(TAG, "Stepper task started on core %d", xPortGetCoreID());
-
         while (running_.load(std::memory_order_acquire)) {
             // Check for emergency stop
             if (emergency_stop_.load(std::memory_order_acquire)) {
@@ -268,7 +261,6 @@ namespace sand_table {
             }
         }
 
-        ESP_LOGI(TAG, "Stepper task exiting");
         vTaskDelete(nullptr);
     }
 
@@ -284,31 +276,12 @@ namespace sand_table {
         }
 
         // Calculate rho adjustment per theta rotation (due to coupling)
-        // FIX: The coupling happens at the MOTOR level, not the drive gear level.
         // When theta motor rotates once (EFFECTIVE_STEPS_PER_REV steps), rho moves
         // by EFFECTIVE_STEPS_PER_REV / THETA_GEAR_RATIO steps due to mechanical coupling.
-        //
-        // Main branch uses: _rhoPosition -= CONFIG_ROBOT_RHO_STEPS_PER_ROT * 16.0f
-        // Which is: motor_steps_per_rev * microsteps = 200 * 16 = 3200 steps/motor_rot
-        //
-        // Per drive gear rotation (theta_rot steps), we have:
-        //   theta_rot = motor_steps_per_rev * gear_ratio * microsteps
-        //   rho_steps_per_motor_rot = motor_steps_per_rev * microsteps
-        //   motor_rotations_per_theta_rot = gear_ratio
-        //   rho_per_theta_rot = rho_steps_per_motor_rot * motor_rotations_per_theta_rot
-        //                     = EFFECTIVE_STEPS_PER_REV * THETA_GEAR_RATIO / THETA_GEAR_RATIO
-        //                     = EFFECTIVE_STEPS_PER_REV
-        //
-        // Wait, let me recalculate:
-        // - theta_rot = steps per full theta (drive gear) rotation
-        // - When drive gear rotates once, theta motor rotates (gear_ratio) times
-        // - Each theta motor rotation causes rho to move by (EFFECTIVE_STEPS_PER_REV / gear_ratio) steps
-        // - So per drive gear rotation: rho moves by EFFECTIVE_STEPS_PER_REV steps
-        //
-        // This matches main branch: 3200 steps per theta rotation (with 4:1 ratio, 3200 = 200*16)
+
         const int32_t rho_per_theta_rot = static_cast<int32_t>(
             MechanicalConfig::EFFECTIVE_STEPS_PER_REV
-        );
+            );
 
         bool wrapped = false;
 
@@ -328,21 +301,14 @@ namespace sand_table {
 
         if (wrapped) {
             ESP_LOGD(TAG, "Position wrapped: theta=%ld, rho=%ld (rho_per_rot=%ld)",
-                     theta_steps, rho_steps, rho_per_theta_rot);
+                theta_steps, rho_steps, rho_per_theta_rot);
             theta_stepper_->set_position(theta_steps);
             rho_stepper_->set_position(rho_steps);
-
-            // NOTE: Do NOT reset fractional accumulators during wrap!
-            // The wrap is a position counter adjustment, not a motion.
-            // Accumulators track fractional step remainders across many segments.
-            // Resetting them here loses up to 0.5 steps per wrap, which accumulates
-            // to significant error over patterns with many rotations.
         }
     }
 
     void MotionController::inactivity_timer_callback(TimerHandle_t timer) {
         auto* self = static_cast<MotionController*>(pvTimerGetTimerID(timer));
-        ESP_LOGD(TAG, "Motor inactivity timeout - disabling motors");
         self->disable_motors();
     }
 
@@ -380,10 +346,6 @@ namespace sand_table {
                 homing_controller_->rho_max_steps()
             );
 
-            ESP_LOGI(TAG, "Calibration set: theta=%ld steps/rot, rho=%ld max steps",
-                homing_controller_->theta_steps_per_rotation(),
-                homing_controller_->rho_max_steps());
-
             // Reset motor positions to home (0 steps)
             theta_stepper_->set_position(0);
             rho_stepper_->set_position(0);
@@ -395,7 +357,6 @@ namespace sand_table {
             path_planner_->set_current_position({ 0.0, 0.0 });
 
             state_.store(SystemState::Idle, std::memory_order_release);
-            ESP_LOGI(TAG, "Homing complete");
         }
         else {
             state_.store(SystemState::Error, std::memory_order_release);
@@ -406,30 +367,19 @@ namespace sand_table {
     }
 
     void MotionController::_set_homed(int32_t theta_steps_per_rot, int32_t rho_max) {
-        ESP_LOGI(TAG, "Setting homed state: theta=%ld steps/rot, rho=%ld max steps",
-            theta_steps_per_rot, rho_max);
-
-        // Set homing controller calibration
         homing_controller_->_set_homed(theta_steps_per_rot, rho_max);
-
-        // Pass calibration to coordinate transformer
         transformer_->set_calibration(theta_steps_per_rot, rho_max);
 
-        // Reset motor positions to home (0 steps)
         theta_stepper_->set_position(0);
         rho_stepper_->set_position(0);
 
         // Reset fractional accumulators
         transformer_->reset_accumulators();
-
-        // Reset path planner position
         path_planner_->set_current_position({ 0.0, 0.0 });
 
         // Mark as homed
         is_homed_.store(true, std::memory_order_release);
         state_.store(SystemState::Idle, std::memory_order_release);
-
-        ESP_LOGI(TAG, "Homed state set (development mode)");
     }
 
     Result<void> MotionController::move_to(const PolarPosition& target, float feedrate) {
@@ -448,7 +398,6 @@ namespace sand_table {
         }
 
         // Get current planning position from PathPlanner
-        // This represents where the arm will be after all currently queued moves
         const PolarPosition& current = path_planner_->current_position();
 
         // Set default feedrate if not specified
@@ -457,20 +406,56 @@ namespace sand_table {
             actual_feedrate = static_cast<float>(MotionConfig::RHO_MAX_SPEED_RPM);
         }
 
-        ESP_LOGD(TAG, "Queueing move: (%.4f, %.4f) -> (%.4f, %.4f) @ %.1f RPM",
+        ESP_LOGD(TAG, "Queueing polar move: (%.4f, %.4f) -> (%.4f, %.4f) @ %.1f RPM",
             current.theta, current.rho, target.theta, target.rho, actual_feedrate);
 
-        // Plan the move (this enqueues segments via callback)
-        // PathPlanner updates its internal position to target after planning
-        auto result = path_planner_->plan_linear_move(current, target, actual_feedrate);
+        // Plan direct polar move (arcs in XY space)
+        auto result = path_planner_->plan_polar_move(current, target, actual_feedrate);
 
         if (result.is_ok()) {
-            // Ensure motors are enabled and state is Running
             enable_motors();
             state_.store(SystemState::Running, std::memory_order_release);
         }
 
-        return result;  // Returns immediately after queueing
+        return result;
+    }
+
+    Result<void> MotionController::move_linear(const PolarPosition& target, float feedrate) {
+        if (!is_homed_.load(std::memory_order_acquire)) {
+            return Result<void>::err(MotionError::NotHomed);
+        }
+
+        if (emergency_stop_.load(std::memory_order_acquire)) {
+            return Result<void>::err(MotionError::EmergencyStop);
+        }
+
+        // Check bounds
+        if (!is_in_bounds(target)) {
+            ESP_LOGW(TAG, "Target out of bounds: theta=%.4f, rho=%.4f", target.theta, target.rho);
+            return Result<void>::err(MotionError::OutOfBounds);
+        }
+
+        // Get current planning position from PathPlanner
+        const PolarPosition& current = path_planner_->current_position();
+
+        // Set default feedrate if not specified
+        float actual_feedrate = feedrate;
+        if (actual_feedrate <= 0) {
+            actual_feedrate = static_cast<float>(MotionConfig::RHO_MAX_SPEED_RPM);
+        }
+
+        ESP_LOGD(TAG, "Queueing linear move: (%.4f, %.4f) -> (%.4f, %.4f) @ %.1f RPM",
+            current.theta, current.rho, target.theta, target.rho, actual_feedrate);
+
+        // Plan Cartesian-interpolated move (straight lines in XY space)
+        auto result = path_planner_->plan_linear_move(current, target, actual_feedrate);
+
+        if (result.is_ok()) {
+            enable_motors();
+            state_.store(SystemState::Running, std::memory_order_release);
+        }
+
+        return result;
     }
 
     void MotionController::pause() {
@@ -536,14 +521,15 @@ namespace sand_table {
 
             // Transfer if: this is the last segment, or we have lookahead buffer
             bool should_transfer = seg.is_last_segment ||
-                                   velocity_planner_->segment_count() > 1;
+                velocity_planner_->segment_count() > 1;
 
             if (should_transfer) {
                 auto popped = velocity_planner_->pop_segment();
                 if (popped) {
                     segment_queue_.push(*popped);
                 }
-            } else {
+            }
+            else {
                 // Not enough lookahead yet, wait for more segments
                 break;
             }

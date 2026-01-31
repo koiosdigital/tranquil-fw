@@ -83,7 +83,7 @@ namespace sand_table {
 
         // Velocity planning
         static constexpr uint32_t LOOKAHEAD_DEPTH = 32;
-        static constexpr float DEFAULT_ACCEL_MM_S2 = 50.0f;    // Default acceleration (mm/s^2)
+        static constexpr float DEFAULT_ACCEL_MM_S2 = 100.0f;    // Default acceleration (mm/s^2)
         static constexpr float JUNCTION_DEVIATION_MM = 0.05f;  // Cornering deviation (mm)
 
         // Motor current settings (from config, hold = run / 2)
