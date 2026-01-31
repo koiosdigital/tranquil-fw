@@ -842,6 +842,67 @@ namespace sand_table {
         return result;
     }
 
+    Result<void> CoordinatedStepperController::execute_constant_speed(
+        int32_t theta_steps,
+        int32_t rho_steps,
+        uint32_t interval_us)
+    {
+        if (rmt_sequencer_.is_executing()) {
+            return Result<void>::err(MotionError::InvalidState);
+        }
+
+        // Calculate total steps for Bresenham (major axis)
+        const uint32_t total_steps = static_cast<uint32_t>(
+            std::max(std::abs(theta_steps), std::abs(rho_steps)));
+
+        // No steps to execute
+        if (total_steps == 0) {
+            return Result<void>::ok();
+        }
+
+        // Set directions
+        theta_.set_direction(theta_steps >= 0);
+        rho_.set_direction(rho_steps >= 0);
+
+        // Setup Bresenham state
+        bresenham_.theta_remaining = std::abs(theta_steps);
+        bresenham_.rho_remaining = std::abs(rho_steps);
+        bresenham_.theta_total = bresenham_.theta_remaining;
+        bresenham_.rho_total = bresenham_.rho_remaining;
+        bresenham_.theta_dir = (theta_steps >= 0) ? 1 : -1;
+        bresenham_.rho_dir = (rho_steps >= 0) ? 1 : -1;
+
+        // Initialize Bresenham error term
+        const int32_t major = std::max(bresenham_.theta_total, bresenham_.rho_total);
+        bresenham_.error = major / 2;
+
+        // Clamp interval to valid range for RMT
+        constexpr uint32_t min_interval_us = 1000000 / HardwareConfig::MAX_STEP_RATE_HZ;  // 20µs
+        constexpr uint32_t max_interval_us = 3225;  // ~310 steps/s, fits in single RMT symbol
+        uint32_t clamped_interval = interval_us;
+        if (clamped_interval < min_interval_us) clamped_interval = min_interval_us;
+        if (clamped_interval > max_interval_us) clamped_interval = max_interval_us;
+
+        // Fill interval table with constant value (no acceleration/deceleration)
+        interval_table_.clear();
+        interval_table_.total_steps = std::min(total_steps, static_cast<uint32_t>(kMaxIntervalsPerSegment));
+        for (uint32_t i = 0; i < interval_table_.total_steps; ++i) {
+            interval_table_.intervals[i] = static_cast<uint16_t>(clamped_interval);
+        }
+
+        ESP_LOGI(TAG, "Constant-speed: theta=%ld, rho=%ld, interval=%lu us (%lu steps/s)",
+            theta_steps, rho_steps, clamped_interval, 1000000UL / clamped_interval);
+
+        // Execute via RMT sequencer (blocking)
+        return rmt_sequencer_.execute(
+            bresenham_,
+            interval_table_.intervals,
+            interval_table_.total_steps,
+            theta_.position_,
+            rho_.position_
+        );
+    }
+
     void CoordinatedStepperController::prepare_interval_table(
         const VelocityProfile& profile,
         uint32_t total_steps)

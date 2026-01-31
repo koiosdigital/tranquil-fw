@@ -227,6 +227,17 @@ namespace sand_table {
         /// This is a blocking call that returns when the segment is complete
         [[nodiscard]] Result<void> execute_segment(const MotionSegment& segment);
 
+        /// Execute constant-speed motion (for homing)
+        /// Uses fixed step interval without acceleration/deceleration
+        /// @param theta_steps Steps for theta axis (positive or negative)
+        /// @param rho_steps Steps for rho axis (positive or negative)
+        /// @param interval_us Microseconds between steps (constant throughout)
+        [[nodiscard]] Result<void> execute_constant_speed(
+            int32_t theta_steps,
+            int32_t rho_steps,
+            uint32_t interval_us
+        );
+
         /// Enable both motors
         void enable();
 

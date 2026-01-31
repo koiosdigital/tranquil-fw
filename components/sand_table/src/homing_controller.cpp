@@ -33,10 +33,12 @@ namespace sand_table {
     }
 
     Result<void> HomingController::init() {
-        ESP_LOGD(TAG, "Initializing homing controller...");
-        ESP_LOGD(TAG, "  Hall sensor pin: GPIO%d", PinConfig::THETA_HALL);
-        ESP_LOGD(TAG, "  Rho DIAG pin: GPIO%d", PinConfig::RHO_DIAG);
-        ESP_LOGD(TAG, "  StallGuard threshold: %d", MotionConfig::RHO_STALLGUARD_THRESHOLD);
+        ESP_LOGI(TAG, "Initializing homing controller...");
+        ESP_LOGI(TAG, "  Hall sensor pin: GPIO%d", PinConfig::THETA_HALL);
+        ESP_LOGI(TAG, "  Rho DIAG pin: GPIO%d", PinConfig::RHO_DIAG);
+        ESP_LOGI(TAG, "  StallGuard threshold: %d", MotionConfig::RHO_STALLGUARD_THRESHOLD);
+        ESP_LOGI(TAG, "  Rho step interval: %lu us", kRhoHomingIntervalUs);
+        ESP_LOGI(TAG, "  Theta step interval: %lu us", kThetaHomingIntervalUs);
 
         // Configure Hall sensor GPIO with interrupt
         gpio_config_t hall_config = {
@@ -85,9 +87,15 @@ namespace sand_table {
             return Result<void>::err(MotionError::HardwareFault);
         }
 
-        // Configure StallGuard
+        // Configure StallGuard for rho axis
+        ESP_LOGI(TAG, "Configuring TMC2209 StallGuard...");
         (void)rho_tmc_.set_stallguard_threshold(MotionConfig::RHO_STALLGUARD_THRESHOLD);
+        // CRITICAL: Set TCOOLTHRS to enable StallGuard at all speeds
         (void)rho_tmc_.set_stallguard_min_speed(0xFFFFF);
+
+        int diag_level = gpio_get_level(PinConfig::RHO_DIAG);
+        ESP_LOGI(TAG, "Initial DIAG pin level: %d", diag_level);
+        ESP_LOGI(TAG, "Homing controller initialized");
 
         return Result<void>::ok();
     }
@@ -95,21 +103,13 @@ namespace sand_table {
     void IRAM_ATTR HomingController::hall_isr_handler(void* arg) {
         auto* self = static_cast<HomingController*>(arg);
         self->hall_triggered_ = true;
-
-        // Immediately stop RMT transmission (ISR-safe version)
-        if (self->stepper_controller_ && self->homing_active_.load(std::memory_order_acquire)) {
-            self->stepper_controller_->emergency_stop_from_isr();
-        }
+        // Flag is checked after each chunk - no need to stop RMT here
     }
 
     void IRAM_ATTR HomingController::diag_isr_handler(void* arg) {
         auto* self = static_cast<HomingController*>(arg);
         self->rho_stall_triggered_ = true;
-
-        // Immediately stop RMT transmission (ISR-safe version)
-        if (self->stepper_controller_ && self->homing_active_.load(std::memory_order_acquire)) {
-            self->stepper_controller_->emergency_stop_from_isr();
-        }
+        // Flag is checked after each chunk - no need to stop RMT here
     }
 
     bool HomingController::is_hall_triggered() const {
@@ -129,7 +129,7 @@ namespace sand_table {
         state_.store(HomingState::Idle, std::memory_order_release);
     }
 
-    int32_t HomingController::execute_homing_chunk(int32_t theta_steps, int32_t rho_steps) {
+    int32_t HomingController::execute_homing_chunk(int32_t theta_steps, int32_t rho_steps, uint32_t interval_us) {
         if (!stepper_controller_) {
             ESP_LOGE(TAG, "No stepper controller set");
             return 0;
@@ -139,22 +139,9 @@ namespace sand_table {
         int32_t theta_before = theta_.position();
         int32_t rho_before = rho_.position();
 
-        // Create a motion segment for the chunk
-        MotionSegment segment;
-        segment.delta_theta_steps = theta_steps;
-        segment.delta_rho_steps = rho_steps;
-        segment.delta_theta_rad = 0;  // Not used for step-based motion
-        segment.delta_rho_norm = 0;
-        segment.distance = static_cast<float>(std::max(std::abs(theta_steps), std::abs(rho_steps)));
-        segment.nominal_velocity = kHomingFeedrate;
-        segment.theta_entry_velocity = kHomingFeedrate;
-        segment.theta_exit_velocity = kHomingFeedrate;
-        segment.rho_entry_velocity = kHomingFeedrate;
-        segment.rho_exit_velocity = kHomingFeedrate;
-        segment.is_last_segment = true;
-
-        // Execute the segment - this blocks until complete or stopped by ISR
-        auto result = stepper_controller_->execute_segment(segment);
+        // Execute at constant speed - no acceleration/deceleration
+        // This is critical for StallGuard to work reliably
+        auto result = stepper_controller_->execute_constant_speed(theta_steps, rho_steps, interval_us);
 
         // Calculate actual steps taken (may be less if ISR stopped early)
         int32_t theta_after = theta_.position();
@@ -168,7 +155,8 @@ namespace sand_table {
     }
 
     HomingController::HomingResult HomingController::seek_rho_max() {
-        ESP_LOGI(TAG, "Seeking rho max...");
+        ESP_LOGI(TAG, "Seeking rho max at %lu us/step (%lu steps/sec)...",
+            kRhoHomingIntervalUs, 1000000UL / kRhoHomingIntervalUs);
         state_.store(HomingState::RhoSeekingMax, std::memory_order_release);
 
         // Clear stall flag and set direction outward
@@ -183,11 +171,11 @@ namespace sand_table {
                 return result;
             }
 
-            // Execute a chunk of rho-only steps
+            // Execute a chunk of rho-only steps at constant speed
             int32_t chunk_steps = std::min(static_cast<int32_t>(kChunkSize),
                 static_cast<int32_t>(kMaxHomingSteps) - total_steps);
 
-            int32_t actual_steps = execute_homing_chunk(0, chunk_steps);
+            int32_t actual_steps = execute_homing_chunk(0, chunk_steps, kRhoHomingIntervalUs);
             total_steps += actual_steps;
 
             // Check if stall was detected (ISR set flag and stopped motion)
@@ -232,11 +220,11 @@ namespace sand_table {
                 return result;
             }
 
-            // Execute a chunk of rho-only steps (negative for inward)
+            // Execute a chunk of rho-only steps (negative for inward) at constant speed
             int32_t chunk_steps = std::min(static_cast<int32_t>(kChunkSize),
                 static_cast<int32_t>(kMaxHomingSteps) - total_steps);
 
-            int32_t actual_steps = execute_homing_chunk(0, -chunk_steps);
+            int32_t actual_steps = execute_homing_chunk(0, -chunk_steps, kRhoHomingIntervalUs);
             total_steps += actual_steps;
 
             if (rho_stall_triggered_) {
@@ -277,12 +265,12 @@ namespace sand_table {
                     return result;
                 }
 
-                // Move theta with coupled rho compensation
+                // Move theta with coupled rho compensation at constant speed
                 int32_t theta_chunk = std::min(static_cast<int32_t>(kChunkSize),
                     static_cast<int32_t>(kMaxHomingSteps) - backoff_steps);
                 int32_t rho_chunk = theta_chunk / static_cast<int32_t>(kGearRatio);
 
-                int32_t actual = execute_homing_chunk(-theta_chunk, -rho_chunk);
+                int32_t actual = execute_homing_chunk(-theta_chunk, -rho_chunk, kThetaHomingIntervalUs);
                 backoff_steps += actual;
             }
         }
@@ -304,12 +292,12 @@ namespace sand_table {
                 return result;
             }
 
-            // Execute chunk with coupled rho compensation
+            // Execute chunk with coupled rho compensation at constant speed
             int32_t theta_chunk = std::min(static_cast<int32_t>(kChunkSize),
                 static_cast<int32_t>(kMaxHomingSteps) - total_steps);
             int32_t rho_chunk = theta_chunk / static_cast<int32_t>(kGearRatio);
 
-            int32_t actual = execute_homing_chunk(theta_chunk, rho_chunk);
+            int32_t actual = execute_homing_chunk(theta_chunk, rho_chunk, kThetaHomingIntervalUs);
 
             if (!first_edge_found) {
                 total_steps += actual;

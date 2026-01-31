@@ -119,10 +119,15 @@ namespace sand_table {
         int32_t rho_max_steps_ = 0;
         int32_t theta_steps_per_rotation_ = 0;
 
-        // Homing parameters
+        // Homing parameters (matched to main branch)
         static constexpr uint32_t kMaxHomingSteps = 100000;
-        static constexpr uint32_t kChunkSize = 1000;  // Steps per RMT chunk
-        static constexpr float kHomingFeedrate = 5.0f;  // RPM for homing moves
+        static constexpr uint32_t kChunkSize = 64;  // Steps per chunk (check stall flag every ~48ms at 750µs/step)
+
+        // Homing step intervals - matched exactly to main branch (constant speed, no acceleration)
+        // These are CRITICAL for StallGuard to work reliably
+        static constexpr uint32_t kRhoHomingIntervalUs = 750;   // 750µs/step = 1333 steps/sec
+        static constexpr uint32_t kThetaHomingIntervalUs = 400; // 400µs/step = 2500 steps/sec
+
         static constexpr uint32_t kGearRatio = static_cast<uint32_t>(MechanicalConfig::THETA_GEAR_RATIO);
 
         // ISR handlers
@@ -134,9 +139,9 @@ namespace sand_table {
         HomingResult seek_rho_min();
         HomingResult calibrate_theta();
 
-        // Execute a homing segment via RMT, returns steps actually taken
+        // Execute a homing segment via RMT at constant speed, returns steps actually taken
         // Returns early if sensor ISR triggers
-        int32_t execute_homing_chunk(int32_t theta_steps, int32_t rho_steps);
+        int32_t execute_homing_chunk(int32_t theta_steps, int32_t rho_steps, uint32_t interval_us);
     };
 
 } // namespace sand_table
