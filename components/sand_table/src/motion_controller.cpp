@@ -244,8 +244,8 @@ namespace sand_table {
                 // Handle position overflow (wrap theta, adjust rho - like main branch)
                 handle_position_overflow();
 
-                // Check if this was the last segment
-                if (segment.is_last_segment && segment_queue_.empty() && velocity_planner_->empty()) {
+                // Go idle when all queues are empty
+                if (segment_queue_.empty() && velocity_planner_->empty()) {
                     state_.store(SystemState::Idle, std::memory_order_release);
                     reset_inactivity_timer();
                 }
@@ -508,30 +508,13 @@ namespace sand_table {
     }
 
     void MotionController::transfer_ready_segments() {
-        // Transfer segments from velocity planner to execution queue when ready
-        // A segment is ready when:
-        // - VelocityPlanner has >1 segment (entry velocity is stable from lookahead), OR
-        // - Segment has is_last_segment=true (flush pipeline)
-
+        // Transfer all available segments from velocity planner to execution queue
+        // Lookahead works naturally: if segments queue faster than execution,
+        // velocity planner calculates junction velocities before transfer
         while (!velocity_planner_->empty() && !segment_queue_.full()) {
-            auto maybe_seg = velocity_planner_->peek_segment();
-            if (!maybe_seg) break;
-
-            const MotionSegment& seg = *maybe_seg;
-
-            // Transfer if: this is the last segment, or we have lookahead buffer
-            bool should_transfer = seg.is_last_segment ||
-                velocity_planner_->segment_count() > 1;
-
-            if (should_transfer) {
-                auto popped = velocity_planner_->pop_segment();
-                if (popped) {
-                    segment_queue_.push(*popped);
-                }
-            }
-            else {
-                // Not enough lookahead yet, wait for more segments
-                break;
+            auto popped = velocity_planner_->pop_segment();
+            if (popped) {
+                segment_queue_.push(*popped);
             }
         }
     }

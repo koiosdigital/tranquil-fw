@@ -60,6 +60,10 @@ private:
     float acceleration_ = static_cast<float>(MotionConfig::DEFAULT_ACCEL_MM_S2);
     float junction_deviation_ = MotionConfig::JUNCTION_DEVIATION_MM;
 
+    // Track last transferred segment's exit velocities for continuity
+    float last_theta_exit_velocity_ = 0.0f;
+    float last_rho_exit_velocity_ = 0.0f;
+
     /// Calculate theta motor junction velocity (only affected by theta direction changes)
     [[nodiscard]] float calculate_theta_junction_velocity(
         const MotionSegment& prev,
@@ -94,6 +98,8 @@ inline void VelocityPlanner::clear() noexcept {
     head_ = 0;
     tail_ = 0;
     count_ = 0;
+    last_theta_exit_velocity_ = 0.0f;
+    last_rho_exit_velocity_ = 0.0f;
 }
 
 inline MotionSegment& VelocityPlanner::at(size_t index) {
@@ -136,6 +142,11 @@ inline std::optional<MotionSegment> VelocityPlanner::pop_segment() {
     }
 
     MotionSegment segment = segments_[tail_];
+
+    // Save exit velocity for next segment's entry
+    last_theta_exit_velocity_ = segment.theta_exit_velocity;
+    last_rho_exit_velocity_ = segment.rho_exit_velocity;
+
     tail_ = (tail_ + 1) % kLookaheadDepth;
     count_--;
 
@@ -207,52 +218,72 @@ inline void VelocityPlanner::recalculate() {
         return;
     }
 
-    // Single segment - simple case
-    if (count_ == 1) {
-        MotionSegment& seg = at(0);
-        // Both motors start from zero
-        seg.theta_entry_velocity = 0.0f;
-        seg.rho_entry_velocity = 0.0f;
-        // Exit at nominal unless it's the last segment
-        if (seg.is_last_segment) {
-            seg.theta_exit_velocity = 0.0f;
-            seg.rho_exit_velocity = 0.0f;
-        } else {
-            seg.theta_exit_velocity = seg.nominal_velocity;
-            seg.rho_exit_velocity = seg.nominal_velocity;
+    auto sign = [](int32_t v) -> int {
+        if (v > 0) return 1;
+        if (v < 0) return -1;
+        return 0;
+    };
+
+    // Per-motor velocity planning: only slow down when that motor reverses direction
+    // The stepper driver handles acceleration profiles based on actual step counts
+
+    // First segment: entry from previous segment's exit (for continuity)
+    // But if this motor isn't moving, entry is 0
+    MotionSegment& first = at(0);
+    first.theta_entry_velocity = (sign(first.delta_theta_steps) != 0) ? last_theta_exit_velocity_ : 0.0f;
+    first.rho_entry_velocity = (sign(first.delta_rho_steps) != 0) ? last_rho_exit_velocity_ : 0.0f;
+
+    // Set exit velocities and propagate through junctions
+    for (size_t i = 0; i < count_; ++i) {
+        MotionSegment& seg = at(i);
+
+        // Default: exit at nominal velocity (if motor is moving)
+        seg.theta_exit_velocity = (sign(seg.delta_theta_steps) != 0) ? seg.nominal_velocity : 0.0f;
+        seg.rho_exit_velocity = (sign(seg.delta_rho_steps) != 0) ? seg.nominal_velocity : 0.0f;
+
+        // Check junction with next segment (if there is one)
+        if (i < count_ - 1) {
+            MotionSegment& next = at(i + 1);
+
+            const int curr_theta_dir = sign(seg.delta_theta_steps);
+            const int next_theta_dir = sign(next.delta_theta_steps);
+
+            // Theta junction velocity
+            if (curr_theta_dir == 0) {
+                // Current segment doesn't move theta - next starts from 0
+                next.theta_entry_velocity = 0.0f;
+            } else if (next_theta_dir == 0) {
+                // Next segment doesn't move theta - current can exit at full speed
+                next.theta_entry_velocity = 0.0f;
+            } else if (curr_theta_dir != next_theta_dir) {
+                // Direction reversal - must stop
+                seg.theta_exit_velocity = 0.0f;
+                next.theta_entry_velocity = 0.0f;
+            } else {
+                // Same direction - maintain velocity
+                next.theta_entry_velocity = seg.theta_exit_velocity;
+            }
+
+            const int curr_rho_dir = sign(seg.delta_rho_steps);
+            const int next_rho_dir = sign(next.delta_rho_steps);
+
+            // Rho junction velocity
+            if (curr_rho_dir == 0) {
+                // Current segment doesn't move rho - next starts from 0
+                next.rho_entry_velocity = 0.0f;
+            } else if (next_rho_dir == 0) {
+                // Next segment doesn't move rho - current can exit at full speed
+                next.rho_entry_velocity = 0.0f;
+            } else if (curr_rho_dir != next_rho_dir) {
+                // Direction reversal - must stop
+                seg.rho_exit_velocity = 0.0f;
+                next.rho_entry_velocity = 0.0f;
+            } else {
+                // Same direction - maintain velocity
+                next.rho_entry_velocity = seg.rho_exit_velocity;
+            }
         }
-        return;
     }
-
-    // Calculate junction velocities between segments - INDEPENDENTLY per motor
-    for (size_t i = 0; i < count_ - 1; ++i) {
-        MotionSegment& curr = at(i);
-        MotionSegment& next = at(i + 1);
-
-        // Theta motor junction - only affected by theta direction changes
-        const float theta_junction = calculate_theta_junction_velocity(curr, next);
-        curr.theta_exit_velocity = theta_junction;
-        next.theta_entry_velocity = theta_junction;
-
-        // Rho motor junction - only affected by rho direction changes
-        const float rho_junction = calculate_rho_junction_velocity(curr, next);
-        curr.rho_exit_velocity = rho_junction;
-        next.rho_entry_velocity = rho_junction;
-    }
-
-    // First segment starts from zero (or current velocity if resuming)
-    at(0).theta_entry_velocity = 0.0f;
-    at(0).rho_entry_velocity = 0.0f;
-
-    // Last segment ends at zero if marked as last
-    if (at(count_ - 1).is_last_segment) {
-        at(count_ - 1).theta_exit_velocity = 0.0f;
-        at(count_ - 1).rho_exit_velocity = 0.0f;
-    }
-
-    // Run two-pass algorithm
-    reverse_pass();
-    forward_pass();
 }
 
 inline void VelocityPlanner::reverse_pass() {

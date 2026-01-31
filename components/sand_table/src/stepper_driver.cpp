@@ -680,13 +680,28 @@ namespace sand_table {
         const float max_step_rate = static_cast<float>(HardwareConfig::MAX_STEP_RATE_HZ);
         const float min_step_rate = 310.0f;  // Limited by RMT symbol duration
 
-        // Use the DOMINANT motor's velocity profile (more steps = controls timing)
-        // Each motor has independent velocity planning - rho reversal doesn't affect theta velocity
-        const bool theta_is_dominant = std::abs(segment.delta_theta_steps) >= std::abs(segment.delta_rho_steps);
+        // For coordinated motion, use velocity from motors that are actually moving
+        // If both move, use minimum (so deceleration happens if either needs to slow)
+        // If only one moves, use that motor's velocity
+        const bool theta_moves = segment.delta_theta_steps != 0;
+        const bool rho_moves = segment.delta_rho_steps != 0;
 
-        // Select the dominant motor's velocities
-        const float entry_rpm = theta_is_dominant ? segment.theta_entry_velocity : segment.rho_entry_velocity;
-        const float exit_rpm = theta_is_dominant ? segment.theta_exit_velocity : segment.rho_exit_velocity;
+        float entry_rpm, exit_rpm;
+        if (theta_moves && rho_moves) {
+            // Both moving: use minimum so either motor can request deceleration
+            entry_rpm = std::min(segment.theta_entry_velocity, segment.rho_entry_velocity);
+            exit_rpm = std::min(segment.theta_exit_velocity, segment.rho_exit_velocity);
+        } else if (theta_moves) {
+            entry_rpm = segment.theta_entry_velocity;
+            exit_rpm = segment.theta_exit_velocity;
+        } else if (rho_moves) {
+            entry_rpm = segment.rho_entry_velocity;
+            exit_rpm = segment.rho_exit_velocity;
+        } else {
+            // Neither moves - shouldn't happen, but handle gracefully
+            entry_rpm = 0.0f;
+            exit_rpm = 0.0f;
+        }
 
         // Convert RPM to steps/s using the relationship:
         //   motion_time = distance / (rpm / 60)

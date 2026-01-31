@@ -93,7 +93,6 @@ namespace sand_table {
             segment.delta_rho_norm = -current.rho;
             segment.distance = static_cast<float>(current.rho);
             segment.nominal_velocity = feedrate_rpm;
-            segment.is_last_segment = true;
             segment.delta_theta_steps = 0;
             segment.delta_rho_steps = 0;
 
@@ -115,7 +114,6 @@ namespace sand_table {
             segment.delta_rho_norm = target.rho;  // From ~0 to target
             segment.distance = static_cast<float>(target.rho);  // Distance dominated by rho
             segment.nominal_velocity = feedrate_rpm;
-            segment.is_last_segment = true;
             segment.delta_theta_steps = 0;
             segment.delta_rho_steps = 0;
 
@@ -176,7 +174,6 @@ namespace sand_table {
             segment.delta_rho_norm = seg_rho - prev_pos.rho;
             segment.distance = dist_per_seg;
             segment.nominal_velocity = feedrate_rpm;
-            segment.is_last_segment = (i == num_segments - 1);
 
             // Motor steps will be calculated at execution time
             segment.delta_theta_steps = 0;
@@ -227,7 +224,6 @@ namespace sand_table {
         segment.delta_rho_norm = delta_rho;
         segment.distance = static_cast<float>(std::max(distance, 0.001));  // Ensure non-zero
         segment.nominal_velocity = feedrate_rpm;
-        segment.is_last_segment = true;
         segment.delta_theta_steps = 0;  // Calculated later by transformer
         segment.delta_rho_steps = 0;
 

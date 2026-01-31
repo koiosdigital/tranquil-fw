@@ -145,9 +145,6 @@ namespace sand_table {
         float nominal_velocity = 0.0f;       // RPM (shared nominal/cruise target)
         float acceleration = 0.0f;
 
-        // Flags
-        bool is_last_segment = false;
-
         [[nodiscard]] CartesianPosition direction() const noexcept {
             // Convert polar delta to approximate Cartesian direction
             // This is used for junction velocity calculations

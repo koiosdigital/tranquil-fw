@@ -95,6 +95,11 @@ namespace sand_table {
         // CRITICAL: Set TCOOLTHRS to enable StallGuard at all speeds
         (void)rho_tmc_.set_stallguard_min_speed(0xFFFFF);
 
+        // Disable both ISRs initially - they'll be enabled only during the appropriate homing phase
+        // This prevents them from interfering with normal motion or each other during homing
+        gpio_intr_disable(PinConfig::THETA_HALL);
+        gpio_intr_disable(PinConfig::RHO_DIAG);
+
         int diag_level = gpio_get_level(PinConfig::RHO_DIAG);
         ESP_LOGI(TAG, "Initial DIAG pin level: %d", diag_level);
         ESP_LOGI(TAG, "Homing controller initialized");
@@ -105,13 +110,19 @@ namespace sand_table {
     void IRAM_ATTR HomingController::hall_isr_handler(void* arg) {
         auto* self = static_cast<HomingController*>(arg);
         self->hall_triggered_ = true;
-        // Flag is checked after each chunk - no need to stop RMT here
+        // Immediately stop RMT transmission from ISR context
+        if (self->stepper_controller_) {
+            self->stepper_controller_->emergency_stop_from_isr();
+        }
     }
 
     void IRAM_ATTR HomingController::diag_isr_handler(void* arg) {
         auto* self = static_cast<HomingController*>(arg);
         self->rho_stall_triggered_ = true;
-        // Flag is checked after each chunk - no need to stop RMT here
+        // Immediately stop RMT transmission from ISR context
+        if (self->stepper_controller_) {
+            self->stepper_controller_->emergency_stop_from_isr();
+        }
     }
 
     bool HomingController::is_hall_triggered() const {
@@ -120,6 +131,22 @@ namespace sand_table {
 
     bool HomingController::is_rho_stalled() const {
         return gpio_get_level(PinConfig::RHO_DIAG) == 1;
+    }
+
+    void HomingController::enable_hall_isr() {
+        gpio_intr_enable(PinConfig::THETA_HALL);
+    }
+
+    void HomingController::disable_hall_isr() {
+        gpio_intr_disable(PinConfig::THETA_HALL);
+    }
+
+    void HomingController::enable_diag_isr() {
+        gpio_intr_enable(PinConfig::RHO_DIAG);
+    }
+
+    void HomingController::disable_diag_isr() {
+        gpio_intr_disable(PinConfig::RHO_DIAG);
     }
 
     void HomingController::abort() {
@@ -131,72 +158,54 @@ namespace sand_table {
         state_.store(HomingState::Idle, std::memory_order_release);
     }
 
-    int32_t HomingController::execute_homing_chunk(int32_t theta_steps, int32_t rho_steps, uint32_t interval_us) {
-        if (!stepper_controller_) {
-            ESP_LOGE(TAG, "No stepper controller set");
-            return 0;
-        }
-
-        // Record position before move
-        int32_t theta_before = theta_.position();
-        int32_t rho_before = rho_.position();
-
-        // Execute at constant speed - no acceleration/deceleration
-        // This is critical for StallGuard to work reliably
-        auto result = stepper_controller_->execute_constant_speed(theta_steps, rho_steps, interval_us);
-
-        // Calculate actual steps taken (may be less if ISR stopped early)
-        int32_t theta_after = theta_.position();
-        int32_t rho_after = rho_.position();
-
-        int32_t theta_moved = std::abs(theta_after - theta_before);
-        int32_t rho_moved = std::abs(rho_after - rho_before);
-
-        // Return the dominant axis step count
-        return std::max(theta_moved, rho_moved);
-    }
-
     HomingController::HomingResult HomingController::seek_rho_max() {
         ESP_LOGI(TAG, "Seeking rho max at %lu us/step (%lu steps/sec)...",
             kRhoHomingIntervalUs, 1000000UL / kRhoHomingIntervalUs);
         state_.store(HomingState::RhoSeekingMax, std::memory_order_release);
 
+        if (!stepper_controller_) {
+            ESP_LOGE(TAG, "No stepper controller set");
+            HomingResult result;
+            result.error = MotionError::InvalidState;
+            return result;
+        }
+
         // Clear stall flag and set direction outward
         rho_stall_triggered_ = false;
         rho_.set_direction(true);
 
-        int32_t total_steps = 0;
-        while (total_steps < static_cast<int32_t>(kMaxHomingSteps)) {
-            if (abort_requested_.load(std::memory_order_acquire)) {
-                HomingResult result;
-                result.error = MotionError::EmergencyStop;
-                return result;
-            }
+        // Only enable stallguard ISR for this phase
+        disable_hall_isr();
+        enable_diag_isr();
 
-            // Execute a chunk of rho-only steps at constant speed
-            int32_t chunk_steps = std::min(static_cast<int32_t>(kChunkSize),
-                static_cast<int32_t>(kMaxHomingSteps) - total_steps);
+        // Record starting position
+        int32_t rho_before = rho_.position();
 
-            int32_t actual_steps = execute_homing_chunk(0, chunk_steps, kRhoHomingIntervalUs);
-            total_steps += actual_steps;
+        // Execute a single large move - ISR will stop when stall detected
+        auto move_result = stepper_controller_->execute_constant_speed(
+            0, static_cast<int32_t>(kMaxHomingSteps), kRhoHomingIntervalUs);
 
-            // Check if stall was detected (ISR set flag and stopped motion)
-            if (rho_stall_triggered_) {
-                ESP_LOGI(TAG, "Rho max found at step %ld", total_steps);
-                HomingResult result;
-                result.success = true;
-                result.position_steps = total_steps;
-                return result;
-            }
+        // Calculate actual steps moved
+        int32_t rho_after = rho_.position();
+        int32_t steps_moved = std::abs(rho_after - rho_before);
 
-            // If we got all requested steps, continue to next chunk
-            // If we got fewer, something else stopped us
-            if (actual_steps < chunk_steps && !rho_stall_triggered_) {
-                // Unexpected stop
-                vTaskDelay(pdMS_TO_TICKS(10));
-            }
+        // Check if aborted
+        if (abort_requested_.load(std::memory_order_acquire)) {
+            HomingResult result;
+            result.error = MotionError::EmergencyStop;
+            return result;
         }
 
+        // Check if stall was detected
+        if (rho_stall_triggered_) {
+            ESP_LOGI(TAG, "Rho max found at step %ld", steps_moved);
+            HomingResult result;
+            result.success = true;
+            result.position_steps = steps_moved;
+            return result;
+        }
+
+        // If we completed all steps without stall, that's a failure
         ESP_LOGE(TAG, "Rho max not found within %lu steps", kMaxHomingSteps);
         HomingResult result;
         result.error = MotionError::HomingFailed;
@@ -207,41 +216,52 @@ namespace sand_table {
         ESP_LOGI(TAG, "Seeking rho min...");
         state_.store(HomingState::RhoSeekingMin, std::memory_order_release);
 
+        if (!stepper_controller_) {
+            ESP_LOGE(TAG, "No stepper controller set");
+            HomingResult result;
+            result.error = MotionError::InvalidState;
+            return result;
+        }
+
         // Clear stall flag and set direction inward
         rho_stall_triggered_ = false;
         rho_.set_direction(false);
 
+        // Only enable stallguard ISR for this phase
+        disable_hall_isr();
+        enable_diag_isr();
+
         // Brief pause to let StallGuard clear from previous stall
         vTaskDelay(pdMS_TO_TICKS(100));
 
-        int32_t total_steps = 0;
-        while (total_steps < static_cast<int32_t>(kMaxHomingSteps)) {
-            if (abort_requested_.load(std::memory_order_acquire)) {
-                HomingResult result;
-                result.error = MotionError::EmergencyStop;
-                return result;
-            }
+        // Record starting position
+        int32_t rho_before = rho_.position();
 
-            // Execute a chunk of rho-only steps (negative for inward) at constant speed
-            int32_t chunk_steps = std::min(static_cast<int32_t>(kChunkSize),
-                static_cast<int32_t>(kMaxHomingSteps) - total_steps);
+        // Execute a single large move inward - ISR will stop when stall detected
+        auto move_result = stepper_controller_->execute_constant_speed(
+            0, -static_cast<int32_t>(kMaxHomingSteps), kRhoHomingIntervalUs);
 
-            int32_t actual_steps = execute_homing_chunk(0, -chunk_steps, kRhoHomingIntervalUs);
-            total_steps += actual_steps;
+        // Calculate actual steps moved
+        int32_t rho_after = rho_.position();
+        int32_t steps_moved = std::abs(rho_after - rho_before);
 
-            if (rho_stall_triggered_) {
-                ESP_LOGI(TAG, "Rho min found - total travel: %ld steps", total_steps);
-                HomingResult result;
-                result.success = true;
-                result.position_steps = total_steps;
-                return result;
-            }
-
-            if (actual_steps < chunk_steps && !rho_stall_triggered_) {
-                vTaskDelay(pdMS_TO_TICKS(10));
-            }
+        // Check if aborted
+        if (abort_requested_.load(std::memory_order_acquire)) {
+            HomingResult result;
+            result.error = MotionError::EmergencyStop;
+            return result;
         }
 
+        // Check if stall was detected
+        if (rho_stall_triggered_) {
+            ESP_LOGI(TAG, "Rho min found - total travel: %ld steps", steps_moved);
+            HomingResult result;
+            result.success = true;
+            result.position_steps = steps_moved;
+            return result;
+        }
+
+        // If we completed all steps without stall, that's a failure
         ESP_LOGE(TAG, "Rho min not found within %lu steps", kMaxHomingSteps);
         HomingResult result;
         result.error = MotionError::HomingFailed;
@@ -252,83 +272,112 @@ namespace sand_table {
         ESP_LOGI(TAG, "Calibrating theta...");
         state_.store(HomingState::ThetaCalibrating, std::memory_order_release);
 
+        if (!stepper_controller_) {
+            ESP_LOGE(TAG, "No stepper controller set");
+            HomingResult result;
+            result.error = MotionError::InvalidState;
+            return result;
+        }
+
+        // Disable both ISRs during backoff phase
+        disable_hall_isr();
+        disable_diag_isr();
+
         // If already on Hall sensor, back off first
+        // Hall ISR won't trigger during backoff (triggers on NEGEDGE = entering field)
+        // We just need to move backward enough to exit the hall field
         if (is_hall_triggered()) {
             ESP_LOGD(TAG, "Backing off Hall sensor...");
             hall_triggered_ = false;
             theta_.set_direction(false);  // Reverse
             rho_.set_direction(false);    // Rho follows theta due to coupling
 
-            int32_t backoff_steps = 0;
-            while (is_hall_triggered() && backoff_steps < static_cast<int32_t>(kMaxHomingSteps)) {
-                if (abort_requested_.load(std::memory_order_acquire)) {
-                    HomingResult result;
-                    result.error = MotionError::EmergencyStop;
-                    return result;
-                }
+            // Move backward a moderate amount (hall field is small)
+            // Use ~5000 theta steps with coupled rho compensation
+            constexpr int32_t kBackoffSteps = 5000;
+            int32_t rho_backoff = kBackoffSteps / static_cast<int32_t>(kGearRatio);
 
-                // Move theta with coupled rho compensation at constant speed
-                int32_t theta_chunk = std::min(static_cast<int32_t>(kChunkSize),
-                    static_cast<int32_t>(kMaxHomingSteps) - backoff_steps);
-                int32_t rho_chunk = theta_chunk / static_cast<int32_t>(kGearRatio);
+            (void)stepper_controller_->execute_constant_speed(
+                -kBackoffSteps, -rho_backoff, kThetaHomingIntervalUs);
 
-                int32_t actual = execute_homing_chunk(-theta_chunk, -rho_chunk, kThetaHomingIntervalUs);
-                backoff_steps += actual;
-            }
-        }
-
-        // Seek forward to first Hall edge
-        ESP_LOGD(TAG, "Seeking first Hall edge...");
-        hall_triggered_ = false;
-        theta_.set_direction(true);   // Forward
-        rho_.set_direction(true);     // Rho follows theta
-
-        int32_t total_steps = 0;
-        bool first_edge_found = false;
-        int32_t steps_since_first_edge = 0;
-
-        while (total_steps < static_cast<int32_t>(kMaxHomingSteps)) {
             if (abort_requested_.load(std::memory_order_acquire)) {
                 HomingResult result;
                 result.error = MotionError::EmergencyStop;
                 return result;
             }
 
-            // Execute chunk with coupled rho compensation at constant speed
-            int32_t theta_chunk = std::min(static_cast<int32_t>(kChunkSize),
-                static_cast<int32_t>(kMaxHomingSteps) - total_steps);
-            int32_t rho_chunk = theta_chunk / static_cast<int32_t>(kGearRatio);
-
-            int32_t actual = execute_homing_chunk(theta_chunk, rho_chunk, kThetaHomingIntervalUs);
-
-            if (!first_edge_found) {
-                total_steps += actual;
-                if (hall_triggered_) {
-                    ESP_LOGD(TAG, "First Hall edge found at step %ld", total_steps);
-                    first_edge_found = true;
-                    steps_since_first_edge = 0;
-                    hall_triggered_ = false;  // Clear for second edge detection
-
-                    // Re-enable Hall interrupt for second edge
-                    // (it was cleared by finding first edge)
-                }
-            }
-            else {
-                steps_since_first_edge += actual;
-                if (hall_triggered_) {
-                    // Found second edge - one full rotation complete
-                    ESP_LOGI(TAG, "Theta calibration complete: %ld steps/rotation", steps_since_first_edge);
-                    HomingResult result;
-                    result.success = true;
-                    result.position_steps = steps_since_first_edge;
-                    return result;
-                }
+            // Verify we're off the hall sensor
+            if (is_hall_triggered()) {
+                ESP_LOGE(TAG, "Failed to back off Hall sensor");
+                HomingResult result;
+                result.error = MotionError::HomingFailed;
+                return result;
             }
         }
 
-        ESP_LOGE(TAG, "Theta calibration failed - Hall sensor not found");
+        // Only enable hall ISR for edge detection
+        enable_hall_isr();
+
+        // Seek forward to first Hall edge
+        // ISR will stop when we enter the hall field (NEGEDGE)
+        ESP_LOGD(TAG, "Seeking first Hall edge...");
+        hall_triggered_ = false;
+        theta_.set_direction(true);   // Forward
+        rho_.set_direction(true);     // Rho follows theta
+
+        int32_t theta_before = theta_.position();
+        int32_t rho_steps_for_full_rotation = static_cast<int32_t>(kMaxHomingSteps) / static_cast<int32_t>(kGearRatio);
+
+        // Execute large forward move - ISR stops at first edge
+        (void)stepper_controller_->execute_constant_speed(
+            static_cast<int32_t>(kMaxHomingSteps), rho_steps_for_full_rotation, kThetaHomingIntervalUs);
+
+        if (abort_requested_.load(std::memory_order_acquire)) {
+            HomingResult result;
+            result.error = MotionError::EmergencyStop;
+            return result;
+        }
+
+        if (!hall_triggered_) {
+            ESP_LOGE(TAG, "First Hall edge not found");
+            HomingResult result;
+            result.error = MotionError::HomingFailed;
+            return result;
+        }
+
+        int32_t first_edge_position = theta_.position();
+        ESP_LOGD(TAG, "First Hall edge found at step %ld", first_edge_position - theta_before);
+
+        // Seek forward to second Hall edge (full rotation measurement)
+        // We're currently ON the hall sensor, need to exit it and re-enter
+        hall_triggered_ = false;  // Clear for second edge detection
+
+        theta_before = theta_.position();
+
+        // Execute another large forward move - ISR stops at second edge
+        (void)stepper_controller_->execute_constant_speed(
+            static_cast<int32_t>(kMaxHomingSteps), rho_steps_for_full_rotation, kThetaHomingIntervalUs);
+
+        if (abort_requested_.load(std::memory_order_acquire)) {
+            HomingResult result;
+            result.error = MotionError::EmergencyStop;
+            return result;
+        }
+
+        if (!hall_triggered_) {
+            ESP_LOGE(TAG, "Second Hall edge not found");
+            HomingResult result;
+            result.error = MotionError::HomingFailed;
+            return result;
+        }
+
+        // Steps between edges = one full rotation
+        int32_t steps_per_rotation = theta_.position() - theta_before;
+        ESP_LOGI(TAG, "Theta calibration complete: %ld steps/rotation", steps_per_rotation);
+
         HomingResult result;
-        result.error = MotionError::HomingFailed;
+        result.success = true;
+        result.position_steps = steps_per_rotation;
         return result;
     }
 
@@ -343,6 +392,8 @@ namespace sand_table {
         // Seek max first
         auto max_result = seek_rho_max();
         if (!max_result.success) {
+            disable_hall_isr();
+            disable_diag_isr();
             homing_active_.store(false, std::memory_order_release);
             state_.store(HomingState::Error, std::memory_order_release);
             return max_result;
@@ -354,6 +405,8 @@ namespace sand_table {
         // Seek min to measure travel
         auto min_result = seek_rho_min();
         if (!min_result.success) {
+            disable_hall_isr();
+            disable_diag_isr();
             homing_active_.store(false, std::memory_order_release);
             state_.store(HomingState::Error, std::memory_order_release);
             return min_result;
@@ -361,6 +414,10 @@ namespace sand_table {
 
         rho_max_steps_ = min_result.position_steps;
         rho_.reset_position();
+
+        // Disable ISRs after homing complete
+        disable_hall_isr();
+        disable_diag_isr();
 
         homing_active_.store(false, std::memory_order_release);
         state_.store(HomingState::Complete, std::memory_order_release);
@@ -378,6 +435,10 @@ namespace sand_table {
         rho_.set_enabled(true);
 
         auto result = calibrate_theta();
+
+        // Disable ISRs after homing (success or failure)
+        disable_hall_isr();
+        disable_diag_isr();
 
         if (result.success) {
             theta_steps_per_rotation_ = result.position_steps;
@@ -415,6 +476,8 @@ namespace sand_table {
         // Home rho first (for safety - moves to known position)
         auto rho_max = seek_rho_max();
         if (!rho_max.success) {
+            disable_hall_isr();
+            disable_diag_isr();
             homing_active_.store(false, std::memory_order_release);
             state_.store(HomingState::Error, std::memory_order_release);
             return Result<void>::err(rho_max.error);
@@ -424,6 +487,8 @@ namespace sand_table {
 
         auto rho_min = seek_rho_min();
         if (!rho_min.success) {
+            disable_hall_isr();
+            disable_diag_isr();
             homing_active_.store(false, std::memory_order_release);
             state_.store(HomingState::Error, std::memory_order_release);
             return Result<void>::err(rho_min.error);
@@ -436,6 +501,8 @@ namespace sand_table {
         // Home theta
         auto theta_result = calibrate_theta();
         if (!theta_result.success) {
+            disable_hall_isr();
+            disable_diag_isr();
             homing_active_.store(false, std::memory_order_release);
             state_.store(HomingState::Error, std::memory_order_release);
             return Result<void>::err(theta_result.error);
@@ -449,6 +516,10 @@ namespace sand_table {
 
         // Save calibration to NVS
         save_calibration_to_nvs();
+
+        // Disable both ISRs after homing complete
+        disable_hall_isr();
+        disable_diag_isr();
 
         ESP_LOGI(TAG, "Full homing complete - Rho: %ld steps, Theta: %ld steps/rev",
             rho_max_steps_, theta_steps_per_rotation_);
@@ -483,6 +554,8 @@ namespace sand_table {
         // Home rho to center using known max
         auto rho_result = home_rho_to_center(rho_max_steps_);
         if (!rho_result.success) {
+            disable_hall_isr();
+            disable_diag_isr();
             homing_active_.store(false, std::memory_order_release);
             state_.store(HomingState::Error, std::memory_order_release);
             return Result<void>::err(rho_result.error);
@@ -493,6 +566,8 @@ namespace sand_table {
         // Home theta to single Hall edge
         auto theta_result = home_theta_single();
         if (!theta_result.success) {
+            disable_hall_isr();
+            disable_diag_isr();
             homing_active_.store(false, std::memory_order_release);
             state_.store(HomingState::Error, std::memory_order_release);
             return Result<void>::err(theta_result.error);
@@ -501,6 +576,10 @@ namespace sand_table {
         // Reset positions
         theta_.reset_position();
         rho_.reset_position();
+
+        // Disable both ISRs after homing complete
+        disable_hall_isr();
+        disable_diag_isr();
 
         ESP_LOGI(TAG, "Quick homing complete");
 
@@ -524,30 +603,40 @@ namespace sand_table {
         ESP_LOGI(TAG, "Homing rho to center (max=%ld)...", rho_max_steps);
         state_.store(HomingState::RhoSeekingMin, std::memory_order_release);
 
+        if (!stepper_controller_) {
+            ESP_LOGE(TAG, "No stepper controller set");
+            HomingResult result;
+            result.error = MotionError::InvalidState;
+            return result;
+        }
+
         // Move inward until we stall at center (rho=0.0)
         rho_stall_triggered_ = false;
         rho_.set_direction(false);  // Inward
 
-        int32_t total_steps = 0;
-        while (total_steps < static_cast<int32_t>(kMaxHomingSteps)) {
-            if (abort_requested_.load(std::memory_order_acquire)) {
-                HomingResult result;
-                result.error = MotionError::EmergencyStop;
-                return result;
-            }
+        // Only enable stallguard ISR for this phase
+        disable_hall_isr();
+        enable_diag_isr();
 
-            int32_t chunk_steps = std::min(static_cast<int32_t>(kChunkSize),
-                static_cast<int32_t>(kMaxHomingSteps) - total_steps);
+        // Record starting position
+        int32_t rho_before = rho_.position();
 
-            int32_t actual_steps = execute_homing_chunk(0, -chunk_steps, kRhoHomingIntervalUs);
-            total_steps += actual_steps;
+        // Execute a single large move inward - ISR will stop when stall detected
+        (void)stepper_controller_->execute_constant_speed(
+            0, -static_cast<int32_t>(kMaxHomingSteps), kRhoHomingIntervalUs);
 
-            if (rho_stall_triggered_) {
-                ESP_LOGD(TAG, "Rho center found after %ld steps", total_steps);
-                break;
-            }
+        // Calculate actual steps moved
+        int32_t rho_after = rho_.position();
+        int32_t steps_moved = std::abs(rho_after - rho_before);
+
+        // Check if aborted
+        if (abort_requested_.load(std::memory_order_acquire)) {
+            HomingResult result;
+            result.error = MotionError::EmergencyStop;
+            return result;
         }
 
+        // Check if stall was detected
         if (!rho_stall_triggered_) {
             ESP_LOGE(TAG, "Rho center not found");
             HomingResult result;
@@ -555,7 +644,7 @@ namespace sand_table {
             return result;
         }
 
-        ESP_LOGI(TAG, "Rho homed to center");
+        ESP_LOGI(TAG, "Rho homed to center after %ld steps", steps_moved);
 
         HomingResult result;
         result.success = true;
@@ -567,58 +656,82 @@ namespace sand_table {
         ESP_LOGI(TAG, "Quick theta homing (single edge)...");
         state_.store(HomingState::ThetaCalibrating, std::memory_order_release);
 
+        if (!stepper_controller_) {
+            ESP_LOGE(TAG, "No stepper controller set");
+            HomingResult result;
+            result.error = MotionError::InvalidState;
+            return result;
+        }
+
+        // Disable both ISRs during backoff phase
+        disable_hall_isr();
+        disable_diag_isr();
+
         // If already on Hall sensor, back off first
+        // Hall ISR won't trigger during backoff (triggers on NEGEDGE = entering field)
         if (is_hall_triggered()) {
             ESP_LOGD(TAG, "Backing off Hall sensor...");
             hall_triggered_ = false;
             theta_.set_direction(false);  // Reverse
             rho_.set_direction(false);    // Rho follows theta due to coupling
 
-            int32_t backoff_steps = 0;
-            while (is_hall_triggered() && backoff_steps < static_cast<int32_t>(kMaxHomingSteps)) {
-                if (abort_requested_.load(std::memory_order_acquire)) {
-                    HomingResult result;
-                    result.error = MotionError::EmergencyStop;
-                    return result;
-                }
+            // Move backward a moderate amount (hall field is small)
+            constexpr int32_t kBackoffSteps = 5000;
+            int32_t rho_backoff = kBackoffSteps / static_cast<int32_t>(kGearRatio);
 
-                int32_t theta_chunk = std::min(static_cast<int32_t>(kChunkSize),
-                    static_cast<int32_t>(kMaxHomingSteps) - backoff_steps);
-                int32_t rho_chunk = theta_chunk / static_cast<int32_t>(kGearRatio);
+            (void)stepper_controller_->execute_constant_speed(
+                -kBackoffSteps, -rho_backoff, kThetaHomingIntervalUs);
 
-                int32_t actual = execute_homing_chunk(-theta_chunk, -rho_chunk, kThetaHomingIntervalUs);
-                backoff_steps += actual;
-            }
-        }
-
-        // Seek forward to first Hall edge only (no full rotation measurement)
-        ESP_LOGD(TAG, "Seeking Hall edge...");
-        hall_triggered_ = false;
-        theta_.set_direction(true);   // Forward
-        rho_.set_direction(true);     // Rho follows theta
-
-        int32_t total_steps = 0;
-        while (total_steps < static_cast<int32_t>(kMaxHomingSteps)) {
             if (abort_requested_.load(std::memory_order_acquire)) {
                 HomingResult result;
                 result.error = MotionError::EmergencyStop;
                 return result;
             }
 
-            int32_t theta_chunk = std::min(static_cast<int32_t>(kChunkSize),
-                static_cast<int32_t>(kMaxHomingSteps) - total_steps);
-            int32_t rho_chunk = theta_chunk / static_cast<int32_t>(kGearRatio);
-
-            int32_t actual = execute_homing_chunk(theta_chunk, rho_chunk, kThetaHomingIntervalUs);
-            total_steps += actual;
-
-            if (hall_triggered_) {
-                ESP_LOGI(TAG, "Theta home found at step %ld", total_steps);
+            // Verify we're off the hall sensor
+            if (is_hall_triggered()) {
+                ESP_LOGE(TAG, "Failed to back off Hall sensor");
                 HomingResult result;
-                result.success = true;
-                result.position_steps = total_steps;
+                result.error = MotionError::HomingFailed;
                 return result;
             }
+        }
+
+        // Only enable hall ISR for edge detection
+        enable_hall_isr();
+
+        // Seek forward to first Hall edge only (no full rotation measurement)
+        // ISR will stop when we enter the hall field (NEGEDGE)
+        ESP_LOGD(TAG, "Seeking Hall edge...");
+        hall_triggered_ = false;
+        theta_.set_direction(true);   // Forward
+        rho_.set_direction(true);     // Rho follows theta
+
+        int32_t theta_before = theta_.position();
+        int32_t rho_steps_for_full_rotation = static_cast<int32_t>(kMaxHomingSteps) / static_cast<int32_t>(kGearRatio);
+
+        // Execute large forward move - ISR stops at hall edge
+        (void)stepper_controller_->execute_constant_speed(
+            static_cast<int32_t>(kMaxHomingSteps), rho_steps_for_full_rotation, kThetaHomingIntervalUs);
+
+        // Calculate actual steps moved
+        int32_t theta_after = theta_.position();
+        int32_t steps_moved = std::abs(theta_after - theta_before);
+
+        // Check if aborted
+        if (abort_requested_.load(std::memory_order_acquire)) {
+            HomingResult result;
+            result.error = MotionError::EmergencyStop;
+            return result;
+        }
+
+        // Check if hall was detected
+        if (hall_triggered_) {
+            ESP_LOGI(TAG, "Theta home found at step %ld", steps_moved);
+            HomingResult result;
+            result.success = true;
+            result.position_steps = steps_moved;
+            return result;
         }
 
         ESP_LOGE(TAG, "Theta home not found");

@@ -25,14 +25,6 @@ static const char* TAG = "main";
 
 static sand_table::MotionController* g_motion_controller = nullptr;
 
-// Wait for all queued motion to complete
-static void wait_for_motion() {
-    while (g_motion_controller->is_moving() || g_motion_controller->queue_depth() > 0) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-    vTaskDelay(pdMS_TO_TICKS(50));  // Brief settle time
-}
-
 // Draw a circle at the given radius using 8 segments of pi/4 each
 // direction: +1 for CCW, -1 for CW
 static void draw_circle(double& current_theta, float rho, int direction, float feedrate) {
@@ -44,7 +36,6 @@ static void draw_circle(double& current_theta, float rho, int direction, float f
         current_theta += direction * QUARTER_PI;
         pos.theta = current_theta;
         (void)g_motion_controller->move_to(pos, feedrate);
-        wait_for_motion();
     }
 }
 
@@ -59,7 +50,6 @@ static void draw_triangle(double start_theta, float rho, float feedrate) {
     for (int i = 0; i < 3; i++) {
         pos.theta = start_theta + (i + 1) * TWO_PI_THIRDS;
         (void)g_motion_controller->move_to(pos, feedrate);
-        wait_for_motion();
     }
 }
 
@@ -108,8 +98,9 @@ extern "C" void app_main(void)
         PixelDriver::start();
 
         ESP_LOGI(TAG, "LED driver initialized: %d LEDs, %s format",
-                 led_config.led_count, led_config.is_rgbw ? "RGBW" : "RGB");
-    } else {
+            led_config.led_count, led_config.is_rgbw ? "RGBW" : "RGB");
+    }
+    else {
         ESP_LOGI(TAG, "LEDs disabled in configuration");
     }
 
@@ -145,7 +136,6 @@ extern "C" void app_main(void)
     pos.theta = 0.0;
     pos.rho = 0.3f;
     (void)g_motion_controller->move_to(pos, feedrate);
-    wait_for_motion();
     draw_circle(current_theta, 0.3f, +1, feedrate);
 
     // --- CIRCLE 2: CCW at rho=0.5 ---
@@ -153,7 +143,6 @@ extern "C" void app_main(void)
     pos.theta = current_theta;
     pos.rho = 0.5f;
     (void)g_motion_controller->move_to(pos, feedrate);
-    wait_for_motion();
     draw_circle(current_theta, 0.5f, +1, feedrate);
 
     // --- CIRCLE 3: CCW at rho=0.7 ---
@@ -161,7 +150,6 @@ extern "C" void app_main(void)
     pos.theta = current_theta;
     pos.rho = 0.7f;
     (void)g_motion_controller->move_to(pos, feedrate);
-    wait_for_motion();
     draw_circle(current_theta, 0.7f, +1, feedrate);
 
     // --- TRIANGLE 1: at rho=0.6 ---
@@ -170,7 +158,6 @@ extern "C" void app_main(void)
     pos.theta = current_theta;
     pos.rho = 0.6f;
     (void)g_motion_controller->move_to(pos, feedrate);
-    wait_for_motion();
     draw_triangle(current_theta, 0.6f, feedrate);
     current_theta += 2.0 * M_PI;  // Triangle completes a full rotation
 
@@ -179,7 +166,6 @@ extern "C" void app_main(void)
     pos.theta = current_theta;
     pos.rho = 0.4f;
     (void)g_motion_controller->move_to(pos, feedrate);
-    wait_for_motion();
     draw_triangle(current_theta, 0.4f, feedrate);
     current_theta += 2.0 * M_PI;
 
@@ -189,7 +175,6 @@ extern "C" void app_main(void)
     pos.theta = current_theta;
     pos.rho = 0.0f;
     (void)g_motion_controller->move_to(pos, feedrate);
-    wait_for_motion();
 
     // --- FINAL STATUS ---
     auto status = g_motion_controller->get_status();

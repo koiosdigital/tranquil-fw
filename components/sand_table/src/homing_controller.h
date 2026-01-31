@@ -18,11 +18,12 @@ namespace sand_table {
     class ConfigManager;
 
     /// Controls the homing sequence for both axes using RMT-based stepping.
-    /// - Theta uses Hall effect sensor
-    /// - Rho uses TMC2209 StallGuard for sensorless homing
+    /// - Theta uses Hall effect sensor (NEGEDGE interrupt)
+    /// - Rho uses TMC2209 StallGuard for sensorless homing (POSEDGE interrupt)
     ///
     /// Step generation uses RMT peripheral via CoordinatedStepperController.
-    /// Sensor ISRs immediately stop RMT transmission when triggered.
+    /// Homing creates large step counters, and sensor ISRs immediately stop
+    /// RMT transmission when triggered (no chunked polling).
     class HomingController {
     public:
         struct HomingResult {
@@ -128,20 +129,25 @@ namespace sand_table {
         int32_t rho_max_steps_ = 0;
         int32_t theta_steps_per_rotation_ = 0;
 
-        // Homing parameters (matched to main branch)
+        // Homing parameters
         static constexpr uint32_t kMaxHomingSteps = 100000;
-        static constexpr uint32_t kChunkSize = 64;  // Steps per chunk (check stall flag every ~48ms at 750µs/step)
 
-        // Homing step intervals - matched exactly to main branch (constant speed, no acceleration)
+        // Homing step intervals (constant speed, no acceleration)
         // These are CRITICAL for StallGuard to work reliably
         static constexpr uint32_t kRhoHomingIntervalUs = 750;   // 750µs/step = 1333 steps/sec
         static constexpr uint32_t kThetaHomingIntervalUs = 400; // 400µs/step = 2500 steps/sec
 
         static constexpr uint32_t kGearRatio = static_cast<uint32_t>(MechanicalConfig::THETA_GEAR_RATIO);
 
-        // ISR handlers
+        // ISR handlers - these directly stop RMT transmission when sensors trigger
         static void IRAM_ATTR hall_isr_handler(void* arg);
         static void IRAM_ATTR diag_isr_handler(void* arg);
+
+        // Enable/disable individual ISRs (only enable the relevant one during each phase)
+        void enable_hall_isr();
+        void disable_hall_isr();
+        void enable_diag_isr();
+        void disable_diag_isr();
 
         // Internal homing methods (full calibration)
         HomingResult seek_rho_max();
@@ -151,10 +157,6 @@ namespace sand_table {
         // Internal homing methods (quick mode - uses cached values)
         HomingResult home_rho_to_center(int32_t rho_max_steps);
         HomingResult home_theta_single();
-
-        // Execute a homing segment via RMT at constant speed, returns steps actually taken
-        // Returns early if sensor ISR triggers
-        int32_t execute_homing_chunk(int32_t theta_steps, int32_t rho_steps, uint32_t interval_us);
 
         // Save calibration results to NVS
         void save_calibration_to_nvs();
