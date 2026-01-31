@@ -1,8 +1,10 @@
 #include <stdio.h>
 #include <string.h>
 #include <cmath>
+#include <sys/stat.h>
 
 #include "freertos/FreeRTOS.h"
+#include "esp_timer.h"
 #include "freertos/task.h"
 #include "sdkconfig.h"
 
@@ -14,7 +16,7 @@
 
 #include "sand_table.h"
 #include "config_manager.h"
-#include "ManifestManager.h"
+#include "ManifestDatabase.h"
 #include "SandTablePlayer.h"
 #include "types.h"
 
@@ -24,6 +26,95 @@
 static const char* TAG = "main";
 
 static sand_table::MotionController* g_motion_controller = nullptr;
+
+// SQLite stress test - performs CRUD operations and reports ops/sec
+static void sqlite_stress_test() {
+    constexpr int NUM_OPS = 100;
+    auto& db = ManifestDatabase::instance();
+
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "=== SQLITE STRESS TEST ===");
+    ESP_LOGI(TAG, "Operations per test: %d", NUM_OPS);
+
+    std::vector<std::string> uuids;
+    uuids.reserve(NUM_OPS);
+
+    // CREATE test
+    int64_t start = esp_timer_get_time();
+    for (int i = 0; i < NUM_OPS; i++) {
+        Pattern p;
+        p.uuid = ManifestDatabase::generateUUID();
+        p.name = "StressTest_" + std::to_string(i);
+        p.creator = "test";
+        p.date = ManifestDatabase::currentTimestamp();
+        p.popularity = i;
+        p.reversible = (i % 2 == 0);
+        p.size_bytes = 1024 * (i + 1);
+        db.addPattern(p);
+        uuids.push_back(p.uuid);
+    }
+    int64_t create_us = esp_timer_get_time() - start;
+    float create_ops = (NUM_OPS * 1000000.0f) / create_us;
+    ESP_LOGI(TAG, "CREATE: %d ops in %lld us = %.1f ops/sec", NUM_OPS, create_us, create_ops);
+
+    // READ test
+    start = esp_timer_get_time();
+    for (int i = 0; i < NUM_OPS; i++) {
+        auto p = db.getPattern(uuids[i]);
+        if (!p.has_value()) {
+            ESP_LOGE(TAG, "READ failed for uuid %s", uuids[i].c_str());
+        }
+    }
+    int64_t read_us = esp_timer_get_time() - start;
+    float read_ops = (NUM_OPS * 1000000.0f) / read_us;
+    ESP_LOGI(TAG, "READ:   %d ops in %lld us = %.1f ops/sec", NUM_OPS, read_us, read_ops);
+
+    // UPDATE test
+    start = esp_timer_get_time();
+    for (int i = 0; i < NUM_OPS; i++) {
+        Pattern p;
+        p.uuid = uuids[i];
+        p.name = "Updated_" + std::to_string(i);
+        p.creator = "test_updated";
+        p.date = ManifestDatabase::currentTimestamp();
+        p.popularity = i * 10;
+        p.reversible = (i % 2 != 0);
+        p.size_bytes = 2048 * (i + 1);
+        db.updatePattern(uuids[i], p);
+    }
+    int64_t update_us = esp_timer_get_time() - start;
+    float update_ops = (NUM_OPS * 1000000.0f) / update_us;
+    ESP_LOGI(TAG, "UPDATE: %d ops in %lld us = %.1f ops/sec", NUM_OPS, update_us, update_ops);
+
+    // DELETE test
+    start = esp_timer_get_time();
+    for (int i = 0; i < NUM_OPS; i++) {
+        db.deletePattern(uuids[i]);
+    }
+    int64_t delete_us = esp_timer_get_time() - start;
+    float delete_ops = (NUM_OPS * 1000000.0f) / delete_us;
+    ESP_LOGI(TAG, "DELETE: %d ops in %lld us = %.1f ops/sec", NUM_OPS, delete_us, delete_ops);
+
+    // Report DB file size
+    struct stat st;
+    if (stat("/data/manifest.db", &st) == 0) {
+        ESP_LOGI(TAG, "Database file size: %ld bytes", st.st_size);
+    } else {
+        ESP_LOGW(TAG, "Could not stat database file");
+    }
+
+    // Verify database is empty
+    size_t remaining = db.getPatternCount();
+    ESP_LOGI(TAG, "Patterns remaining after test: %zu", remaining);
+
+    // Summary
+    float total_us = create_us + read_us + update_us + delete_us;
+    float avg_ops = (NUM_OPS * 4 * 1000000.0f) / total_us;
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "TOTAL: %d ops in %.1f ms = %.1f avg ops/sec", NUM_OPS * 4, total_us / 1000.0f, avg_ops);
+    ESP_LOGI(TAG, "=== STRESS TEST COMPLETE ===");
+    ESP_LOGI(TAG, "");
+}
 
 // Draw a circle at the given radius using 8 segments of pi/4 each
 // direction: +1 for CCW, -1 for CW
@@ -68,7 +159,10 @@ extern "C" void app_main(void)
         ESP_LOGW(TAG, "ConfigManager init failed: %s, using defaults", esp_err_to_name(cfg_err));
     }
 
-    ManifestManager::initialize();
+    ManifestDatabase::instance().initialize();
+
+    // Stress test SQLite before motion operations
+    sqlite_stress_test();
 
     // Initialize motion controller
     g_motion_controller = new sand_table::MotionController();

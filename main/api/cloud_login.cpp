@@ -178,14 +178,18 @@ esp_err_t cloud_login_handler(httpd_req_t* req) {
     args.done = xSemaphoreCreateBinary();
     cJSON_Delete(json);
 
-    if (xTaskCreate(cloud_login_task, "cloud_login_task", 6144, &args, 5, NULL) != pdPASS) {
-        vSemaphoreDelete(args.done);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to create login task");
-        return ESP_FAIL;
-    }
-    // Wait for the task to finish
-    xSemaphoreTake(args.done, portMAX_DELAY);
+    // DISABLED for memory profiling - TODO: Re-enable after optimization
+    // if (xTaskCreate(cloud_login_task, "cloud_login_task", 6144, &args, 5, NULL) != pdPASS) {
+    //     vSemaphoreDelete(args.done);
+    //     httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to create login task");
+    //     return ESP_FAIL;
+    // }
+    // // Wait for the task to finish
+    // xSemaphoreTake(args.done, portMAX_DELAY);
     vSemaphoreDelete(args.done);
+    ESP_LOGW(TAG, "cloud_login_task DISABLED for memory profiling");
+    httpd_resp_send_err(req, HTTPD_501_METHOD_NOT_IMPLEMENTED, "Cloud login disabled");
+    return ESP_FAIL;
 
     if (args.result.success) {
         cJSON* resp = cJSON_CreateObject();

@@ -4,11 +4,12 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
-#include "ManifestManager.h"
+#include "ManifestDatabase.h"
 #include "motion_controller.h"
 #include "cJSON.h"
 #include <string>
 #include <vector>
+#include <optional>
 
 #define MAX_UUID_LEN 64
 #define MAX_LINE_BUFFER_SIZE 512
@@ -114,7 +115,7 @@ public:
     static int getTotalProgress();
 
     // Pattern info
-    static Pattern* getCurrentPattern();
+    static const Pattern* getCurrentPattern();
     static const char* getCurrentPatternUUID();
     static const char* getCurrentPlaylistUUID();
     static bool isPatternLoaded();
@@ -162,7 +163,7 @@ private:
 
     // Pattern state
     static char current_pattern_uuid_[MAX_UUID_LEN];
-    static Pattern* current_pattern_;
+    static std::optional<Pattern> current_pattern_;
     static FILE* pattern_file_;
     static size_t current_line_index_;
     static size_t total_lines_;

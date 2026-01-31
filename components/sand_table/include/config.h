@@ -127,7 +127,7 @@ namespace sand_table {
         static constexpr uint32_t TIMER_RESOLUTION_HZ = 1000000;  // 1 MHz = 1us resolution
 
         // RMT channel configuration
-        static constexpr uint32_t RMT_RESOLUTION_HZ = 10000000;  // 10 MHz for RMT
+        static constexpr uint32_t RMT_RESOLUTION_HZ = 1000000;  // 1 MHz for RMT (allows min ~31 steps/s)
 
         // Minimum step pulse width (microseconds)
         // TMC2209 requires 100ns minimum, but use 5µs for reliable edge detection

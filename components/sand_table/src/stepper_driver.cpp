@@ -678,7 +678,7 @@ namespace sand_table {
 
         // Hardware limits
         const float max_step_rate = static_cast<float>(HardwareConfig::MAX_STEP_RATE_HZ);
-        const float min_step_rate = 310.0f;  // Limited by RMT symbol duration
+        const float min_step_rate = 31.0f;  // Limited by RMT symbol duration at 1 MHz
 
         // For coordinated motion, use velocity from motors that are actually moving
         // If both move, use minimum (so deceleration happens if either needs to slow)
@@ -893,7 +893,7 @@ namespace sand_table {
 
         // Clamp interval to valid range for RMT
         constexpr uint32_t min_interval_us = 1000000 / HardwareConfig::MAX_STEP_RATE_HZ;  // 20µs
-        constexpr uint32_t max_interval_us = 3225;  // ~310 steps/s, fits in single RMT symbol
+        constexpr uint32_t max_interval_us = 32000;  // ~31 steps/s at 1 MHz RMT clock
         uint32_t clamped_interval = interval_us;
         if (clamped_interval < min_interval_us) clamped_interval = min_interval_us;
         if (clamped_interval > max_interval_us) clamped_interval = max_interval_us;
@@ -925,10 +925,10 @@ namespace sand_table {
         interval_table_.clear();
         interval_table_.total_steps = std::min(total_steps, static_cast<uint32_t>(kMaxIntervalsPerSegment));
 
-        // RMT symbol max duration: (32767 + 20) ticks @ 10MHz = 3278.7µs
-        // Minimum velocity = 1,000,000 / 3278 ≈ 305 steps/s
-        // Use 310 steps/s for margin
-        const float min_velocity = 310.0f;  // steps/s (limited by RMT symbol max duration)
+        // RMT symbol max duration: 32767 ticks @ 1MHz = 32767µs
+        // Minimum velocity = 1,000,000 / 32767 ≈ 30.5 steps/s
+        // Use 31 steps/s for margin
+        const float min_velocity = 31.0f;  // steps/s (limited by RMT symbol max duration at 1 MHz)
         const float max_velocity = static_cast<float>(HardwareConfig::MAX_STEP_RATE_HZ);
 
         for (uint32_t step = 0; step < interval_table_.total_steps; ++step) {
@@ -966,9 +966,9 @@ namespace sand_table {
 
             // Clamp interval to safe range
             // Minimum: 20µs (50kHz max step rate)
-            // Maximum: 3225µs (~310Hz min step rate, fits in RMT symbol)
+            // Maximum: 32000µs (~31 steps/s, fits in RMT symbol at 1 MHz)
             constexpr uint32_t min_interval_us = 1000000 / HardwareConfig::MAX_STEP_RATE_HZ;
-            constexpr uint32_t max_interval_us = 3225;  // ~310 steps/s, fits in single RMT symbol
+            constexpr uint32_t max_interval_us = 32000;  // ~31 steps/s, fits in single RMT symbol at 1 MHz
             if (interval_us < min_interval_us) {
                 interval_us = min_interval_us;
             }

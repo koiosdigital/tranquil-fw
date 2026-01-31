@@ -21,7 +21,7 @@ PlaybackState SandTablePlayer::playback_state_ = PlaybackState::STOPPED;
 PlayMode SandTablePlayer::play_mode_ = PlayMode::SINGLE_PATTERN;
 
 char SandTablePlayer::current_pattern_uuid_[MAX_UUID_LEN] = {0};
-Pattern* SandTablePlayer::current_pattern_ = nullptr;
+std::optional<Pattern> SandTablePlayer::current_pattern_ = std::nullopt;
 FILE* SandTablePlayer::pattern_file_ = nullptr;
 size_t SandTablePlayer::current_line_index_ = 0;
 size_t SandTablePlayer::total_lines_ = 0;
@@ -61,14 +61,16 @@ esp_err_t SandTablePlayer::initialize(sand_table::MotionController* controller) 
         return ESP_ERR_NO_MEM;
     }
 
-    // Create service task
-    if (xTaskCreate(serviceTaskWrapper, "sand_player", SERVICE_TASK_STACK_SIZE,
-                    nullptr, SERVICE_TASK_PRIORITY, &service_task_handle_) != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create service task");
-        vSemaphoreDelete(state_mutex_);
-        vSemaphoreDelete(file_mutex_);
-        return ESP_ERR_NO_MEM;
-    }
+    // Create service task - DISABLED for memory profiling
+    // TODO: Re-enable after memory optimization
+    // if (xTaskCreate(serviceTaskWrapper, "sand_player", SERVICE_TASK_STACK_SIZE,
+    //                 nullptr, SERVICE_TASK_PRIORITY, &service_task_handle_) != pdPASS) {
+    //     ESP_LOGE(TAG, "Failed to create service task");
+    //     vSemaphoreDelete(state_mutex_);
+    //     vSemaphoreDelete(file_mutex_);
+    //     return ESP_ERR_NO_MEM;
+    // }
+    ESP_LOGW(TAG, "sand_player task DISABLED for memory profiling");
 
     initialized_ = true;
     ESP_LOGI(TAG, "SandTablePlayer initialized");
@@ -130,10 +132,9 @@ esp_err_t SandTablePlayer::playPattern(const char* pattern_uuid) {
         return ret;
     }
 
-    // Get pattern info from ManifestManager
-    std::string pattern_uuid_str(pattern_uuid);
-    current_pattern_ = ManifestManager::getPattern(pattern_uuid_str);
-    if (!current_pattern_) {
+    // Get pattern info from ManifestDatabase
+    current_pattern_ = ManifestDatabase::instance().getPattern(pattern_uuid);
+    if (!current_pattern_.has_value()) {
         ESP_LOGE(TAG, "Pattern not found in manifest: %s", pattern_uuid);
         unloadPatternFile();
         xSemaphoreGive(state_mutex_);
@@ -261,7 +262,7 @@ esp_err_t SandTablePlayer::stop() {
     // Clear pattern state
     unloadPatternFile();
     memset(current_pattern_uuid_, 0, sizeof(current_pattern_uuid_));
-    current_pattern_ = nullptr;
+    current_pattern_ = std::nullopt;
 
     // Clear playlist state
     memset(current_playlist_uuid_, 0, sizeof(current_playlist_uuid_));
@@ -443,8 +444,8 @@ int SandTablePlayer::getTotalProgress() {
     return percent;
 }
 
-Pattern* SandTablePlayer::getCurrentPattern() {
-    return current_pattern_;
+const Pattern* SandTablePlayer::getCurrentPattern() {
+    return current_pattern_.has_value() ? &current_pattern_.value() : nullptr;
 }
 
 const char* SandTablePlayer::getCurrentPatternUUID() {
@@ -656,9 +657,8 @@ void SandTablePlayer::loadPlaylist(const char* playlist_uuid) {
     playlist_order_.clear();
     playlist_index_ = 0;
 
-    std::string uuid_str(playlist_uuid);
-    Playlist* playlist = ManifestManager::getPlaylist(uuid_str);
-    if (playlist) {
+    auto playlist = ManifestDatabase::instance().getPlaylist(playlist_uuid);
+    if (playlist.has_value()) {
         playlist_patterns_ = playlist->patterns;
         playlist_order_.resize(playlist_patterns_.size());
         for (size_t i = 0; i < playlist_order_.size(); ++i) {
@@ -684,7 +684,7 @@ void SandTablePlayer::startCurrentPattern() {
     }
 
     // Get pattern info
-    current_pattern_ = ManifestManager::getPattern(pattern_uuid);
+    current_pattern_ = ManifestDatabase::instance().getPattern(pattern_uuid);
     strncpy(current_pattern_uuid_, pattern_uuid.c_str(), MAX_UUID_LEN - 1);
     current_pattern_uuid_[MAX_UUID_LEN - 1] = '\0';
 

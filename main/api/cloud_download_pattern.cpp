@@ -8,7 +8,7 @@
 #include "nvs.h"
 #include "cJSON.h"
 #include <string>
-#include "ManifestManager.h"
+#include "ManifestDatabase.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -182,16 +182,16 @@ static void cloud_download_task(void* pvParameter) {
         xSemaphoreGive(args->done);
         vTaskDelete(NULL);
     }
-    Pattern pattern = ManifestManager::jsonToPattern(manifest_pattern_json);
+    Pattern pattern = ManifestDatabase::jsonToPattern(manifest_pattern_json);
     cJSON_Delete(manifest_pattern_json);
-    if (ManifestManager::addPattern(pattern) != ESP_OK) {
+    if (ManifestDatabase::instance().addPattern(pattern) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to add pattern to manifest");
         args->result.success = false;
         args->result.error = strdup("Failed to add pattern to manifest");
         xSemaphoreGive(args->done);
         vTaskDelete(NULL);
     }
-    ESP_LOGI(TAG, "Pattern manifest added to ManifestManager");
+    ESP_LOGI(TAG, "Pattern manifest added to ManifestDatabase");
 
     // Download pattern data to file
     snprintf(url, sizeof(url), CLOUD_API_BASE_URL "/patterns/%s/data", args->uuid);
@@ -285,15 +285,19 @@ esp_err_t cloud_download_pattern_handler(httpd_req_t* req) {
     args.done = xSemaphoreCreateBinary();
     cJSON_Delete(json);
 
-    if (xTaskCreate(cloud_download_task, "cloud_download_task", 8192, &args, 5, NULL) != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create download task");
-        vSemaphoreDelete(args.done);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to create download task");
-        return ESP_FAIL;
-    }
-    // Wait for the task to finish
-    xSemaphoreTake(args.done, portMAX_DELAY);
+    // DISABLED for memory profiling - TODO: Re-enable after optimization
+    // if (xTaskCreate(cloud_download_task, "cloud_download_task", 8192, &args, 5, NULL) != pdPASS) {
+    //     ESP_LOGE(TAG, "Failed to create download task");
+    //     vSemaphoreDelete(args.done);
+    //     httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to create download task");
+    //     return ESP_FAIL;
+    // }
+    // // Wait for the task to finish
+    // xSemaphoreTake(args.done, portMAX_DELAY);
     vSemaphoreDelete(args.done);
+    ESP_LOGW(TAG, "cloud_download_task DISABLED for memory profiling");
+    httpd_resp_send_err(req, HTTPD_501_METHOD_NOT_IMPLEMENTED, "Cloud download disabled");
+    return ESP_FAIL;
 
     if (args.result.success) {
         ESP_LOGI(TAG, "Pattern download successful");

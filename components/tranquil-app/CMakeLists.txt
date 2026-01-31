@@ -57,6 +57,7 @@ namespace static_files {
     struct file {
         const char* path;
         const unsigned char* contents;
+        const char* type;
         size_t size;
     };
     
@@ -123,6 +124,8 @@ if(NOT CMAKE_BUILD_EARLY_EXPANSION)
     else()
         message(WARNING "Failed to download ${STATIC_FILES_HEADER} from ${DOWNLOAD_URL}, keeping fallback")
     endif()
+
+    file(WRITE ${STATIC_FILES_PATH} "${FALLBACK_CONTENT}")
 
     # Print detailed status information
     message(STATUS "tranquil-app component configured:")

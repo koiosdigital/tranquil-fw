@@ -4,3 +4,6 @@ dependencies:
   idf:
     version: ">=5.5.2"
   espressif/mdns: ^1.8.2
+  esp32-idf-sqlite3:
+    git: https://github.com/nopnop2002/esp32-idf-sqlite3.git
+    path: components/esp32-idf-sqlite3
