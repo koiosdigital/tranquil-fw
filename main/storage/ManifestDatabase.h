@@ -111,6 +111,10 @@ public:
     // Utility
     static std::string currentTimestamp();
 
+    // Memory management
+    void releaseMemory();   // Release SQLite page cache
+    esp_err_t vacuum();     // Compact database file (reclaim deleted space)
+
 private:
     ManifestDatabase();
     ~ManifestDatabase();

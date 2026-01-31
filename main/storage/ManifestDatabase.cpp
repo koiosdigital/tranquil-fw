@@ -36,28 +36,26 @@ public:
     // SQLite task handles
     TaskHandle_t sqliteTask = nullptr;
     QueueHandle_t commandQueue = nullptr;
+    SemaphoreHandle_t completionSem = nullptr;  // Reusable completion semaphore
     volatile bool taskRunning = false;
 
     // Execute a function on the SQLite task and wait for completion
+    // Uses raw function pointer to avoid std::function heap allocation
     template<typename F>
     auto executeOnSqliteTask(F&& func) -> decltype(func()) {
         using ReturnType = decltype(func());
 
         if constexpr (std::is_void_v<ReturnType>) {
             std::function<void()> wrapper = [&func]() { func(); };
-            SemaphoreHandle_t done = xSemaphoreCreateBinary();
-            SqliteCommand cmd = { &wrapper, done };
+            SqliteCommand cmd = { &wrapper, completionSem };
             xQueueSend(commandQueue, &cmd, portMAX_DELAY);
-            xSemaphoreTake(done, portMAX_DELAY);
-            vSemaphoreDelete(done);
+            xSemaphoreTake(completionSem, portMAX_DELAY);
         } else {
             ReturnType result{};
             std::function<void()> wrapper = [&func, &result]() { result = func(); };
-            SemaphoreHandle_t done = xSemaphoreCreateBinary();
-            SqliteCommand cmd = { &wrapper, done };
+            SqliteCommand cmd = { &wrapper, completionSem };
             xQueueSend(commandQueue, &cmd, portMAX_DELAY);
-            xSemaphoreTake(done, portMAX_DELAY);
-            vSemaphoreDelete(done);
+            xSemaphoreTake(completionSem, portMAX_DELAY);
             return result;
         }
     }
@@ -329,6 +327,17 @@ esp_err_t ManifestDatabase::initialize() {
         return ESP_FAIL;
     }
 
+    // Create reusable completion semaphore (avoids per-call allocation)
+    impl_->completionSem = xSemaphoreCreateBinary();
+    if (!impl_->completionSem) {
+        ESP_LOGE(TAG, "Failed to create completion semaphore");
+        vQueueDelete(impl_->commandQueue);
+        impl_->commandQueue = nullptr;
+        vSemaphoreDelete(impl_->mutex);
+        impl_->mutex = nullptr;
+        return ESP_FAIL;
+    }
+
     // Start SQLite task with large stack (SQLite is stack-hungry)
     impl_->taskRunning = true;
     BaseType_t ret = xTaskCreatePinnedToCore(
@@ -343,6 +352,8 @@ esp_err_t ManifestDatabase::initialize() {
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create SQLite task");
         impl_->taskRunning = false;
+        vSemaphoreDelete(impl_->completionSem);
+        impl_->completionSem = nullptr;
         vQueueDelete(impl_->commandQueue);
         impl_->commandQueue = nullptr;
         vSemaphoreDelete(impl_->mutex);
@@ -375,6 +386,8 @@ esp_err_t ManifestDatabase::initialize() {
         // Cleanup on failure
         impl_->taskRunning = false;
         vTaskDelay(pdMS_TO_TICKS(150));  // Let task exit
+        vSemaphoreDelete(impl_->completionSem);
+        impl_->completionSem = nullptr;
         vQueueDelete(impl_->commandQueue);
         impl_->commandQueue = nullptr;
         vSemaphoreDelete(impl_->mutex);
@@ -404,6 +417,10 @@ void ManifestDatabase::shutdown() {
     impl_->taskRunning = false;
     vTaskDelay(pdMS_TO_TICKS(150));  // Let task exit cleanly
 
+    if (impl_->completionSem) {
+        vSemaphoreDelete(impl_->completionSem);
+        impl_->completionSem = nullptr;
+    }
     if (impl_->commandQueue) {
         vQueueDelete(impl_->commandQueue);
         impl_->commandQueue = nullptr;
@@ -1080,6 +1097,32 @@ std::string ManifestDatabase::currentTimestamp() {
     char buf[32];
     strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm_info);
     return buf;
+}
+
+void ManifestDatabase::releaseMemory() {
+    if (!impl_->initialized || !impl_->db) return;
+
+    impl_->executeOnSqliteTask([this]() {
+        sqlite3_db_release_memory(impl_->db);
+        ESP_LOGI(TAG, "Released SQLite cache memory");
+    });
+}
+
+esp_err_t ManifestDatabase::vacuum() {
+    Impl::Lock lock(impl_->mutex);
+    if (!lock.acquired()) return ESP_ERR_TIMEOUT;
+
+    return impl_->executeOnSqliteTask([this]() -> esp_err_t {
+        char* errMsg = nullptr;
+        int rc = sqlite3_exec(impl_->db, "VACUUM", nullptr, nullptr, &errMsg);
+        if (rc != SQLITE_OK) {
+            ESP_LOGE(TAG, "VACUUM failed: %s", errMsg ? errMsg : "unknown");
+            sqlite3_free(errMsg);
+            return ESP_FAIL;
+        }
+        ESP_LOGI(TAG, "Database vacuumed");
+        return ESP_OK;
+    });
 }
 
 cJSON* ManifestDatabase::patternToJson(const Pattern& p) {

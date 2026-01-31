@@ -7,12 +7,14 @@
 #include "driver/rmt_tx.h"
 #include "driver/rmt_encoder.h"
 #include "esp_attr.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <new>
 
 namespace sand_table {
 
@@ -190,6 +192,10 @@ namespace sand_table {
         // Completion signaling
         SemaphoreHandle_t completion_sem_ = nullptr;
 
+        // Channel completion tracking - counts how many channels have completed
+        // When this reaches 2, both channels are done and we can proceed
+        std::atomic<int> channels_done_{0};
+
         // Callback for TX done
         static bool IRAM_ATTR tx_done_callback(
             rmt_channel_handle_t channel,
@@ -252,7 +258,7 @@ namespace sand_table {
 
         /// Check if motion is in progress
         [[nodiscard]] bool is_moving() const noexcept {
-            return rmt_sequencer_.is_executing();
+            return rmt_sequencer_ && rmt_sequencer_->is_executing();
         }
 
         /// Get current positions
@@ -264,7 +270,18 @@ namespace sand_table {
         StepperDriver& theta_;
         StepperDriver& rho_;
 
-        RmtStepSequencer rmt_sequencer_;
+        // Custom deleter for internal RAM allocation
+        struct InternalRamDeleter {
+            void operator()(RmtStepSequencer* ptr) const {
+                if (ptr) {
+                    ptr->~RmtStepSequencer();
+                    heap_caps_free(ptr);
+                }
+            }
+        };
+
+        // RMT sequencer must be in internal RAM for ISR callback safety
+        std::unique_ptr<RmtStepSequencer, InternalRamDeleter> rmt_sequencer_;
         BresenhamState bresenham_;
 
         // Pre-computed step intervals for velocity profiles

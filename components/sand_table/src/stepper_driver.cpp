@@ -205,13 +205,19 @@ namespace sand_table {
             return Result<void>::err(MotionError::HardwareFault);
         }
 
-        // Register TX done callback BEFORE enabling (only on theta - they're synchronized)
+        // Register TX done callback on BOTH channels to track completion of each
         rmt_tx_event_callbacks_t cbs = {
             .on_trans_done = tx_done_callback,
         };
 
         if (rmt_tx_register_event_callbacks(theta_channel_, &cbs, this) != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to register RMT callback");
+            ESP_LOGE(TAG, "Failed to register theta RMT callback");
+            deinit();
+            return Result<void>::err(MotionError::HardwareFault);
+        }
+
+        if (rmt_tx_register_event_callbacks(rho_channel_, &cbs, this) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to register rho RMT callback");
             deinit();
             return Result<void>::err(MotionError::HardwareFault);
         }
@@ -417,13 +423,27 @@ namespace sand_table {
 
         // Check for stop request
         if (self->stop_requested_.load(std::memory_order_acquire)) {
+            self->channels_done_.store(0, std::memory_order_release);
             self->pending_tx_.store(0, std::memory_order_release);
             self->executing_.store(false, std::memory_order_release);
             xSemaphoreGiveFromISR(self->completion_sem_, &xHigherPriorityTaskWoken);
             return xHigherPriorityTaskWoken == pdTRUE;
         }
 
-        // Decrement pending counter - this transmission just completed
+        // Atomically increment channel completion counter
+        // fetch_add returns the value BEFORE increment, so:
+        // - First callback sees 0, increments to 1, returns early
+        // - Second callback sees 1, increments to 2, proceeds
+        int prev_count = self->channels_done_.fetch_add(1, std::memory_order_acq_rel);
+        if (prev_count < 1) {
+            // First channel done, wait for the other
+            return false;
+        }
+
+        // Both channels done - reset counter for next round
+        self->channels_done_.store(0, std::memory_order_release);
+
+        // Decrement pending counter - this transmission pair just completed
         self->pending_tx_.fetch_sub(1, std::memory_order_acq_rel);
 
         // Switch buffer and try to encode next chunk
@@ -454,7 +474,6 @@ namespace sand_table {
                 &tx_config);
         }
 
-        // FIXED: Check ACTUAL pending count (not stale value from before queuing)
         // Only signal completion when no transmissions pending AND all steps encoded
         if (self->pending_tx_.load(std::memory_order_acquire) == 0 &&
             self->steps_encoded_ >= self->total_steps_) {
@@ -493,6 +512,7 @@ namespace sand_table {
         steps_encoded_ = 0;
         pending_tx_.store(0, std::memory_order_release);
         stop_requested_.store(false, std::memory_order_release);
+        channels_done_.store(0, std::memory_order_release);
         executing_.store(true, std::memory_order_release);
 
         // Clear semaphore
@@ -625,11 +645,22 @@ namespace sand_table {
     }
 
     CoordinatedStepperController::~CoordinatedStepperController() {
-        rmt_sequencer_.deinit();
+        if (rmt_sequencer_) {
+            rmt_sequencer_->deinit();
+        }
     }
 
     Result<void> CoordinatedStepperController::init() {
-        auto result = rmt_sequencer_.init(theta_.step_pin(), rho_.step_pin());
+        // Allocate RMT sequencer in internal RAM (required for ISR callback safety)
+        void* mem = heap_caps_malloc(sizeof(RmtStepSequencer),
+                                      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (!mem) {
+            ESP_LOGE(TAG, "Failed to allocate RMT sequencer in internal RAM");
+            return Result<void>::err(MotionError::HardwareFault);
+        }
+        rmt_sequencer_.reset(new (mem) RmtStepSequencer());
+
+        auto result = rmt_sequencer_->init(theta_.step_pin(), rho_.step_pin());
         if (result.is_err()) {
             ESP_LOGE(TAG, "Failed to initialize RMT step sequencer");
             return result;
@@ -652,12 +683,12 @@ namespace sand_table {
     }
 
     void CoordinatedStepperController::emergency_stop() {
-        rmt_sequencer_.stop();
+        rmt_sequencer_->stop();
         bresenham_.clear();
     }
 
     void IRAM_ATTR CoordinatedStepperController::emergency_stop_from_isr() {
-        rmt_sequencer_.stop_from_isr();
+        rmt_sequencer_->stop_from_isr();
         // Don't clear bresenham from ISR - not critical
     }
 
@@ -792,7 +823,7 @@ namespace sand_table {
     Result<void> CoordinatedStepperController::execute_segment(
         const MotionSegment& segment)
     {
-        if (rmt_sequencer_.is_executing()) {
+        if (rmt_sequencer_->is_executing()) {
             return Result<void>::err(MotionError::InvalidState);
         }
 
@@ -846,7 +877,7 @@ namespace sand_table {
             total_steps, profile.cruise_velocity, interval_table_.intervals[0]);
 
         // Execute via RMT sequencer (blocking)
-        auto result = rmt_sequencer_.execute(
+        auto result = rmt_sequencer_->execute(
             bresenham_,
             interval_table_.intervals,
             interval_table_.total_steps,
@@ -862,7 +893,7 @@ namespace sand_table {
         int32_t rho_steps,
         uint32_t interval_us)
     {
-        if (rmt_sequencer_.is_executing()) {
+        if (rmt_sequencer_->is_executing()) {
             return Result<void>::err(MotionError::InvalidState);
         }
 
@@ -909,7 +940,7 @@ namespace sand_table {
             theta_steps, rho_steps, clamped_interval, 1000000UL / clamped_interval);
 
         // Execute via RMT sequencer (blocking)
-        return rmt_sequencer_.execute(
+        return rmt_sequencer_->execute(
             bresenham_,
             interval_table_.intervals,
             interval_table_.total_steps,
