@@ -1,4 +1,5 @@
 #include "PatternReader.h"
+#include "EncryptedPatternReader.h"
 #include "esp_log.h"
 #include <cstring>
 #include <cstdlib>
@@ -8,9 +9,7 @@ static const char* TAG = "PatternReader";
 // Factory function
 std::unique_ptr<IPatternReader> createPatternReader(bool is_encrypted) {
     if (is_encrypted) {
-        // TODO: Return EncryptedPatternReader when implemented
-        ESP_LOGE(TAG, "Encrypted pattern reader not yet implemented");
-        return nullptr;
+        return std::make_unique<EncryptedPatternReader>();
     }
     return std::make_unique<PlainTextPatternReader>();
 }

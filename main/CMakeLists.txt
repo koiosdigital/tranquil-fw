@@ -7,6 +7,7 @@ list(APPEND INCLUDE_DIRS ".")
 list(APPEND INCLUDE_DIRS "api")
 list(APPEND INCLUDE_DIRS "usb_pd")
 list(APPEND INCLUDE_DIRS "storage")
+list(APPEND INCLUDE_DIRS "drm")
 
 message(STATUS ${NESTED_SRC})
 
