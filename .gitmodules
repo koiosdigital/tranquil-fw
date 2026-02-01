@@ -7,3 +7,6 @@
 [submodule "components/protobufs"]
 	path = components/protobufs
 	url = https://github.com/koiosdigital/protobufs
+[submodule "components/esp32-idf-sqlite3"]
+	path = components/esp32-idf-sqlite3
+	url = https://github.com/koiosdigital/esp32-idf-sqlite3.git
