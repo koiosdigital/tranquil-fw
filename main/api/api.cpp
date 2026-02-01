@@ -2,9 +2,7 @@
 
 #include "kd_common.h"
 
-#include "cloud_api.h"
 #include "patterns_api.h"
-#include "pattern_upload.h"
 #include "playlists_api.h"
 #include "api_player.h"
 #include "led_api.h"
@@ -47,9 +45,7 @@ void tranquil_api_init() {
     httpd_handle_t server = kd_common_api_get_httpd_handle();
 
     // Register app-specific handlers
-    cloud_api_register_handlers(server);
     patterns_api_register_handlers(server);
-    pattern_upload_register_handlers(server);
     playlists_api_register_handlers(server);
     api_player_register_endpoints(server);
     led_api_register_handlers(server);

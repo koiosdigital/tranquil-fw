@@ -16,7 +16,7 @@ void init_sd() {
     };
 
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-    host.max_freq_khz = SDMMC_FREQ_HIGHSPEED; // Set to maximum frequency supported by the host
+    host.max_freq_khz = 80000; // Set to maximum frequency supported by the host
 
     // This initializes the slot without card detect (CD) and write protect (WP) signals.
     // Modify slot_config.gpio_cd and slot_config.gpio_wp if your board has these signals.
@@ -59,4 +59,9 @@ void deinit_sd() {
         return;
     }
     ESP_LOGI(TAG, "Unmounted successfully");
+}
+
+void format_sd() {
+    esp_vfs_fat_sdcard_format(mount_point, card);
+    ESP_LOGW(TAG, "SD card formatted");
 }

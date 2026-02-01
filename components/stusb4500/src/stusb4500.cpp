@@ -148,7 +148,7 @@ esp_err_t STUSB4500::begin(uint8_t device_address) {
         return ESP_ERR_NOT_FOUND;
     }
 
-    clear_alert_status();
+    (void)clear_alert_status();  // Best-effort cleanup, ignore errors
     is_initialized_ = true;
     ESP_LOGI(TAG, "Initialized (Device ID: 0x%02X)", *device_id);
 
@@ -195,7 +195,7 @@ esp_err_t STUSB4500::read_nvm() {
 
     for (uint8_t i = 0; i < nvm::kSectorCount; ++i) {
         if (auto ret = nvm_read_sector(i, nvm_sectors_[i].data()); ret != ESP_OK) {
-            nvm_exit_test_mode();
+            (void)nvm_exit_test_mode();  // Best-effort cleanup on error
             return ret;
         }
     }
@@ -232,7 +232,7 @@ esp_err_t STUSB4500::write_nvm(bool use_defaults) {
 
     for (uint8_t i = 0; i < nvm::kSectorCount; ++i) {
         if (auto ret = nvm_write_sector(i, nvm_sectors_[i].data()); ret != ESP_OK) {
-            nvm_exit_test_mode();
+            (void)nvm_exit_test_mode();  // Best-effort cleanup on error
             return ret;
         }
     }
@@ -826,33 +826,33 @@ void STUSB4500::load_pdo_settings_from_nvm() {
 
     // PDO number from sector 3, byte 2, bits 2:3
     uint8_t pdo_count = (nvm_sectors_[3][2] & 0x06) >> 1;
-    set_pdo_number(pdo_count);
+    (void)set_pdo_number(pdo_count);
 
     // PDO1 (fixed at 5V)
-    set_voltage(1, 5.0f);
+    (void)set_voltage(1, 5.0f);
     uint8_t current_val = (nvm_sectors_[3][2] & 0xF0) >> 4;
     float current = (current_val == 0) ? 0.0f :
                     (current_val < 11) ? (current_val * 0.25f + 0.25f) :
                     (current_val * 0.50f - 2.50f);
-    set_current(1, current);
+    (void)set_current(1, current);
 
     // PDO2
     float voltage2 = ((nvm_sectors_[4][1] << 2) + (nvm_sectors_[4][0] >> 6)) / 20.0f;
-    set_voltage(2, voltage2);
+    (void)set_voltage(2, voltage2);
     current_val = nvm_sectors_[3][4] & 0x0F;
     current = (current_val == 0) ? 0.0f :
               (current_val < 11) ? (current_val * 0.25f + 0.25f) :
               (current_val * 0.50f - 2.50f);
-    set_current(2, current);
+    (void)set_current(2, current);
 
     // PDO3
     float voltage3 = (((nvm_sectors_[4][3] & 0x03) << 8) + nvm_sectors_[4][2]) / 20.0f;
-    set_voltage(3, voltage3);
+    (void)set_voltage(3, voltage3);
     current_val = (nvm_sectors_[3][5] & 0xF0) >> 4;
     current = (current_val == 0) ? 0.0f :
               (current_val < 11) ? (current_val * 0.25f + 0.25f) :
               (current_val * 0.50f - 2.50f);
-    set_current(3, current);
+    (void)set_current(3, current);
 }
 
 void STUSB4500::save_pdo_settings_to_nvm() {

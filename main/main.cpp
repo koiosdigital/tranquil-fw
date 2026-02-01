@@ -29,45 +29,6 @@ static const char* TAG = "main";
 
 static sand_table::MotionController* g_motion_controller = nullptr;
 
-// Log current heap usage
-static void log_heap_stats(const char* label) {
-    size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-    size_t internal_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
-    size_t external_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-    size_t external_largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
-
-    ESP_LOGI(TAG, "HEAP [%s] Internal: %zu free (%zu largest) | External: %zu free (%zu largest)",
-        label, internal_free, internal_largest, external_free, external_largest);
-}
-
-// Draw a circle at the given radius using 8 segments of pi/4 each
-// direction: +1 for CCW, -1 for CW
-static void draw_circle(double& current_theta, float rho, int direction, float feedrate) {
-    constexpr double QUARTER_PI = M_PI / 4.0;
-    sand_table::PolarPosition pos;
-    pos.rho = rho;
-
-    for (int i = 0; i < 8; i++) {
-        current_theta += direction * QUARTER_PI;
-        pos.theta = current_theta;
-        (void)g_motion_controller->move_to(pos, feedrate);
-    }
-}
-
-// Draw a triangle at the given radius
-// Vertices are evenly spaced at 120 degrees apart
-static void draw_triangle(double start_theta, float rho, float feedrate) {
-    constexpr double TWO_PI_THIRDS = 2.0 * M_PI / 3.0;
-    sand_table::PolarPosition pos;
-    pos.rho = rho;
-
-    // Draw three sides connecting vertices at 0, 120, 240 degrees from start
-    for (int i = 0; i < 3; i++) {
-        pos.theta = start_theta + (i + 1) * TWO_PI_THIRDS;
-        (void)g_motion_controller->move_to(pos, feedrate);
-    }
-}
-
 extern "C" void app_main(void)
 {
     esp_event_loop_create_default();
@@ -86,7 +47,6 @@ extern "C" void app_main(void)
     ManifestDatabase::instance().initialize();
 
     // Initialize motion controller
-    bool motion_ok = false;
     g_motion_controller = new sand_table::MotionController();
     auto init_result = g_motion_controller->init();
     if (init_result.is_err()) {
@@ -98,7 +58,6 @@ extern "C" void app_main(void)
             ESP_LOGE(TAG, "Failed to start motion controller");
         }
         else {
-            motion_ok = true;
             sand_table::console_init(g_motion_controller);
         }
     }
@@ -126,9 +85,8 @@ extern "C" void app_main(void)
 
     tranquil_api_init();
 
-    g_motion_controller->home();
-
-    while (!g_motion_controller->is_homed()) {
-        vTaskDelay(pdMS_TO_TICKS(100));
+    auto ret = g_motion_controller->home();
+    if (ret.is_err()) {
+        ESP_LOGE(TAG, "Failed to home motion controller");
     }
 }

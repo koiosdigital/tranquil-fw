@@ -73,14 +73,14 @@ esp_err_t UsbPdController::configure_pdos(const UsbPdConfig& config) {
         ESP_LOGI(TAG, "Updating NVM with PDO configuration");
 
         for (int i = 0; i < config.pdo_count; ++i) {
-            stusb_.set_voltage(i + 1, config.pdos[i].voltage);
-            stusb_.set_current(i + 1, config.pdos[i].current);
+            (void)stusb_.set_voltage(i + 1, config.pdos[i].voltage);
+            (void)stusb_.set_current(i + 1, config.pdos[i].current);
         }
 
-        stusb_.set_pdo_number(config.pdo_count);
-        stusb_.set_usb_comm_capable(config.usb_comm_capable);
-        stusb_.set_external_power(config.external_power);
-        stusb_.write_nvm();
+        (void)stusb_.set_pdo_number(config.pdo_count);
+        (void)stusb_.set_usb_comm_capable(config.usb_comm_capable);
+        (void)stusb_.set_external_power(config.external_power);
+        (void)stusb_.write_nvm();
 
         ESP_LOGI(TAG, "NVM updated: %d PDOs configured", config.pdo_count);
     } else {

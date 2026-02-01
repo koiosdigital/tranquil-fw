@@ -18,7 +18,7 @@ static const char* TAG = "ManifestDB";
 static constexpr const char* DB_PATH = "/sd/manifest.db";
 
 // SQLite task stack size - needs to be large for SQLite operations
-static constexpr size_t SQLITE_TASK_STACK_SIZE = 8192;
+static constexpr size_t SQLITE_TASK_STACK_SIZE = 16 * 1024;
 
 // Command structure for the SQLite task queue
 struct SqliteCommand {
@@ -50,7 +50,8 @@ public:
             SqliteCommand cmd = { &wrapper, completionSem };
             xQueueSend(commandQueue, &cmd, portMAX_DELAY);
             xSemaphoreTake(completionSem, portMAX_DELAY);
-        } else {
+        }
+        else {
             ReturnType result{};
             std::function<void()> wrapper = [&func, &result]() { result = func(); };
             SqliteCommand cmd = { &wrapper, completionSem };
@@ -129,7 +130,7 @@ public:
         ~Statement() {
             if (stmt_) sqlite3_finalize(stmt_);
         }
-        operator sqlite3_stmt*() { return stmt_; }
+        operator sqlite3_stmt* () { return stmt_; }
         sqlite3_stmt* get() { return stmt_; }
         bool valid() const { return stmt_ != nullptr; }
 
@@ -303,7 +304,7 @@ esp_err_t ManifestDatabase::initialize() {
     init_sd();
 
     // Ensure patterns directory exists
-    struct stat st = {0};
+    struct stat st = { 0 };
     if (stat("/sd/patterns", &st) == -1) {
         if (mkdir("/sd/patterns", 0775) != 0) {
             ESP_LOGE(TAG, "Failed to create /sd/patterns");
@@ -380,7 +381,7 @@ esp_err_t ManifestDatabase::initialize() {
 
         // Create schema
         return impl_->createSchema();
-    });
+        });
 
     if (initResult != ESP_OK) {
         // Cleanup on failure
@@ -410,7 +411,7 @@ void ManifestDatabase::shutdown() {
                 sqlite3_close(impl_->db);
                 impl_->db = nullptr;
             }
-        });
+            });
     }
 
     // Stop the SQLite task
@@ -469,7 +470,7 @@ esp_err_t ManifestDatabase::addPattern(const Pattern& pattern) {
 
         ESP_LOGI(TAG, "Pattern added: %s", pattern.uuid.c_str());
         return ESP_OK;
-    });
+        });
 }
 
 esp_err_t ManifestDatabase::updatePattern(const std::string& uuid, const Pattern& pattern) {
@@ -501,7 +502,7 @@ esp_err_t ManifestDatabase::updatePattern(const std::string& uuid, const Pattern
         }
 
         return ESP_OK;
-    });
+        });
 }
 
 esp_err_t ManifestDatabase::deletePattern(const std::string& uuid) {
@@ -533,7 +534,7 @@ esp_err_t ManifestDatabase::deletePattern(const std::string& uuid) {
 
         txn.commit();
         return ESP_OK;
-    });
+        });
 
     if (result == ESP_OK) {
         // Delete pattern files (try both extensions since DB record is gone)
@@ -562,7 +563,7 @@ std::vector<Pattern> ManifestDatabase::getAllPatterns() {
             patterns.push_back(impl_->rowToPattern(stmt));
         }
         return patterns;
-    });
+        });
 }
 
 PaginatedResult<Pattern> ManifestDatabase::getPatterns(int page, int per_page) {
@@ -572,10 +573,12 @@ PaginatedResult<Pattern> ManifestDatabase::getPatterns(int page, int per_page) {
     return impl_->executeOnSqliteTask([this, page, per_page]() -> PaginatedResult<Pattern> {
         PaginatedResult<Pattern> result;
 
-        // Get total count
-        Impl::Statement countStmt(impl_->db, "SELECT COUNT(*) FROM patterns");
-        if (countStmt.step() == SQLITE_ROW) {
-            result.pagination.total_items = countStmt.columnInt(0);
+        // Get total count (scoped to finalize before next query)
+        {
+            Impl::Statement countStmt(impl_->db, "SELECT COUNT(*) FROM patterns");
+            if (countStmt.step() == SQLITE_ROW) {
+                result.pagination.total_items = countStmt.columnInt(0);
+            }
         }
 
         result.pagination.page = page;
@@ -587,14 +590,24 @@ PaginatedResult<Pattern> ManifestDatabase::getPatterns(int page, int per_page) {
             "SELECT uuid, name, creator, date, popularity, reversible, start_point, "
             "encrypted, size_bytes, created_at, last_played_at, downloaded_at "
             "FROM patterns ORDER BY name LIMIT ? OFFSET ?");
+
+        if (!stmt.valid()) {
+            ESP_LOGE(TAG, "Failed to prepare patterns SELECT: %s", sqlite3_errmsg(impl_->db));
+            return result;
+        }
+
         stmt.bindInt(1, per_page);
         stmt.bindInt(2, page * per_page);
 
-        while (stmt.step() == SQLITE_ROW) {
+        int rc;
+        while ((rc = stmt.step()) == SQLITE_ROW) {
             result.items.push_back(impl_->rowToPattern(stmt));
         }
+        if (rc != SQLITE_DONE) {
+            ESP_LOGE(TAG, "patterns SELECT step failed: %d - %s", rc, sqlite3_errmsg(impl_->db));
+        }
         return result;
-    });
+        });
 }
 
 std::optional<Pattern> ManifestDatabase::getPattern(const std::string& uuid) {
@@ -612,7 +625,7 @@ std::optional<Pattern> ManifestDatabase::getPattern(const std::string& uuid) {
             return impl_->rowToPattern(stmt);
         }
         return std::nullopt;
-    });
+        });
 }
 
 bool ManifestDatabase::patternExists(const std::string& uuid) {
@@ -623,7 +636,7 @@ bool ManifestDatabase::patternExists(const std::string& uuid) {
         Impl::Statement stmt(impl_->db, "SELECT 1 FROM patterns WHERE uuid = ? LIMIT 1");
         stmt.bindText(1, uuid);
         return stmt.step() == SQLITE_ROW;
-    });
+        });
 }
 
 size_t ManifestDatabase::getPatternCount() {
@@ -636,7 +649,7 @@ size_t ManifestDatabase::getPatternCount() {
             return stmt.columnInt(0);
         }
         return 0;
-    });
+        });
 }
 
 esp_err_t ManifestDatabase::updateLastPlayed(const std::string& uuid) {
@@ -652,7 +665,7 @@ esp_err_t ManifestDatabase::updateLastPlayed(const std::string& uuid) {
             return ESP_ERR_NOT_FOUND;
         }
         return ESP_OK;
-    });
+        });
 }
 
 esp_err_t ManifestDatabase::incrementPopularity(const std::string& uuid) {
@@ -667,7 +680,7 @@ esp_err_t ManifestDatabase::incrementPopularity(const std::string& uuid) {
             return ESP_ERR_NOT_FOUND;
         }
         return ESP_OK;
-    });
+        });
 }
 
 // Playlist CRUD
@@ -717,7 +730,7 @@ esp_err_t ManifestDatabase::addPlaylist(const Playlist& playlist) {
         txn.commit();
         ESP_LOGI(TAG, "Playlist added: %s", playlist.uuid.c_str());
         return ESP_OK;
-    });
+        });
 }
 
 esp_err_t ManifestDatabase::updatePlaylist(const std::string& uuid, const Playlist& playlist) {
@@ -766,7 +779,7 @@ esp_err_t ManifestDatabase::updatePlaylist(const std::string& uuid, const Playli
 
         txn.commit();
         return ESP_OK;
-    });
+        });
 }
 
 esp_err_t ManifestDatabase::deletePlaylist(const std::string& uuid) {
@@ -788,7 +801,7 @@ esp_err_t ManifestDatabase::deletePlaylist(const std::string& uuid) {
 
         ESP_LOGI(TAG, "Playlist deleted: %s", uuid.c_str());
         return ESP_OK;
-    });
+        });
 }
 
 std::vector<Playlist> ManifestDatabase::getAllPlaylists() {
@@ -808,7 +821,7 @@ std::vector<Playlist> ManifestDatabase::getAllPlaylists() {
             playlists.push_back(std::move(pl));
         }
         return playlists;
-    });
+        });
 }
 
 PaginatedResult<Playlist> ManifestDatabase::getPlaylists(int page, int per_page) {
@@ -818,10 +831,12 @@ PaginatedResult<Playlist> ManifestDatabase::getPlaylists(int page, int per_page)
     return impl_->executeOnSqliteTask([this, page, per_page]() -> PaginatedResult<Playlist> {
         PaginatedResult<Playlist> result;
 
-        // Get total count
-        Impl::Statement countStmt(impl_->db, "SELECT COUNT(*) FROM playlists");
-        if (countStmt.step() == SQLITE_ROW) {
-            result.pagination.total_items = countStmt.columnInt(0);
+        // Get total count (scoped to finalize before next query)
+        {
+            Impl::Statement countStmt(impl_->db, "SELECT COUNT(*) FROM playlists");
+            if (countStmt.step() == SQLITE_ROW) {
+                result.pagination.total_items = countStmt.columnInt(0);
+            }
         }
 
         result.pagination.page = page;
@@ -842,7 +857,7 @@ PaginatedResult<Playlist> ManifestDatabase::getPlaylists(int page, int per_page)
             result.items.push_back(std::move(pl));
         }
         return result;
-    });
+        });
 }
 
 std::optional<Playlist> ManifestDatabase::getPlaylist(const std::string& uuid) {
@@ -862,7 +877,7 @@ std::optional<Playlist> ManifestDatabase::getPlaylist(const std::string& uuid) {
             return pl;
         }
         return std::nullopt;
-    });
+        });
 }
 
 bool ManifestDatabase::playlistExists(const std::string& uuid) {
@@ -873,7 +888,7 @@ bool ManifestDatabase::playlistExists(const std::string& uuid) {
         Impl::Statement stmt(impl_->db, "SELECT 1 FROM playlists WHERE uuid = ? LIMIT 1");
         stmt.bindText(1, uuid);
         return stmt.step() == SQLITE_ROW;
-    });
+        });
 }
 
 size_t ManifestDatabase::getPlaylistCount() {
@@ -886,7 +901,7 @@ size_t ManifestDatabase::getPlaylistCount() {
             return stmt.columnInt(0);
         }
         return 0;
-    });
+        });
 }
 
 // Playlist-pattern operations
@@ -928,7 +943,7 @@ esp_err_t ManifestDatabase::addPatternToPlaylist(const std::string& playlistUuid
         updateStmt.step();
 
         return ESP_OK;
-    });
+        });
 }
 
 esp_err_t ManifestDatabase::removePatternFromPlaylist(const std::string& playlistUuid, const std::string& patternUuid) {
@@ -961,7 +976,7 @@ esp_err_t ManifestDatabase::removePatternFromPlaylist(const std::string& playlis
         clearFeatured.step();
 
         return ESP_OK;
-    });
+        });
 }
 
 esp_err_t ManifestDatabase::setFeaturedPattern(const std::string& playlistUuid, const std::string& patternUuid) {
@@ -994,7 +1009,7 @@ esp_err_t ManifestDatabase::setFeaturedPattern(const std::string& playlistUuid, 
             return ESP_FAIL;
         }
         return ESP_OK;
-    });
+        });
 }
 
 esp_err_t ManifestDatabase::reorderPlaylist(const std::string& playlistUuid, const std::vector<std::string>& newOrder) {
@@ -1045,7 +1060,7 @@ esp_err_t ManifestDatabase::reorderPlaylist(const std::string& playlistUuid, con
 
         txn.commit();
         return ESP_OK;
-    });
+        });
 }
 
 std::vector<Pattern> ManifestDatabase::getPlaylistPatterns(const std::string& playlistUuid) {
@@ -1070,7 +1085,7 @@ std::vector<Pattern> ManifestDatabase::getPlaylistPatterns(const std::string& pl
             patterns.push_back(impl_->rowToPattern(stmt));
         }
         return patterns;
-    });
+        });
 }
 
 // Utility functions
@@ -1107,7 +1122,7 @@ void ManifestDatabase::releaseMemory() {
     impl_->executeOnSqliteTask([this]() {
         sqlite3_db_release_memory(impl_->db);
         ESP_LOGI(TAG, "Released SQLite cache memory");
-    });
+        });
 }
 
 esp_err_t ManifestDatabase::vacuum() {
@@ -1124,7 +1139,7 @@ esp_err_t ManifestDatabase::vacuum() {
         }
         ESP_LOGI(TAG, "Database vacuumed");
         return ESP_OK;
-    });
+        });
 }
 
 cJSON* ManifestDatabase::patternToJson(const Pattern& p) {
@@ -1180,15 +1195,15 @@ Pattern ManifestDatabase::jsonToPattern(const cJSON* json) {
     auto getText = [json](const char* key) -> std::string {
         const cJSON* item = cJSON_GetObjectItem(json, key);
         return (item && cJSON_IsString(item)) ? item->valuestring : "";
-    };
+        };
     auto getInt = [json](const char* key, int def = 0) -> int {
         const cJSON* item = cJSON_GetObjectItem(json, key);
         return (item && cJSON_IsNumber(item)) ? item->valueint : def;
-    };
+        };
     auto getBool = [json](const char* key) -> bool {
         const cJSON* item = cJSON_GetObjectItem(json, key);
         return item && cJSON_IsTrue(item);
-    };
+        };
 
     p.uuid = getText("uuid");
     p.name = getText("name");
@@ -1214,7 +1229,7 @@ Playlist ManifestDatabase::jsonToPlaylist(const cJSON* json) {
     auto getText = [json](const char* key) -> std::string {
         const cJSON* item = cJSON_GetObjectItem(json, key);
         return (item && cJSON_IsString(item)) ? item->valuestring : "";
-    };
+        };
 
     pl.uuid = getText("uuid");
     pl.name = getText("name");

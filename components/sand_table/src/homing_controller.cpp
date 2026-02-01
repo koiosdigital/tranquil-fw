@@ -182,7 +182,7 @@ namespace sand_table {
         int32_t rho_before = rho_.position();
 
         // Execute a single large move - ISR will stop when stall detected
-        auto move_result = stepper_controller_->execute_constant_speed(
+        (void)stepper_controller_->execute_constant_speed(
             0, static_cast<int32_t>(kMaxHomingSteps), kRhoHomingIntervalUs);
 
         // Calculate actual steps moved
@@ -238,7 +238,7 @@ namespace sand_table {
         int32_t rho_before = rho_.position();
 
         // Execute a single large move inward - ISR will stop when stall detected
-        auto move_result = stepper_controller_->execute_constant_speed(
+        (void)stepper_controller_->execute_constant_speed(
             0, -static_cast<int32_t>(kMaxHomingSteps), kRhoHomingIntervalUs);
 
         // Calculate actual steps moved

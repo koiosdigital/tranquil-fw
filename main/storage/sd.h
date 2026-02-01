@@ -19,3 +19,4 @@ extern sdmmc_card_t* card;
 
 void init_sd();
 void deinit_sd();
+void format_sd();

@@ -338,7 +338,7 @@ namespace sand_table {
         return symbol;
     }
 
-    void IRAM_ATTR RmtStepSequencer::bresenham_step(bool& step_theta, bool& step_rho) {
+    void RmtStepSequencer::bresenham_step(bool& step_theta, bool& step_rho) {
         step_theta = false;
         step_rho = false;
 
@@ -376,7 +376,7 @@ namespace sand_table {
         }
     }
 
-    void IRAM_ATTR RmtStepSequencer::encode_chunk(uint8_t buffer_idx) {
+    void RmtStepSequencer::encode_chunk(uint8_t buffer_idx) {
         auto& theta_buf = theta_symbols_[buffer_idx];
         auto& rho_buf = rho_symbols_[buffer_idx];
         size_t count = 0;
@@ -402,14 +402,16 @@ namespace sand_table {
 
         symbol_counts_[buffer_idx] = count;
 
-        // Update position counters atomically using fetch_add
+        // Update position counters atomically using __atomic builtins
+        // Note: Using __atomic_* instead of std::atomic methods to ensure the code
+        // is inlined and doesn't call into flash-resident library functions (ISR-safe)
         if (theta_pos_ && theta_steps_encoded > 0) {
-            theta_pos_->fetch_add(theta_steps_encoded * bresenham_->theta_dir,
-                std::memory_order_release);
+            __atomic_fetch_add(reinterpret_cast<int32_t*>(theta_pos_),
+                theta_steps_encoded * bresenham_->theta_dir, __ATOMIC_RELEASE);
         }
         if (rho_pos_ && rho_steps_encoded > 0) {
-            rho_pos_->fetch_add(rho_steps_encoded * bresenham_->rho_dir,
-                std::memory_order_release);
+            __atomic_fetch_add(reinterpret_cast<int32_t*>(rho_pos_),
+                rho_steps_encoded * bresenham_->rho_dir, __ATOMIC_RELEASE);
         }
     }
 
@@ -422,10 +424,11 @@ namespace sand_table {
         BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
         // Check for stop request
-        if (self->stop_requested_.load(std::memory_order_acquire)) {
-            self->channels_done_.store(0, std::memory_order_release);
-            self->pending_tx_.store(0, std::memory_order_release);
-            self->executing_.store(false, std::memory_order_release);
+        // Using __atomic_* builtins instead of std::atomic methods for ISR safety
+        if (__atomic_load_n(reinterpret_cast<bool*>(&self->stop_requested_), __ATOMIC_ACQUIRE)) {
+            __atomic_store_n(reinterpret_cast<int*>(&self->channels_done_), 0, __ATOMIC_RELEASE);
+            __atomic_store_n(reinterpret_cast<int32_t*>(&self->pending_tx_), 0, __ATOMIC_RELEASE);
+            __atomic_store_n(reinterpret_cast<bool*>(&self->executing_), false, __ATOMIC_RELEASE);
             xSemaphoreGiveFromISR(self->completion_sem_, &xHigherPriorityTaskWoken);
             return xHigherPriorityTaskWoken == pdTRUE;
         }
@@ -434,17 +437,17 @@ namespace sand_table {
         // fetch_add returns the value BEFORE increment, so:
         // - First callback sees 0, increments to 1, returns early
         // - Second callback sees 1, increments to 2, proceeds
-        int prev_count = self->channels_done_.fetch_add(1, std::memory_order_acq_rel);
+        int prev_count = __atomic_fetch_add(reinterpret_cast<int*>(&self->channels_done_), 1, __ATOMIC_ACQ_REL);
         if (prev_count < 1) {
             // First channel done, wait for the other
             return false;
         }
 
         // Both channels done - reset counter for next round
-        self->channels_done_.store(0, std::memory_order_release);
+        __atomic_store_n(reinterpret_cast<int*>(&self->channels_done_), 0, __ATOMIC_RELEASE);
 
         // Decrement pending counter - this transmission pair just completed
-        self->pending_tx_.fetch_sub(1, std::memory_order_acq_rel);
+        __atomic_fetch_sub(reinterpret_cast<int32_t*>(&self->pending_tx_), 1, __ATOMIC_ACQ_REL);
 
         // Switch buffer and try to encode next chunk
         uint8_t next_buffer = self->active_buffer_ ^ 1;
@@ -453,7 +456,7 @@ namespace sand_table {
 
         if (self->symbol_counts_[next_buffer] > 0) {
             // Queue next transmission - increment pending counter BEFORE queuing
-            self->pending_tx_.fetch_add(1, std::memory_order_release);
+            __atomic_fetch_add(reinterpret_cast<int32_t*>(&self->pending_tx_), 1, __ATOMIC_RELEASE);
 
             rmt_transmit_config_t tx_config = {
                 .loop_count = 0,
@@ -475,9 +478,9 @@ namespace sand_table {
         }
 
         // Only signal completion when no transmissions pending AND all steps encoded
-        if (self->pending_tx_.load(std::memory_order_acquire) == 0 &&
+        if (__atomic_load_n(reinterpret_cast<int32_t*>(&self->pending_tx_), __ATOMIC_ACQUIRE) == 0 &&
             self->steps_encoded_ >= self->total_steps_) {
-            self->executing_.store(false, std::memory_order_release);
+            __atomic_store_n(reinterpret_cast<bool*>(&self->executing_), false, __ATOMIC_RELEASE);
             xSemaphoreGiveFromISR(self->completion_sem_, &xHigherPriorityTaskWoken);
         }
 
@@ -618,7 +621,7 @@ namespace sand_table {
         }
     }
 
-    void IRAM_ATTR RmtStepSequencer::stop_from_isr() {
+    void RmtStepSequencer::stop_from_isr() {
         // ISR-safe version - only set flag and signal semaphore
         // No blocking calls allowed
         stop_requested_.store(true, std::memory_order_release);
@@ -652,8 +655,7 @@ namespace sand_table {
 
     Result<void> CoordinatedStepperController::init() {
         // Allocate RMT sequencer in internal RAM (required for ISR callback safety)
-        void* mem = heap_caps_malloc(sizeof(RmtStepSequencer),
-                                      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        void* mem = malloc(sizeof(RmtStepSequencer));
         if (!mem) {
             ESP_LOGE(TAG, "Failed to allocate RMT sequencer in internal RAM");
             return Result<void>::err(MotionError::HardwareFault);
@@ -687,7 +689,7 @@ namespace sand_table {
         bresenham_.clear();
     }
 
-    void IRAM_ATTR CoordinatedStepperController::emergency_stop_from_isr() {
+    void CoordinatedStepperController::emergency_stop_from_isr() {
         rmt_sequencer_->stop_from_isr();
         // Don't clear bresenham from ISR - not critical
     }
@@ -722,13 +724,16 @@ namespace sand_table {
             // Both moving: use minimum so either motor can request deceleration
             entry_rpm = std::min(segment.theta_entry_velocity, segment.rho_entry_velocity);
             exit_rpm = std::min(segment.theta_exit_velocity, segment.rho_exit_velocity);
-        } else if (theta_moves) {
+        }
+        else if (theta_moves) {
             entry_rpm = segment.theta_entry_velocity;
             exit_rpm = segment.theta_exit_velocity;
-        } else if (rho_moves) {
+        }
+        else if (rho_moves) {
             entry_rpm = segment.rho_entry_velocity;
             exit_rpm = segment.rho_exit_velocity;
-        } else {
+        }
+        else {
             // Neither moves - shouldn't happen, but handle gracefully
             entry_rpm = 0.0f;
             exit_rpm = 0.0f;
@@ -867,10 +872,6 @@ namespace sand_table {
             ESP_LOGW(TAG, "First interval too fast: %u us (min: %lu us)",
                 interval_table_.intervals[0], min_interval_us);
         }
-
-        // Capture position before execution for drift debugging
-        int32_t theta_before = theta_.position();
-        int32_t rho_before = rho_.position();
 
         ESP_LOGD(TAG, "RMT segment: theta=%ld, rho=%ld, total=%lu, cruise_v=%.1f, interval[0]=%u us",
             segment.delta_theta_steps, segment.delta_rho_steps,

@@ -521,7 +521,7 @@ namespace sand_table {
         while (!velocity_planner_->empty() && !segment_queue_.full()) {
             auto popped = velocity_planner_->pop_segment();
             if (popped) {
-                segment_queue_.push(*popped);
+                (void)segment_queue_.push(*popped);  // Already checked !full() above
             }
         }
     }
