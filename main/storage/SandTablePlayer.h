@@ -38,34 +38,10 @@ struct PatternLine {
         : theta(t), rho(r), is_first_line(first), is_valid(true) {}
 };
 
-struct InterpolationState {
-    bool in_progress;
-    bool is_interpolating;
-    int cur_step;
-    int interpolate_steps;
-    double cur_theta;
-    double cur_rho;
-    double prev_theta;
-    double prev_rho;
-    double theta_inc;
-    double rho_inc;
-    double theta_start_offset;
-    double step_angle;  // ~1 degree in radians
-
-    InterpolationState() {
-        in_progress = false;
-        is_interpolating = false;
-        cur_step = 0;
-        interpolate_steps = 0;
-        cur_theta = 0.0;
-        cur_rho = 0.0;
-        prev_theta = 0.0;
-        prev_rho = 0.0;
-        theta_inc = 0.0;
-        rho_inc = 0.0;
-        theta_start_offset = 0.0;
-        step_angle = 0.0174533;  // ~1 degree in radians
-    }
+// Tracks previous position for pattern playback
+struct PatternPosition {
+    double prev_theta = 0.0;
+    double prev_rho = 0.0;
 };
 
 struct PlaybackStatus {
@@ -113,6 +89,7 @@ public:
     static PlaybackStatus getStatus();
     static cJSON* getStateJSON();
     static int getTotalProgress();
+    static bool isHomed();
 
     // Pattern info
     static const Pattern* getCurrentPattern();
@@ -134,7 +111,7 @@ private:
     static esp_err_t loadPatternFile(const char* pattern_uuid);
     static void unloadPatternFile();
     static PatternLine parsePatternLine(const char* line, size_t line_number);
-    static void getPatternFilePath(const char* pattern_uuid, char* file_path, size_t file_path_size);
+    static void getPatternFilePath(const char* pattern_uuid, bool encrypted, char* file_path, size_t file_path_size);
     static PatternLine peekNextLine();
     static void popLine();
     static bool hasMoreLines();
@@ -147,7 +124,6 @@ private:
 
     // Motion processing
     static bool processPatternLine(const PatternLine& line);
-    static void serviceInterpolation();
     static void sendMoveCommand(double theta_rad, double rho_normalized);
 
     // State
@@ -177,8 +153,8 @@ private:
     static bool is_shuffle_;
     static bool is_loop_;
 
-    // Interpolation state
-    static InterpolationState interpolation_state_;
+    // Pattern position tracking
+    static PatternPosition pattern_position_;
 
     // Configuration
     static double feed_rate_;
@@ -189,6 +165,4 @@ private:
     static constexpr uint32_t SERVICE_TASK_DELAY_MS = 10;
     static constexpr size_t SERVICE_TASK_STACK_SIZE = 8192;
     static constexpr UBaseType_t SERVICE_TASK_PRIORITY = 5;
-    static constexpr int PROCESS_STEPS_PER_SERVICE = 100;
-    static constexpr double RHO_AT_DEFAULT_STEP_ANGLE = 0.3;
 };

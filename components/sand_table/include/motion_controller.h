@@ -61,8 +61,9 @@ namespace sand_table {
         // Homing
         // =========================================================================
 
-        /// Execute full homing sequence
-        [[nodiscard]] Result<void> home();
+        /// Execute homing sequence
+        /// @param force_full If true, performs full calibration. Otherwise uses cached calibration if available.
+        [[nodiscard]] Result<void> home(bool force_full = false);
 
         /// Check if system is homed
         [[nodiscard]] bool is_homed() const noexcept {
@@ -134,6 +135,28 @@ namespace sand_table {
             return segment_queue_.size();
         }
 
+        /// Progress information for motion execution
+        struct MotionProgress {
+            uint64_t steps_queued;       // Total steps queued since reset
+            uint64_t steps_completed;    // Total steps completed since reset
+            uint32_t current_segment_steps_total;  // Steps in current segment
+            uint32_t current_segment_steps_done;   // Steps done in current segment
+            size_t segments_queued;      // Segments in execution queue
+            bool is_executing;           // Whether a segment is currently executing
+
+            /// Get progress as a fraction (0.0 to 1.0)
+            [[nodiscard]] float progress_fraction() const noexcept {
+                if (steps_queued == 0) return 1.0f;
+                return static_cast<float>(steps_completed) / static_cast<float>(steps_queued);
+            }
+        };
+
+        /// Get current motion execution progress
+        [[nodiscard]] MotionProgress get_motion_progress() const;
+
+        /// Reset progress counters (call when starting a new pattern)
+        void reset_progress_counters();
+
     private:
         // Segment queue (64 segments, power of 2)
         static constexpr size_t kSegmentQueueSize = 64;
@@ -169,6 +192,10 @@ namespace sand_table {
         std::atomic<bool> emergency_stop_{ false };
         std::atomic<bool> paused_{ false };
         std::atomic<bool> running_{ false };
+
+        // Progress tracking
+        std::atomic<uint64_t> total_steps_queued_{ 0 };
+        std::atomic<uint64_t> total_steps_completed_{ 0 };
 
         // Position tracking: uses actual motor positions directly
         // No need for separate "target" tracking - motor positions are the source of truth

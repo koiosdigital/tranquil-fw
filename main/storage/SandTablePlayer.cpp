@@ -34,7 +34,7 @@ size_t SandTablePlayer::playlist_index_ = 0;
 bool SandTablePlayer::is_shuffle_ = false;
 bool SandTablePlayer::is_loop_ = false;
 
-InterpolationState SandTablePlayer::interpolation_state_;
+PatternPosition SandTablePlayer::pattern_position_;
 double SandTablePlayer::feed_rate_ = 5.0;
 
 // =============================================================================
@@ -121,8 +121,6 @@ esp_err_t SandTablePlayer::playPattern(const char* pattern_uuid) {
     // Stop current playback if any
     if (playback_state_ != PlaybackState::STOPPED) {
         playback_state_ = PlaybackState::STOPPED;
-        interpolation_state_.in_progress = false;
-        interpolation_state_.is_interpolating = false;
     }
 
     // Load the pattern file
@@ -143,6 +141,9 @@ esp_err_t SandTablePlayer::playPattern(const char* pattern_uuid) {
 
     strncpy(current_pattern_uuid_, pattern_uuid, MAX_UUID_LEN - 1);
     current_pattern_uuid_[MAX_UUID_LEN - 1] = '\0';
+
+    // Reset motion progress counters for accurate progress tracking
+    motion_controller_->reset_progress_counters();
 
     play_mode_ = PlayMode::SINGLE_PATTERN;
     playback_state_ = PlaybackState::PLAYING;
@@ -170,8 +171,6 @@ esp_err_t SandTablePlayer::playPlaylist(const char* playlist_uuid, bool shuffle,
     // Stop current playback
     if (playback_state_ != PlaybackState::STOPPED) {
         playback_state_ = PlaybackState::STOPPED;
-        interpolation_state_.in_progress = false;
-        interpolation_state_.is_interpolating = false;
         unloadPatternFile();
     }
 
@@ -255,10 +254,6 @@ esp_err_t SandTablePlayer::stop() {
     playback_state_ = PlaybackState::STOPPED;
     play_mode_ = PlayMode::SINGLE_PATTERN;
 
-    // Stop interpolation
-    interpolation_state_.in_progress = false;
-    interpolation_state_.is_interpolating = false;
-
     // Clear pattern state
     unloadPatternFile();
     memset(current_pattern_uuid_, 0, sizeof(current_pattern_uuid_));
@@ -294,9 +289,7 @@ esp_err_t SandTablePlayer::skip() {
         return ESP_ERR_INVALID_STATE;
     }
 
-    // Stop current pattern interpolation
-    interpolation_state_.in_progress = false;
-    interpolation_state_.is_interpolating = false;
+    // Stop current pattern
     unloadPatternFile();
 
     // Advance to next
@@ -429,19 +422,33 @@ cJSON* SandTablePlayer::getStateJSON() {
 int SandTablePlayer::getTotalProgress() {
     if (!file_loaded_ || total_lines_ == 0) return 0;
 
-    double line_progress = 0.0;
-    if (interpolation_state_.in_progress && interpolation_state_.interpolate_steps > 0) {
-        line_progress = static_cast<double>(interpolation_state_.cur_step) /
-                        static_cast<double>(interpolation_state_.interpolate_steps);
-        if (line_progress > 1.0) line_progress = 1.0;
-        if (line_progress < 0.0) line_progress = 0.0;
+    // With direct moves to motion controller, progress is based on:
+    // 1. How many lines have been queued (current_line_index_ / total_lines_)
+    // 2. How much of the queued motion has executed (motion progress)
+
+    // Motion execution progress is the primary indicator
+    if (motion_controller_) {
+        auto mp = motion_controller_->get_motion_progress();
+        if (mp.steps_queued > 0) {
+            double motion_fraction = static_cast<double>(mp.steps_completed) /
+                                     static_cast<double>(mp.steps_queued);
+            int percent = static_cast<int>(motion_fraction * 100.0);
+            if (percent > 100) percent = 100;
+            if (percent < 0) percent = 0;
+            return percent;
+        }
     }
 
-    double total = static_cast<double>(current_line_index_) + line_progress;
-    int percent = static_cast<int>((total / static_cast<double>(total_lines_)) * 100.0);
+    // Fallback: use line-based progress if no motion data
+    int percent = static_cast<int>(
+        (static_cast<double>(current_line_index_) / static_cast<double>(total_lines_)) * 100.0);
     if (percent > 100) percent = 100;
     if (percent < 0) percent = 0;
     return percent;
+}
+
+bool SandTablePlayer::isHomed() {
+    return motion_controller_ && motion_controller_->is_homed();
 }
 
 const Pattern* SandTablePlayer::getCurrentPattern() {
@@ -473,16 +480,13 @@ void SandTablePlayer::serviceTask() {
     ESP_LOGI(TAG, "Service task started");
 
     while (true) {
-        // Service interpolation when playing
-        serviceInterpolation();
-
-        // Check if we need to load the next line or advance playlist
-        if (playback_state_ == PlaybackState::PLAYING && file_loaded_ &&
-            !interpolation_state_.in_progress) {
+        // Process pattern lines when playing
+        if (playback_state_ == PlaybackState::PLAYING && file_loaded_) {
 
             if (hasMoreLines()) {
                 PatternLine line = peekNextLine();
                 if (line.is_valid) {
+                    // processPatternLine returns false if queue is full (will retry)
                     if (processPatternLine(line)) {
                         popLine();
                     }
@@ -491,14 +495,17 @@ void SandTablePlayer::serviceTask() {
                     popLine();
                 }
             } else {
-                // Pattern finished
-                ESP_LOGI(TAG, "Pattern finished");
+                // All lines queued - wait for motion to complete before advancing
+                auto progress = motion_controller_->get_motion_progress();
+                if (!progress.is_executing && progress.segments_queued == 0) {
+                    ESP_LOGI(TAG, "Pattern finished");
 
-                // Handle playlist mode
-                if (play_mode_ != PlayMode::SINGLE_PATTERN && !playlist_patterns_.empty()) {
-                    advanceToNextPattern();
-                } else {
-                    playback_state_ = PlaybackState::STOPPED;
+                    // Handle playlist mode
+                    if (play_mode_ != PlayMode::SINGLE_PATTERN && !playlist_patterns_.empty()) {
+                        advanceToNextPattern();
+                    } else {
+                        playback_state_ = PlaybackState::STOPPED;
+                    }
                 }
             }
         }
@@ -526,8 +533,19 @@ esp_err_t SandTablePlayer::loadPatternFile(const char* pattern_uuid) {
     total_lines_ = 0;
     file_loaded_ = false;
 
+    // Get pattern metadata to determine if encrypted
+    auto pattern = ManifestDatabase::instance().getPattern(pattern_uuid);
+    bool is_encrypted = pattern.has_value() ? pattern->encrypted : false;
+
     char file_path[256];
-    getPatternFilePath(pattern_uuid, file_path, sizeof(file_path));
+    getPatternFilePath(pattern_uuid, is_encrypted, file_path, sizeof(file_path));
+
+    // TODO: For encrypted patterns, use EncryptedPatternReader instead
+    if (is_encrypted) {
+        ESP_LOGE(TAG, "Encrypted pattern playback not yet implemented: %s", pattern_uuid);
+        xSemaphoreGive(file_mutex_);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
 
     pattern_file_ = fopen(file_path, "r");
     if (!pattern_file_) {
@@ -600,8 +618,10 @@ PatternLine SandTablePlayer::parsePatternLine(const char* line, size_t line_numb
     return PatternLine(theta, rho, is_first);
 }
 
-void SandTablePlayer::getPatternFilePath(const char* pattern_uuid, char* file_path, size_t file_path_size) {
-    snprintf(file_path, file_path_size, "%s/%s.thr", PATTERNS_PATH, pattern_uuid);
+void SandTablePlayer::getPatternFilePath(const char* pattern_uuid, bool encrypted, char* file_path, size_t file_path_size) {
+    // Unencrypted patterns use .thr extension, encrypted use .dat
+    const char* extension = encrypted ? "dat" : "thr";
+    snprintf(file_path, file_path_size, "%s/%s.%s", PATTERNS_PATH, pattern_uuid, extension);
 }
 
 PatternLine SandTablePlayer::peekNextLine() {
@@ -688,8 +708,11 @@ void SandTablePlayer::startCurrentPattern() {
     strncpy(current_pattern_uuid_, pattern_uuid.c_str(), MAX_UUID_LEN - 1);
     current_pattern_uuid_[MAX_UUID_LEN - 1] = '\0';
 
-    // Reset interpolation state
-    interpolation_state_ = InterpolationState();
+    // Reset motion progress counters for accurate progress tracking
+    motion_controller_->reset_progress_counters();
+
+    // Reset pattern position
+    pattern_position_ = PatternPosition();
 
     ESP_LOGI(TAG, "Starting pattern %zu/%zu: %s",
              playlist_index_ + 1, playlist_patterns_.size(), pattern_uuid.c_str());
@@ -741,100 +764,32 @@ void SandTablePlayer::shufflePlaylistOrder() {
 bool SandTablePlayer::processPatternLine(const PatternLine& line) {
     if (!line.is_valid) return false;
 
-    double new_theta = line.theta;
-    double new_rho = line.rho;
-
     if (line.is_first_line) {
-        // On the first line, just set the starting point
-        interpolation_state_.theta_start_offset = 0.0;
-        interpolation_state_.prev_theta = new_theta;
-        interpolation_state_.prev_rho = new_rho;
-        interpolation_state_.is_interpolating = false;
-        interpolation_state_.in_progress = false;
+        // First line: record starting position, no move needed
+        pattern_position_.prev_theta = line.theta;
+        pattern_position_.prev_rho = line.rho;
         return true;
     }
 
-    // Regular line - setup interpolation
-    double delta_theta = new_theta - interpolation_state_.prev_theta;
-    double abs_delta_theta = fabs(delta_theta);
-    double adapted_step_angle = interpolation_state_.step_angle;
-
-    double abs_new_rho = fabs(new_rho);
-    double abs_prev_rho = fabs(interpolation_state_.prev_rho);
-    double avg_rho = abs_new_rho > abs_prev_rho ? abs_new_rho : abs_prev_rho;
-    if (avg_rho > 1) avg_rho = 1;
-
-    double max_step_angle = interpolation_state_.step_angle * 16;
-    if (max_step_angle > M_PI / 2) max_step_angle = M_PI / 2;
-    double min_step_angle = interpolation_state_.step_angle / 4;
-
-    // Adapt step angle based on radius
-    if (avg_rho > RHO_AT_DEFAULT_STEP_ANGLE) {
-        adapted_step_angle = ((avg_rho - RHO_AT_DEFAULT_STEP_ANGLE) / (1 - RHO_AT_DEFAULT_STEP_ANGLE)) *
-                             (min_step_angle - interpolation_state_.step_angle) + interpolation_state_.step_angle;
-    } else {
-        adapted_step_angle = (avg_rho / RHO_AT_DEFAULT_STEP_ANGLE) *
-                             (interpolation_state_.step_angle - max_step_angle) + max_step_angle;
+    // Check if motion controller can accept command
+    auto status = motion_controller_->get_status();
+    if (!status.is_homed) {
+        ESP_LOGE(TAG, "Motion controller not homed, stopping");
+        stop();
+        return false;
+    }
+    if (status.queue_depth >= status.queue_capacity) {
+        // Queue full, don't pop line yet - will retry
+        return false;
     }
 
-    interpolation_state_.theta_inc = delta_theta >= 0 ? adapted_step_angle : -adapted_step_angle;
-    double delta_rho = new_rho - interpolation_state_.prev_rho;
+    // Send move directly to motion controller
+    // Motion system handles segmentation and velocity planning
+    sendMoveCommand(line.theta, line.rho);
 
-    if (abs_delta_theta < adapted_step_angle) {
-        interpolation_state_.theta_inc = delta_theta;
-        interpolation_state_.interpolate_steps = 1;
-        interpolation_state_.rho_inc = delta_rho;
-    } else {
-        interpolation_state_.interpolate_steps = static_cast<int>(floor(abs_delta_theta / adapted_step_angle));
-        if (interpolation_state_.interpolate_steps < 1) return true;
-        interpolation_state_.rho_inc = delta_rho * adapted_step_angle / abs_delta_theta;
-    }
-
-    interpolation_state_.cur_theta = interpolation_state_.prev_theta;
-    interpolation_state_.cur_rho = interpolation_state_.prev_rho;
-    interpolation_state_.prev_theta = new_theta;
-    interpolation_state_.prev_rho = new_rho;
-    interpolation_state_.cur_step = 0;
-    interpolation_state_.in_progress = true;
-    interpolation_state_.is_interpolating = true;
-
+    pattern_position_.prev_theta = line.theta;
+    pattern_position_.prev_rho = line.rho;
     return true;
-}
-
-void SandTablePlayer::serviceInterpolation() {
-    if (!interpolation_state_.in_progress || !interpolation_state_.is_interpolating) {
-        return;
-    }
-
-    // Process multiple steps per service call
-    for (int i = 0; i < PROCESS_STEPS_PER_SERVICE; i++) {
-        if (interpolation_state_.cur_step >= interpolation_state_.interpolate_steps) {
-            interpolation_state_.in_progress = false;
-            return;
-        }
-
-        // Check if motion controller can accept command
-        auto status = motion_controller_->get_status();
-        if (!status.is_homed) {
-            ESP_LOGE(TAG, "Motion controller not homed, stopping");
-            stop();
-            return;
-        }
-        if (status.queue_depth >= status.queue_capacity) {
-            // Queue full, wait
-            return;
-        }
-
-        // Step
-        interpolation_state_.cur_step++;
-
-        // Increment position
-        interpolation_state_.cur_theta += interpolation_state_.theta_inc;
-        interpolation_state_.cur_rho += interpolation_state_.rho_inc;
-
-        // Send move command with converted coordinates
-        sendMoveCommand(interpolation_state_.cur_theta, interpolation_state_.cur_rho);
-    }
 }
 
 void SandTablePlayer::sendMoveCommand(double theta_rad, double rho_normalized) {

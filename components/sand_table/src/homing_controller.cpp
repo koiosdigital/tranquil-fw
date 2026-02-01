@@ -551,6 +551,9 @@ namespace sand_table {
         theta_.set_enabled(true);
         rho_.set_enabled(true);
 
+        rho_.set_direction(true);  // Outwards
+        rho_.step_fixed_rate(50, 500);
+
         // Home rho to center using known max
         auto rho_result = home_rho_to_center(rho_max_steps_);
         if (!rho_result.success) {
@@ -750,7 +753,8 @@ namespace sand_table {
         esp_err_t err = ConfigManager::instance().save_calibration(calib);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "Failed to save calibration to NVS: %s", esp_err_to_name(err));
-        } else {
+        }
+        else {
             ESP_LOGI(TAG, "Calibration saved to NVS");
         }
     }

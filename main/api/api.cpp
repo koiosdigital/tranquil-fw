@@ -4,9 +4,11 @@
 
 #include "cloud_api.h"
 #include "patterns_api.h"
+#include "pattern_upload.h"
 #include "playlists_api.h"
 #include "api_player.h"
 #include "led_api.h"
+#include "websocket_server.h"
 
 #include "static_files.h"
 
@@ -47,9 +49,11 @@ void tranquil_api_init() {
     // Register app-specific handlers
     cloud_api_register_handlers(server);
     patterns_api_register_handlers(server);
+    pattern_upload_register_handlers(server);
     playlists_api_register_handlers(server);
     api_player_register_endpoints(server);
     led_api_register_handlers(server);
+    websocket_server_init(server);
 
     // Create an array of httpd_uri_t to keep them alive after the loop
     static httpd_uri_t static_file_uris[static_files::num_of_files + 1]; // +1 for root '/' override

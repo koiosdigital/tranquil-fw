@@ -165,6 +165,16 @@ namespace sand_table {
             return executing_.load(std::memory_order_acquire);
         }
 
+        /// Get number of steps encoded/executed so far in current segment
+        [[nodiscard]] uint32_t steps_executed() const noexcept {
+            return steps_encoded_;
+        }
+
+        /// Get total steps in current segment
+        [[nodiscard]] uint32_t total_steps() const noexcept {
+            return total_steps_;
+        }
+
     private:
         // RMT handles
         rmt_channel_handle_t theta_channel_ = nullptr;
@@ -264,6 +274,25 @@ namespace sand_table {
         /// Get current positions
         [[nodiscard]] StepPosition get_position() const noexcept {
             return { theta_.position(), rho_.position() };
+        }
+
+        /// Progress information for current segment execution
+        struct SegmentProgress {
+            uint32_t steps_done;
+            uint32_t steps_total;
+            bool is_executing;
+        };
+
+        /// Get progress of current segment being executed
+        [[nodiscard]] SegmentProgress get_segment_progress() const noexcept {
+            if (!rmt_sequencer_) {
+                return {0, 0, false};
+            }
+            return {
+                rmt_sequencer_->steps_executed(),
+                rmt_sequencer_->total_steps(),
+                rmt_sequencer_->is_executing()
+            };
         }
 
     private:

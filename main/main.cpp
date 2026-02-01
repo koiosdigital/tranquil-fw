@@ -17,6 +17,7 @@
 
 #include "sand_table.h"
 #include "config_manager.h"
+#include "console_commands.h"
 #include "ManifestDatabase.h"
 #include "SandTablePlayer.h"
 #include "types.h"
@@ -27,6 +28,17 @@
 static const char* TAG = "main";
 
 static sand_table::MotionController* g_motion_controller = nullptr;
+
+// Log current heap usage
+static void log_heap_stats(const char* label) {
+    size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    size_t internal_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    size_t external_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    size_t external_largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+
+    ESP_LOGI(TAG, "HEAP [%s] Internal: %zu free (%zu largest) | External: %zu free (%zu largest)",
+        label, internal_free, internal_largest, external_free, external_largest);
+}
 
 // Draw a circle at the given radius using 8 segments of pi/4 each
 // direction: +1 for CCW, -1 for CW
@@ -87,6 +99,7 @@ extern "C" void app_main(void)
         }
         else {
             motion_ok = true;
+            sand_table::console_init(g_motion_controller);
         }
     }
 
@@ -113,89 +126,9 @@ extern "C" void app_main(void)
 
     tranquil_api_init();
 
-    // Only run homing and demo if motion controller initialized
-    if (!motion_ok) {
-        ESP_LOGW(TAG, "Motion controller not available - skipping homing and demo");
-        // Keep task alive, periodically log heap
-        while (true) {
-            log_heap_stats("idle");
-            vTaskDelay(pdMS_TO_TICKS(10000));
-        }
-    }
-
     g_motion_controller->home();
 
     while (!g_motion_controller->is_homed()) {
         vTaskDelay(pdMS_TO_TICKS(100));
     }
-
-    ESP_LOGI(TAG, "Homing complete");
-
-    // ==========================================================================
-    // DEMO PATTERN: 3 circles, 2 triangles, return to center
-    // ==========================================================================
-
-    constexpr float feedrate = 15.0f;  // RPM
-    sand_table::PolarPosition pos;
-    double current_theta = 0.0;
-
-    ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "=== DEMO PATTERN ===");
-    ESP_LOGI(TAG, "3 circles, 2 triangles, return to center");
-    ESP_LOGI(TAG, "Feedrate: %.1f RPM", feedrate);
-
-    // --- CIRCLE 1: CCW at rho=0.3 ---
-    ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "Circle 1: CCW at rho=0.3");
-    pos.theta = 0.0;
-    pos.rho = 0.3f;
-    (void)g_motion_controller->move_to(pos, feedrate);
-    draw_circle(current_theta, 0.3f, +1, feedrate);
-
-    // --- CIRCLE 2: CCW at rho=0.5 ---
-    ESP_LOGI(TAG, "Circle 2: CCW at rho=0.5");
-    pos.theta = current_theta;
-    pos.rho = 0.5f;
-    (void)g_motion_controller->move_to(pos, feedrate);
-    draw_circle(current_theta, 0.5f, +1, feedrate);
-
-    // --- CIRCLE 3: CCW at rho=0.7 ---
-    ESP_LOGI(TAG, "Circle 3: CCW at rho=0.7");
-    pos.theta = current_theta;
-    pos.rho = 0.7f;
-    (void)g_motion_controller->move_to(pos, feedrate);
-    draw_circle(current_theta, 0.7f, +1, feedrate);
-
-    // --- TRIANGLE 1: at rho=0.6 ---
-    ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "Triangle 1: at rho=0.6");
-    pos.theta = current_theta;
-    pos.rho = 0.6f;
-    (void)g_motion_controller->move_to(pos, feedrate);
-    draw_triangle(current_theta, 0.6f, feedrate);
-    current_theta += 2.0 * M_PI;  // Triangle completes a full rotation
-
-    // --- TRIANGLE 2: at rho=0.4 ---
-    ESP_LOGI(TAG, "Triangle 2: at rho=0.4");
-    pos.theta = current_theta;
-    pos.rho = 0.4f;
-    (void)g_motion_controller->move_to(pos, feedrate);
-    draw_triangle(current_theta, 0.4f, feedrate);
-    current_theta += 2.0 * M_PI;
-
-    // --- RETURN TO CENTER ---
-    ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "Returning to center");
-    pos.theta = current_theta;
-    pos.rho = 0.0f;
-    (void)g_motion_controller->move_to(pos, feedrate);
-
-    // --- FINAL STATUS ---
-    auto status = g_motion_controller->get_status();
-    ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "=== DEMO COMPLETE ===");
-    ESP_LOGI(TAG, "Final position: theta=%ld steps, rho=%ld steps",
-        status.theta.position_steps, status.rho.position_steps);
-    ESP_LOGI(TAG, "Polar: theta=%.4f rad, rho=%.4f",
-        status.position.theta, status.position.rho);
 }

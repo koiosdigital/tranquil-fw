@@ -201,8 +201,20 @@ namespace sand_table {
             return Result<void>::err(MotionError::InvalidState);
         }
 
-        // Calculate deltas in polar space (min-rotation for theta)
-        const double delta_theta = calculate_min_rotation(target.theta, current.theta);
+        // Calculate delta theta with direction preference
+        // - For multi-rotation moves (>= 2π), preserve full rotation count
+        // - For sub-rotation moves (< 2π), pick the shorter direction
+        const double raw_delta = target.theta - current.theta;
+        double delta_theta;
+        if (std::fabs(raw_delta) >= 2.0 * M_PI) {
+            // Multi-rotation: preserve full intent (e.g., 0 to 20π = 10 rotations)
+            delta_theta = raw_delta;
+        } else {
+            // Sub-rotation: pick shorter direction (e.g., 1.9π to 0.1π = +0.2π not -1.8π)
+            delta_theta = std::fmod(raw_delta, 2.0 * M_PI);
+            if (delta_theta > M_PI) delta_theta -= 2.0 * M_PI;
+            else if (delta_theta < -M_PI) delta_theta += 2.0 * M_PI;
+        }
         const double delta_rho = target.rho - current.rho;
 
         // Skip negligible moves
@@ -211,24 +223,47 @@ namespace sand_table {
             return Result<void>::ok();
         }
 
-        // Calculate distance for velocity planning
-        // Use arc length approximation: sqrt((rho * delta_theta)^2 + delta_rho^2)
-        // Use average rho for arc length calculation
+        // Estimate total motor steps to determine if segmentation is needed
+        // RMT driver has kMaxIntervalsPerSegment = 32768 limit
+        // Use 75% of limit to leave headroom for rho coupling and accumulator variance
+        constexpr double kStepsPerThetaRotation = 25760.0;  // 200 * 16 * 8.05 (default config)
+        constexpr uint32_t kMaxStepsPerSegment = 24576;     // 75% of 32768
+
+        const double theta_rotations = std::fabs(delta_theta) / (2.0 * M_PI);
+        const uint32_t estimated_theta_steps = static_cast<uint32_t>(
+            theta_rotations * kStepsPerThetaRotation);
+
+        // Calculate number of segments needed
+        const uint32_t num_segments = std::max<uint32_t>(
+            1u,
+            static_cast<uint32_t>(std::ceil(
+                static_cast<double>(estimated_theta_steps) / kMaxStepsPerSegment))
+        );
+
+        // Calculate per-segment deltas
+        const double theta_per_segment = delta_theta / num_segments;
+        const double rho_per_segment = delta_rho / num_segments;
+
+        // Calculate distance for velocity planning (arc length approximation)
         const double avg_rho = (current.rho + target.rho) / 2.0;
         const double arc_component = avg_rho * std::fabs(delta_theta);
-        const double distance = std::sqrt(arc_component * arc_component + delta_rho * delta_rho);
+        const double total_distance = std::sqrt(arc_component * arc_component + delta_rho * delta_rho);
+        const float dist_per_segment = static_cast<float>(
+            std::max(total_distance / num_segments, 0.001));
 
-        // Create single segment for the polar move
-        MotionSegment segment;
-        segment.delta_theta_rad = delta_theta;
-        segment.delta_rho_norm = delta_rho;
-        segment.distance = static_cast<float>(std::max(distance, 0.001));  // Ensure non-zero
-        segment.nominal_velocity = feedrate_rpm;
-        segment.delta_theta_steps = 0;  // Calculated later by transformer
-        segment.delta_rho_steps = 0;
+        // Emit segments
+        for (uint32_t i = 0; i < num_segments; ++i) {
+            MotionSegment segment;
+            segment.delta_theta_rad = theta_per_segment;
+            segment.delta_rho_norm = rho_per_segment;
+            segment.distance = dist_per_segment;
+            segment.nominal_velocity = feedrate_rpm;
+            segment.delta_theta_steps = 0;  // Calculated later by transformer
+            segment.delta_rho_steps = 0;
 
-        if (!callback_(segment)) {
-            return Result<void>::err(MotionError::QueueFull);
+            if (!callback_(segment)) {
+                return Result<void>::err(MotionError::QueueFull);
+            }
         }
 
         current_position_ = target;

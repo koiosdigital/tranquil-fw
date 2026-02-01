@@ -327,7 +327,7 @@ namespace sand_table {
         stepper_controller_->disable();
     }
 
-    Result<void> MotionController::home() {
+    Result<void> MotionController::home(bool force_full) {
         if (homing_controller_->is_homing()) {
             return Result<void>::err(MotionError::InvalidState);
         }
@@ -335,7 +335,7 @@ namespace sand_table {
         state_.store(SystemState::Homing, std::memory_order_release);
         enable_motors();
 
-        auto result = homing_controller_->home_all();
+        auto result = homing_controller_->home_all(force_full);
 
         if (result.is_ok()) {
             is_homed_.store(true, std::memory_order_release);
@@ -499,6 +499,13 @@ namespace sand_table {
             segment.delta_rho_steps
         );
 
+        // Track total steps queued for progress reporting
+        // Use the maximum of theta/rho steps (major axis determines segment duration)
+        uint32_t segment_steps = static_cast<uint32_t>(
+            std::max(std::abs(segment.delta_theta_steps), std::abs(segment.delta_rho_steps))
+        );
+        total_steps_queued_.fetch_add(segment_steps, std::memory_order_relaxed);
+
         // Push segment to velocity planner for lookahead processing
         // VelocityPlanner calculates entry/exit velocities based on motor directions
         while (velocity_planner_->full()) {
@@ -520,9 +527,21 @@ namespace sand_table {
     }
 
     Result<void> MotionController::execute_segment(const MotionSegment& segment) {
+        // Calculate segment step count (same logic as enqueue_segment)
+        uint32_t segment_steps = static_cast<uint32_t>(
+            std::max(std::abs(segment.delta_theta_steps), std::abs(segment.delta_rho_steps))
+        );
+
         // Segment already has entry/exit velocities from VelocityPlanner
         // Execute via stepper controller (this is blocking per-segment)
-        return stepper_controller_->execute_segment(segment);
+        auto result = stepper_controller_->execute_segment(segment);
+
+        if (result.is_ok()) {
+            // Track completed steps for progress reporting
+            total_steps_completed_.fetch_add(segment_steps, std::memory_order_relaxed);
+        }
+
+        return result;
     }
 
     RobotStatus MotionController::get_status() const {
@@ -548,6 +567,38 @@ namespace sand_table {
         }
 
         return status;
+    }
+
+    MotionController::MotionProgress MotionController::get_motion_progress() const {
+        MotionProgress progress;
+
+        progress.steps_queued = total_steps_queued_.load(std::memory_order_acquire);
+        progress.steps_completed = total_steps_completed_.load(std::memory_order_acquire);
+        progress.segments_queued = segment_queue_.size();
+
+        // Get current segment progress from stepper controller
+        if (stepper_controller_) {
+            auto seg_progress = stepper_controller_->get_segment_progress();
+            progress.current_segment_steps_total = seg_progress.steps_total;
+            progress.current_segment_steps_done = seg_progress.steps_done;
+            progress.is_executing = seg_progress.is_executing;
+
+            // Add current segment's in-progress steps to completed count
+            if (seg_progress.is_executing) {
+                progress.steps_completed += seg_progress.steps_done;
+            }
+        } else {
+            progress.current_segment_steps_total = 0;
+            progress.current_segment_steps_done = 0;
+            progress.is_executing = false;
+        }
+
+        return progress;
+    }
+
+    void MotionController::reset_progress_counters() {
+        total_steps_queued_.store(0, std::memory_order_release);
+        total_steps_completed_.store(0, std::memory_order_release);
     }
 
 } // namespace sand_table

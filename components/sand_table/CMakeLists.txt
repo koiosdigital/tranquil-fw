@@ -4,6 +4,7 @@ idf_component_register(
         "src/homing_controller.cpp"
         "src/motion_controller.cpp"
         "src/config_manager.cpp"
+        "src/console_commands.cpp"
     INCLUDE_DIRS
         "include"
     PRIV_INCLUDE_DIRS
@@ -17,4 +18,5 @@ idf_component_register(
         tmcstepper
         nvs_flash
         kd_common
+        console
 )

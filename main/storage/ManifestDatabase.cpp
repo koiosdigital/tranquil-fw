@@ -536,10 +536,12 @@ esp_err_t ManifestDatabase::deletePattern(const std::string& uuid) {
     });
 
     if (result == ESP_OK) {
-        // Delete pattern file (can run outside SQLite task)
+        // Delete pattern files (try both extensions since DB record is gone)
         char path[128];
         snprintf(path, sizeof(path), "/sd/patterns/%s.thr", uuid.c_str());
-        unlink(path);
+        unlink(path);  // Unencrypted
+        snprintf(path, sizeof(path), "/sd/patterns/%s.dat", uuid.c_str());
+        unlink(path);  // Encrypted
         ESP_LOGI(TAG, "Pattern deleted: %s", uuid.c_str());
     }
     return result;

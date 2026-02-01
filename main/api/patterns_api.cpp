@@ -10,10 +10,16 @@
 
 namespace {
 
+// Helper: get pattern file path with correct extension
+void getPatternFilePath(const std::string& uuid, bool encrypted, char* path, size_t path_size) {
+    const char* extension = encrypted ? "dat" : "thr";
+    snprintf(path, path_size, "/sd/patterns/%s.%s", uuid.c_str(), extension);
+}
+
 // Helper: get pattern file size on disk
-size_t getPatternFileSize(const std::string& uuid) {
+size_t getPatternFileSize(const std::string& uuid, bool encrypted) {
     char path[128];
-    snprintf(path, sizeof(path), "/sd/patterns/%s.thr", uuid.c_str());
+    getPatternFilePath(uuid, encrypted, path, sizeof(path));
     struct stat st;
     if (stat(path, &st) == 0) {
         return st.st_size;
@@ -67,7 +73,7 @@ static esp_err_t patterns_list_handler(httpd_req_t* req) {
     for (auto& pattern : result.items) {
         // Update size from disk if not set
         if (pattern.size_bytes == 0) {
-            pattern.size_bytes = getPatternFileSize(pattern.uuid);
+            pattern.size_bytes = getPatternFileSize(pattern.uuid, pattern.encrypted);
         }
         cJSON_AddItemToArray(patternsArray, ManifestDatabase::patternToJson(pattern));
     }
@@ -106,7 +112,7 @@ static esp_err_t patterns_detail_handler(httpd_req_t* req) {
 
     // Update size from disk if not set
     if (pattern->size_bytes == 0) {
-        pattern->size_bytes = getPatternFileSize(pattern->uuid);
+        pattern->size_bytes = getPatternFileSize(pattern->uuid, pattern->encrypted);
     }
 
     cJSON* json = ManifestDatabase::patternToJson(*pattern);
@@ -166,7 +172,7 @@ static esp_err_t patterns_create_handler(httpd_req_t* req) {
     }
 
     // Get file size if pattern file exists
-    pattern.size_bytes = getPatternFileSize(pattern.uuid);
+    pattern.size_bytes = getPatternFileSize(pattern.uuid, pattern.encrypted);
 
     if (ManifestDatabase::instance().addPattern(pattern) != ESP_OK) {
         httpd_resp_send_500(req);
