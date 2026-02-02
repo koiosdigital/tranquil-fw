@@ -2,7 +2,6 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include <cstring>
-#include <algorithm>
 
 static const char* TAG = "Framebuffer";
 
@@ -14,11 +13,9 @@ Framebuffer::Framebuffer() : buffer_(nullptr) {
     );
 
     if (buffer_ == nullptr) {
-        ESP_LOGE(TAG, "Failed to allocate %zu bytes in SPIRAM", size());
-        return;  // isValid() will return false
+        ESP_LOGE(TAG, "Failed to allocate SPIRAM");
+        return;
     }
-
-    ESP_LOGI(TAG, "Allocated %zu bytes in SPIRAM", size());
     clear();
 }
 
@@ -41,7 +38,6 @@ Framebuffer::~Framebuffer() {
     if (buffer_) {
         heap_caps_free(buffer_);
         buffer_ = nullptr;
-        ESP_LOGI(TAG, "Freed SPIRAM buffer");
     }
 }
 
@@ -51,45 +47,30 @@ void Framebuffer::clear() {
     }
 }
 
-void Framebuffer::setPixel(int x, int y, uint8_t value) {
+void Framebuffer::setPixel(int x, int y) {
     if (x < 0 || x >= CANVAS_SIZE || y < 0 || y >= CANVAS_SIZE) {
         return;
     }
-    buffer_[y * CANVAS_SIZE + x] = value;
+    // MSB first: bit 7 = leftmost pixel
+    size_t byte_idx = y * ROW_BYTES + (x >> 3);
+    uint8_t bit_mask = 0x80 >> (x & 7);
+    buffer_[byte_idx] |= bit_mask;
 }
 
-void Framebuffer::setPixelBlend(int x, int y, uint8_t value, float alpha) {
+bool Framebuffer::getPixel(int x, int y) const {
     if (x < 0 || x >= CANVAS_SIZE || y < 0 || y >= CANVAS_SIZE) {
-        return;
+        return false;
     }
-
-    uint8_t* pixel = &buffer_[y * CANVAS_SIZE + x];
-    // Additive blending (white lines accumulate)
-    float existing = static_cast<float>(*pixel) / 255.0f;
-    float addition = (static_cast<float>(value) / 255.0f) * alpha;
-    float blended = std::min(1.0f, existing + addition);
-    *pixel = static_cast<uint8_t>(blended * 255.0f);
-}
-
-uint8_t Framebuffer::getPixel(int x, int y) const {
-    if (x < 0 || x >= CANVAS_SIZE || y < 0 || y >= CANVAS_SIZE) {
-        return 0;
-    }
-    return buffer_[y * CANVAS_SIZE + x];
+    size_t byte_idx = y * ROW_BYTES + (x >> 3);
+    uint8_t bit_mask = 0x80 >> (x & 7);
+    return (buffer_[byte_idx] & bit_mask) != 0;
 }
 
 const uint8_t* Framebuffer::row(uint16_t y) const {
     if (y >= CANVAS_SIZE || !buffer_) {
         return nullptr;
     }
-    return &buffer_[y * CANVAS_SIZE];
-}
-
-uint8_t* Framebuffer::row(uint16_t y) {
-    if (y >= CANVAS_SIZE || !buffer_) {
-        return nullptr;
-    }
-    return &buffer_[y * CANVAS_SIZE];
+    return &buffer_[y * ROW_BYTES];
 }
 
 } // namespace thumbnail

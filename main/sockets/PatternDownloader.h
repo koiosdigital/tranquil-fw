@@ -71,7 +71,7 @@ public:
      * Validates the response, checks license, and enqueues a download job.
      */
     DownloadResult queueDownload(const Kd__V1__PatternDownloadResponse* response,
-                                  DownloadCallback callback = nullptr);
+        DownloadCallback callback = nullptr);
 
     /**
      * @brief Queue a pattern by UUID (requests info from cloud first)
@@ -79,7 +79,7 @@ public:
      * Sends a RequestPatternDownload message and queues when response arrives.
      */
     DownloadResult queueDownloadByUuid(const std::string& pattern_uuid,
-                                        DownloadCallback callback = nullptr);
+        DownloadCallback callback = nullptr);
 
     /**
      * @brief Cancel a pending download job

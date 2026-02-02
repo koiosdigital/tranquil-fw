@@ -8,151 +8,151 @@
 extern "C" {
 #endif
 
-/**
- * @brief License file magic number "KDLC"
- */
+    /**
+     * @brief License file magic number "KDLC"
+     */
 #define DRM_LICENSE_MAGIC 0x4B444C43
 
-/**
- * @brief License file format version
- */
+     /**
+      * @brief License file format version
+      */
 #define DRM_LICENSE_VERSION 0x0001
 
-/**
- * @brief License file path on SD card
- */
-#define DRM_LICENSE_PATH "/sd/license.dat"
+      /**
+       * @brief License file path on SD card
+       */
+#define DRM_LICENSE_PATH "/sd/global_lic.licdat"
 
-/**
- * @brief Maximum size for store token (JWT)
- */
+       /**
+        * @brief Maximum size for store token (JWT)
+        */
 #define DRM_STORE_TOKEN_MAX_SIZE 384
 
-/**
- * @brief License validation result
- */
-typedef enum {
-    DRM_LICENSE_VALID = 0,
-    DRM_LICENSE_NOT_FOUND,
-    DRM_LICENSE_INVALID_FORMAT,
-    DRM_LICENSE_SIGNATURE_INVALID,
-    DRM_LICENSE_EXPIRED,
-    DRM_LICENSE_NOT_YET_VALID,
-    DRM_LICENSE_DEVICE_MISMATCH,
-    DRM_LICENSE_PATTERN_LIMIT_REACHED,
-} drm_license_status_t;
+        /**
+         * @brief License validation result
+         */
+    typedef enum {
+        DRM_LICENSE_VALID = 0,
+        DRM_LICENSE_NOT_FOUND,
+        DRM_LICENSE_INVALID_FORMAT,
+        DRM_LICENSE_SIGNATURE_INVALID,
+        DRM_LICENSE_EXPIRED,
+        DRM_LICENSE_NOT_YET_VALID,
+        DRM_LICENSE_DEVICE_MISMATCH,
+        DRM_LICENSE_PATTERN_LIMIT_REACHED,
+    } drm_license_status_t;
 
-/**
- * @brief License information (decoded from file)
- */
-typedef struct {
-    char for_device[128];       // Device CN
-    uint32_t max_patterns;      // Maximum patterns allowed
-    int64_t valid_from;         // Unix timestamp UTC
-    int64_t valid_to;           // Unix timestamp UTC
-    char license_id[64];        // Unique license ID
-    int64_t issued_at;          // Issue timestamp
-    char store_token[DRM_STORE_TOKEN_MAX_SIZE + 1];  // JWT store token
-} drm_license_info_t;
+    /**
+     * @brief License information (decoded from file)
+     */
+    typedef struct {
+        char for_device[128];       // Device CN
+        uint32_t max_patterns;      // Maximum patterns allowed
+        int64_t valid_from;         // Unix timestamp UTC
+        int64_t valid_to;           // Unix timestamp UTC
+        char license_id[64];        // Unique license ID
+        int64_t issued_at;          // Issue timestamp
+        char store_token[DRM_STORE_TOKEN_MAX_SIZE + 1];  // JWT store token
+    } drm_license_info_t;
 
-/**
- * @brief Initialize the license manager
- *
- * Loads and validates the license file from SD card.
- * Should be called during system startup.
- *
- * @return ESP_OK if license loaded (may be invalid), error code on I/O failure
- */
-esp_err_t drm_license_init(void);
+    /**
+     * @brief Initialize the license manager
+     *
+     * Loads and validates the license file from SD card.
+     * Should be called during system startup.
+     *
+     * @return ESP_OK if license loaded (may be invalid), error code on I/O failure
+     */
+    esp_err_t drm_license_init(void);
 
-/**
- * @brief Check if a valid license is loaded
- *
- * @return true if license is valid and not expired
- */
-bool drm_license_is_valid(void);
+    /**
+     * @brief Check if a valid license is loaded
+     *
+     * @return true if license is valid and not expired
+     */
+    bool drm_license_is_valid(void);
 
-/**
- * @brief Get detailed license validation status
- *
- * @return Status code indicating why license is valid/invalid
- */
-drm_license_status_t drm_license_get_status(void);
+    /**
+     * @brief Get detailed license validation status
+     *
+     * @return Status code indicating why license is valid/invalid
+     */
+    drm_license_status_t drm_license_get_status(void);
 
-/**
- * @brief Get maximum patterns allowed by license
- *
- * @return Maximum pattern count, or 0 if no valid license
- */
-uint32_t drm_license_get_max_patterns(void);
+    /**
+     * @brief Get maximum patterns allowed by license
+     *
+     * @return Maximum pattern count, or 0 if no valid license
+     */
+    uint32_t drm_license_get_max_patterns(void);
 
-/**
- * @brief Check if device can download another pattern
- *
- * Checks current pattern count against license limit.
- *
- * @return true if download is allowed
- */
-bool drm_license_can_download(void);
+    /**
+     * @brief Check if device can download another pattern
+     *
+     * Checks current pattern count against license limit.
+     *
+     * @return true if download is allowed
+     */
+    bool drm_license_can_download(void);
 
-/**
- * @brief Get license information
- *
- * @param info Output structure for license info (may be NULL to check if loaded)
- * @return ESP_OK if license info available, ESP_ERR_NOT_FOUND if no license
- */
-esp_err_t drm_license_get_info(drm_license_info_t* info);
+    /**
+     * @brief Get license information
+     *
+     * @param info Output structure for license info (may be NULL to check if loaded)
+     * @return ESP_OK if license info available, ESP_ERR_NOT_FOUND if no license
+     */
+    esp_err_t drm_license_get_info(drm_license_info_t* info);
 
-/**
- * @brief Save a new license to SD card
- *
- * @param payload Serialized LicensePayload protobuf
- * @param payload_len Length of payload
- * @param signature Server RSA signature over payload
- * @param signature_len Length of signature
- * @return ESP_OK on success, error code on failure
- */
-esp_err_t drm_license_save(const uint8_t* payload, size_t payload_len,
-                           const uint8_t* signature, size_t signature_len);
+    /**
+     * @brief Save a new license to SD card
+     *
+     * @param payload Serialized LicensePayload protobuf
+     * @param payload_len Length of payload
+     * @param signature Server RSA signature over payload
+     * @param signature_len Length of signature
+     * @return ESP_OK on success, error code on failure
+     */
+    esp_err_t drm_license_save(const uint8_t* payload, size_t payload_len,
+        const uint8_t* signature, size_t signature_len);
 
-/**
- * @brief Verify signature over license payload
- *
- * Uses pinned server public key to verify RSA signature.
- *
- * @param payload License payload data
- * @param payload_len Length of payload
- * @param signature RSA signature
- * @param signature_len Length of signature
- * @return ESP_OK if signature valid, ESP_ERR_INVALID_ARG if invalid
- */
-esp_err_t drm_license_verify_signature(const uint8_t* payload, size_t payload_len,
-                                       const uint8_t* signature, size_t signature_len);
+    /**
+     * @brief Verify signature over license payload
+     *
+     * Uses pinned server public key to verify RSA signature.
+     *
+     * @param payload License payload data
+     * @param payload_len Length of payload
+     * @param signature RSA signature
+     * @param signature_len Length of signature
+     * @return ESP_OK if signature valid, ESP_ERR_INVALID_ARG if invalid
+     */
+    esp_err_t drm_license_verify_signature(const uint8_t* payload, size_t payload_len,
+        const uint8_t* signature, size_t signature_len);
 
-/**
- * @brief Reload license from SD card
- *
- * Re-reads and validates the license file.
- *
- * @return ESP_OK on success
- */
-esp_err_t drm_license_reload(void);
+    /**
+     * @brief Reload license from SD card
+     *
+     * Re-reads and validates the license file.
+     *
+     * @return ESP_OK on success
+     */
+    esp_err_t drm_license_reload(void);
 
-/**
- * @brief Get the current store token from license
- *
- * @param token Output buffer for token (must be at least DRM_STORE_TOKEN_MAX_SIZE+1 bytes)
- * @param token_len Output length of token (may be NULL)
- * @return ESP_OK if token available, ESP_ERR_NOT_FOUND if no token in license
- */
-esp_err_t drm_license_get_store_token(char* token, size_t* token_len);
+    /**
+     * @brief Get the current store token from license
+     *
+     * @param token Output buffer for token (must be at least DRM_STORE_TOKEN_MAX_SIZE+1 bytes)
+     * @param token_len Output length of token (may be NULL)
+     * @return ESP_OK if token available, ESP_ERR_NOT_FOUND if no token in license
+     */
+    esp_err_t drm_license_get_store_token(char* token, size_t* token_len);
 
-/**
- * @brief Check if a valid store token is available in the license
- *
- * @return true if store token exists and license is valid
- */
-bool drm_license_has_store_token(void);
+    /**
+     * @brief Check if a valid store token is available in the license
+     *
+     * @return true if store token exists and license is valid
+     */
+    bool drm_license_has_store_token(void);
 
 #ifdef __cplusplus
 }

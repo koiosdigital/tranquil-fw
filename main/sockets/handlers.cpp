@@ -235,7 +235,8 @@ namespace {
                     ManifestDatabase::instance().updatePattern(bundle->pattern_uuid, updated);
                     ESP_LOGD(TAG, "Updated manifest for pattern: %s", bundle->pattern_uuid);
                 }
-            } else {
+            }
+            else {
                 ESP_LOGW(TAG, "Failed to save receipt for %s: %s",
                     bundle->pattern_uuid, esp_err_to_name(err));
                 failed++;

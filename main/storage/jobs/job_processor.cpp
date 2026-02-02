@@ -30,7 +30,7 @@ public:
 
     static void processorTaskFunction(void* param) {
         auto* impl = static_cast<Impl*>(param);
-        ESP_LOGI(TAG, "Processor task started");
+        ESP_LOGD(TAG, "Processor task started");
 
         while (impl->running) {
             // Wait for trigger or timeout
@@ -41,7 +41,7 @@ public:
             impl->processJobs();
         }
 
-        ESP_LOGI(TAG, "Processor task exiting");
+        ESP_LOGD(TAG, "Processor task exiting");
         vTaskDelete(nullptr);
     }
 
@@ -85,7 +85,7 @@ public:
     static void workerTaskFunction(void* param) {
         auto* ctx = static_cast<WorkerContext*>(param);
 
-        ESP_LOGI(TAG, "Worker started for job: %s (type=%s)",
+        ESP_LOGD(TAG, "Worker started for job: %s (type=%s)",
             ctx->job.uuid.c_str(), jobTypeToString(ctx->job.type));
 
         // Execute the job
@@ -94,7 +94,7 @@ public:
         // Update job status
         if (result.success) {
             JobQueue::instance().markCompleted(ctx->job.uuid);
-            ESP_LOGI(TAG, "Job completed successfully: %s", ctx->job.uuid.c_str());
+            ESP_LOGD(TAG, "Job completed: %s", ctx->job.uuid.c_str());
         } else {
             JobQueue::instance().markFailed(ctx->job.uuid, result.error);
             ESP_LOGW(TAG, "Job failed: %s - %s", ctx->job.uuid.c_str(), result.error.c_str());
@@ -157,8 +157,7 @@ esp_err_t JobProcessor::init(std::unordered_map<JobType, std::unique_ptr<IJobExe
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "JobProcessor started (max_concurrent=%zu, poll_interval=%lums)",
-        config.max_concurrent, (unsigned long)config.poll_interval_ms);
+    ESP_LOGD(TAG, "JobProcessor started");
     return ESP_OK;
 }
 
@@ -186,7 +185,7 @@ void JobProcessor::stop() {
     }
 
     impl_->processorTask = nullptr;
-    ESP_LOGI(TAG, "JobProcessor stopped");
+    ESP_LOGD(TAG, "JobProcessor stopped");
 }
 
 bool JobProcessor::isRunning() const {

@@ -58,7 +58,7 @@ static bool verify_device_binding(const char* for_device) {
     if (mbedtls_x509_crt_parse(&crt, reinterpret_cast<const unsigned char*>(cert_pem),
         cert_len + 1) == 0) {
         // Extract CN from subject
-        char cn[128] = {0};
+        char cn[128] = { 0 };
         int cn_ret = mbedtls_x509_dn_gets(cn, sizeof(cn), &crt.subject);
         if (cn_ret > 0) {
             // The CN format is: CN=TRANQUIL-XXXXX.iotdevices.koiosdigital.net
@@ -220,8 +220,8 @@ cleanup:
 }
 
 esp_err_t drm_purchase_save(const char* pattern_uuid,
-                            const uint8_t* payload, size_t payload_len,
-                            const uint8_t* signature, size_t signature_len) {
+    const uint8_t* payload, size_t payload_len,
+    const uint8_t* signature, size_t signature_len) {
     if (!pattern_uuid || !payload || !signature) {
         return ESP_ERR_INVALID_ARG;
     }

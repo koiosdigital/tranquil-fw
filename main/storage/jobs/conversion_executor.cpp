@@ -71,8 +71,7 @@ JobResult ConversionExecutor::execute(const Job& job) {
     // Success - delete temp file
     unlink(data.temp_path.c_str());
 
-    ESP_LOGI(TAG, "Conversion complete: %s (%zu points, %zu bytes)",
-        job.pattern_uuid.c_str(), point_count, file_size);
+    ESP_LOGD(TAG, "Conversion complete: %s (%zu points)", job.pattern_uuid.c_str(), point_count);
 
     // Enqueue thumbnail generation job
     ThumbnailJobData thumb_data;

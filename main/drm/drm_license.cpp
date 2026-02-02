@@ -308,7 +308,7 @@ static esp_err_t load_license_file(void) {
     // Allocate and read payload (use SPIRAM - persistent, cold path)
     license_state.payload = static_cast<uint8_t*>(
         heap_caps_malloc(header.payload_len, MALLOC_CAP_SPIRAM)
-    );
+        );
     if (license_state.payload == nullptr) {
         fclose(f);
         license_state.loaded = false;
@@ -327,7 +327,7 @@ static esp_err_t load_license_file(void) {
     // Allocate and read signature (use SPIRAM - persistent, cold path)
     license_state.signature = static_cast<uint8_t*>(
         heap_caps_malloc(header.signature_len, MALLOC_CAP_SPIRAM)
-    );
+        );
     if (license_state.signature == nullptr) {
         free_license_data();
         fclose(f);

@@ -1,7 +1,7 @@
 #include "bezier_renderer.h"
-#include <cmath>
 #include <algorithm>
-#include <utility>
+#include <cmath>
+#include <cstdlib>
 
 namespace thumbnail {
 
@@ -158,73 +158,32 @@ float BezierRenderer::flatness(const CartesianPoint& p0,
 }
 
 void BezierRenderer::drawLine(const CartesianPoint& from, const CartesianPoint& to) {
-    // Wu's anti-aliased line algorithm with 0.75px width
-    float x0 = from.x, y0 = from.y;
-    float x1 = to.x, y1 = to.y;
+    // Bresenham's line algorithm
+    int x0 = static_cast<int>(from.x + 0.5f);
+    int y0 = static_cast<int>(from.y + 0.5f);
+    int x1 = static_cast<int>(to.x + 0.5f);
+    int y1 = static_cast<int>(to.y + 0.5f);
 
-    bool steep = std::abs(y1 - y0) > std::abs(x1 - x0);
+    int dx = std::abs(x1 - x0);
+    int dy = -std::abs(y1 - y0);
+    int sx = x0 < x1 ? 1 : -1;
+    int sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
 
-    if (steep) {
-        std::swap(x0, y0);
-        std::swap(x1, y1);
-    }
+    while (true) {
+        framebuffer_.setPixel(x0, y0);
 
-    if (x0 > x1) {
-        std::swap(x0, x1);
-        std::swap(y0, y1);
-    }
+        if (x0 == x1 && y0 == y1) break;
 
-    float dx = x1 - x0;
-    float dy = y1 - y0;
-    float gradient = (dx < 0.0001f) ? 1.0f : dy / dx;
-
-    // Line width factor (0.75px means reduced intensity)
-    constexpr float LINE_WIDTH_FACTOR = LINE_WIDTH;
-
-    // Lambda to set pixel based on steep flag
-    auto plot = [this, steep](int x, int y, float brightness) {
-        if (steep) {
-            framebuffer_.setPixelBlend(y, x, 255, brightness);
-        } else {
-            framebuffer_.setPixelBlend(x, y, 255, brightness);
+        int e2 = 2 * err;
+        if (e2 >= dy) {
+            err += dy;
+            x0 += sx;
         }
-    };
-
-    // Helper for fractional part
-    auto fpart = [](float x) -> float { return x - std::floor(x); };
-    auto rfpart = [&fpart](float x) -> float { return 1.0f - fpart(x); };
-
-    // First endpoint
-    float xend = std::round(x0);
-    float yend = y0 + gradient * (xend - x0);
-    float xgap = rfpart(x0 + 0.5f) * LINE_WIDTH_FACTOR;
-    int xpxl1 = static_cast<int>(xend);
-    int ypxl1 = static_cast<int>(std::floor(yend));
-
-    plot(xpxl1, ypxl1, rfpart(yend) * xgap);
-    plot(xpxl1, ypxl1 + 1, fpart(yend) * xgap);
-
-    float intery = yend + gradient;
-
-    // Second endpoint
-    xend = std::round(x1);
-    yend = y1 + gradient * (xend - x1);
-    xgap = fpart(x1 + 0.5f) * LINE_WIDTH_FACTOR;
-    int xpxl2 = static_cast<int>(xend);
-    int ypxl2 = static_cast<int>(std::floor(yend));
-
-    plot(xpxl2, ypxl2, rfpart(yend) * xgap);
-    plot(xpxl2, ypxl2 + 1, fpart(yend) * xgap);
-
-    // Main loop
-    for (int x = xpxl1 + 1; x < xpxl2; ++x) {
-        int y = static_cast<int>(std::floor(intery));
-        float frac = fpart(intery);
-
-        plot(x, y, rfpart(intery) * LINE_WIDTH_FACTOR);
-        plot(x, y + 1, frac * LINE_WIDTH_FACTOR);
-
-        intery += gradient;
+        if (e2 <= dx) {
+            err += dx;
+            y0 += sy;
+        }
     }
 }
 

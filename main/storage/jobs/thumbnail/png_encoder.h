@@ -6,14 +6,15 @@
 namespace thumbnail {
 
 /**
- * @brief PNG encoder using libpng
+ * @brief PNG encoder using spng (lightweight alternative to libpng)
  *
- * Encodes grayscale framebuffer to PNG file.
+ * Encodes 1-bit framebuffer to PNG file.
  *
  * Output PNG:
- *   - 600x600 pixels
- *   - 8-bit grayscale
+ *   - 1024x1024 pixels
+ *   - 1-bit grayscale (black/white)
  *   - No interlacing
+ *   - Transparent black background
  */
 class PngEncoder {
 public:
@@ -32,7 +33,7 @@ public:
      * @param buffer_size Buffer capacity
      * @param bytes_written Actual bytes written
      *
-     * Recommend allocating at least 100KB for safety.
+     * 1-bit PNGs compress well - 32KB should be sufficient.
      */
     static ThumbnailError encodeToMemory(const Framebuffer& fb,
                                          uint8_t* output_buffer,

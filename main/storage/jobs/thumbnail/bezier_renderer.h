@@ -49,7 +49,7 @@ public:
 
 private:
     /**
-     * Draw anti-aliased line using Wu's algorithm with 0.75px width.
+     * Draw line using Bresenham's algorithm.
      */
     void drawLine(const CartesianPoint& from, const CartesianPoint& to);
 

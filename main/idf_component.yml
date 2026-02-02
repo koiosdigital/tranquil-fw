@@ -5,4 +5,4 @@ dependencies:
     version: ">=5.5.2"
   espressif/mdns: ^1.9.1
   espressif/esp_websocket_client: ^1.6.1
-  espressif/libpng: ^1.6.43
+  # libpng replaced with local spng component (smaller, simpler)

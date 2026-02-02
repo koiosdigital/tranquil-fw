@@ -20,7 +20,7 @@ message(STATUS ${NESTED_SRC})
 idf_component_register(
     SRCS ${NESTED_SRC}
     INCLUDE_DIRS ${INCLUDE_DIRS}
-    PRIV_REQUIRES lwip esp_wifi heap bootloader_support kd_common wifi_provisioning mbedtls esp_http_server kd_pixdriver stusb4500 sand_table tranquil-app vfs json esp_driver_sdmmc fatfs esp32-idf-sqlite3 esp_websocket_client
+    PRIV_REQUIRES lwip esp_wifi heap bootloader_support kd_common wifi_provisioning mbedtls esp_http_server kd_pixdriver stusb4500 sand_table tranquil-app vfs json esp_driver_sdmmc fatfs esp32-idf-sqlite3 esp_websocket_client spng
 )
 
 idf_build_set_property(COMPILE_OPTIONS "-Wno-missing-field-initializers" APPEND)

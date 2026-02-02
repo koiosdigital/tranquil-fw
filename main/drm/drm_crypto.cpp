@@ -22,10 +22,10 @@ static const uint8_t OAEP_LHASH_SHA256[32] = {
 };
 
 void drm_mgf1_sha256(const uint8_t* seed, size_t seed_len,
-                     uint8_t* mask, size_t mask_len) {
+    uint8_t* mask, size_t mask_len) {
     // MGF1 with SHA-256: mask = H(seed || counter_0) || H(seed || counter_1) || ...
     uint8_t hash[32];
-    uint8_t counter[4] = {0, 0, 0, 0};
+    uint8_t counter[4] = { 0, 0, 0, 0 };
     size_t offset = 0;
 
     while (offset < mask_len) {
@@ -55,14 +55,14 @@ void drm_mgf1_sha256(const uint8_t* seed, size_t seed_len,
 }
 
 esp_err_t drm_remove_oaep_sha256(const uint8_t* decrypted, size_t decrypted_len,
-                                  uint8_t* output, size_t* output_len) {
+    uint8_t* output, size_t* output_len) {
     // For RSA-4096: decrypted_len = 512 bytes
     // OAEP structure: EM = 0x00 || maskedSeed (32) || maskedDB (479)
     // Total = 1 + 32 + 479 = 512 bytes
 
     if (decrypted_len != DRM_RSA_KEY_BYTES) {
         ESP_LOGE(TAG, "OAEP: Invalid decrypted length %zu (expected %d)",
-                 decrypted_len, DRM_RSA_KEY_BYTES);
+            decrypted_len, DRM_RSA_KEY_BYTES);
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -80,10 +80,10 @@ esp_err_t drm_remove_oaep_sha256(const uint8_t* decrypted, size_t decrypted_len,
 
     // Use stack buffers for OAEP working arrays (small, cold-path)
     constexpr size_t MAX_DB_LEN = DRM_RSA_KEY_BYTES - 1 - DRM_SHA256_BYTES;  // 479 for RSA-4096
-    uint8_t seed_mask[hash_len] = {0};
-    uint8_t seed[hash_len] = {0};
-    uint8_t db_mask[MAX_DB_LEN] = {0};
-    uint8_t db[MAX_DB_LEN] = {0};
+    uint8_t seed_mask[hash_len] = { 0 };
+    uint8_t seed[hash_len] = { 0 };
+    uint8_t db_mask[MAX_DB_LEN] = { 0 };
+    uint8_t db[MAX_DB_LEN] = { 0 };
 
     esp_err_t ret = ESP_OK;
 
@@ -118,7 +118,8 @@ esp_err_t drm_remove_oaep_sha256(const uint8_t* decrypted, size_t decrypted_len,
             if (db[i] == 0x01) {
                 msg_start = i + 1;
                 break;
-            } else if (db[i] != 0x00) {
+            }
+            else if (db[i] != 0x00) {
                 ESP_LOGE(TAG, "OAEP: Invalid padding byte 0x%02x at position %zu", db[i], i);
                 ret = ESP_ERR_INVALID_ARG;
                 goto cleanup;
@@ -163,7 +164,7 @@ esp_err_t drm_rsa_decrypt(const uint8_t* ciphertext, uint8_t* plaintext) {
     size_t rsa_bytes = ds_ctx->rsa_length_bits / 8;
     if (rsa_bytes != DRM_RSA_KEY_BYTES) {
         ESP_LOGE(TAG, "Unexpected RSA key size: %zu bits (expected %d)",
-                 ds_ctx->rsa_length_bits, DRM_RSA_KEY_BYTES * 8);
+            ds_ctx->rsa_length_bits, DRM_RSA_KEY_BYTES * 8);
         free(ds_ctx->esp_ds_data);
         free(ds_ctx);
         return ESP_ERR_INVALID_ARG;
@@ -220,7 +221,7 @@ cleanup:
 
 esp_err_t drm_recover_aes_key(const uint8_t* encrypted_key, uint8_t aes_key[DRM_AES_KEY_BYTES]) {
     // Step 1: RSA decrypt the encrypted key (use stack buffer - 512 bytes, cold path)
-    uint8_t decrypted[DRM_RSA_KEY_BYTES] = {0};
+    uint8_t decrypted[DRM_RSA_KEY_BYTES] = { 0 };
 
     esp_err_t ret = drm_rsa_decrypt(encrypted_key, decrypted);
     if (ret != ESP_OK) {
@@ -243,7 +244,7 @@ esp_err_t drm_recover_aes_key(const uint8_t* encrypted_key, uint8_t aes_key[DRM_
 
     if (key_len != DRM_AES_KEY_BYTES) {
         ESP_LOGE(TAG, "Unexpected key length after OAEP: %zu (expected %d)",
-                 key_len, DRM_AES_KEY_BYTES);
+            key_len, DRM_AES_KEY_BYTES);
         mbedtls_platform_zeroize(aes_key, DRM_AES_KEY_BYTES);
         return ESP_ERR_INVALID_SIZE;
     }

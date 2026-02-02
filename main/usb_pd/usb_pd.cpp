@@ -83,7 +83,8 @@ esp_err_t UsbPdController::configure_pdos(const UsbPdConfig& config) {
         (void)stusb_.write_nvm();
 
         ESP_LOGI(TAG, "NVM updated: %d PDOs configured", config.pdo_count);
-    } else {
+    }
+    else {
         ESP_LOGI(TAG, "NVM configuration already matches desired settings");
     }
 
@@ -100,7 +101,7 @@ void stusb_init() {
     auto& controller = UsbPdController::instance();
     if (!controller.is_initialized()) {
         ESP_LOGE(TAG, "USB-PD initialization failed: %s",
-                 esp_err_to_name(controller.get_last_error()));
+            esp_err_to_name(controller.get_last_error()));
         esp_restart();
     }
 }

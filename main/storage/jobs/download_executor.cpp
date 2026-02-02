@@ -126,10 +126,10 @@ JobResult DownloadExecutor::execute(const Job& job) {
 
 JobResult DownloadExecutor::performDownload(const std::string& pattern_uuid,
                                              const DownloadJobData& data) {
-    ESP_LOGI(TAG, "Starting download: %s", pattern_uuid.c_str());
-    ESP_LOGI(TAG, "  URL: %s", data.download_url.c_str());
-    ESP_LOGI(TAG, "  Encrypted: %s", data.encrypted ? "yes" : "no");
-    ESP_LOGI(TAG, "  Purchased: %s", data.hasPurchaseReceipt() ? "yes" : "no");
+    ESP_LOGD(TAG, "Starting download: %s", pattern_uuid.c_str());
+    ESP_LOGD(TAG, "  URL: %s", data.download_url.c_str());
+    ESP_LOGD(TAG, "  Encrypted: %s", data.encrypted ? "yes" : "no");
+    ESP_LOGD(TAG, "  Purchased: %s", data.hasPurchaseReceipt() ? "yes" : "no");
 
     // For subscription patterns (no receipt), check license validity and limits
     // For purchased patterns (has receipt), we can download without a valid subscription
@@ -225,7 +225,7 @@ JobResult DownloadExecutor::performDownload(const std::string& pattern_uuid,
     }
 
     file.close();
-    ESP_LOGI(TAG, "Downloaded %zu bytes", ctx.bytes_written);
+    ESP_LOGD(TAG, "Downloaded %zu bytes", ctx.bytes_written);
 
     // Build pattern info for database
     Pattern pattern_info;
@@ -275,7 +275,7 @@ JobResult DownloadExecutor::performDownload(const std::string& pattern_uuid,
             payload.data(), payload_len, signature.data(), sig_len);
 
         if (save_err == ESP_OK) {
-            ESP_LOGI(TAG, "Saved purchase receipt for pattern: %s", pattern_uuid.c_str());
+            ESP_LOGD(TAG, "Saved purchase receipt for pattern: %s", pattern_uuid.c_str());
             pattern_info.purchased = true;
 
             // Try to get purchase info for the timestamp and receipt_id
@@ -303,7 +303,7 @@ JobResult DownloadExecutor::performDownload(const std::string& pattern_uuid,
     thumb_data.output_path = "/sd/previews/" + pattern_uuid + ".png";
     JobQueue::instance().enqueueThumbnail(pattern_uuid, thumb_data, -1);
 
-    ESP_LOGI(TAG, "Download complete: %s -> %s", pattern_uuid.c_str(), file_path);
+    ESP_LOGD(TAG, "Download complete: %s -> %s", pattern_uuid.c_str(), file_path);
     return JobResult::ok();
 }
 

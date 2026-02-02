@@ -10,7 +10,7 @@ struct UsbPdConfig {
         float current;
     };
 
-    Pdo pdos[3] = {{5.0f, 3.0f}, {15.0f, 3.0f}, {20.0f, 5.0f}};
+    Pdo pdos[3] = { {5.0f, 3.0f}, {15.0f, 3.0f}, {20.0f, 5.0f} };
     uint8_t pdo_count = 3;
     bool usb_comm_capable = true;
     bool external_power = true;

@@ -6,64 +6,42 @@
 
 namespace thumbnail {
 
+// Bytes per row (8 pixels per byte, MSB first)
+static constexpr size_t ROW_BYTES = CANVAS_SIZE / 8;
+
 /**
- * @brief RAII wrapper for SPIRAM-allocated framebuffer
+ * @brief RAII wrapper for SPIRAM-allocated 1-bit framebuffer
  *
  * Memory layout:
- *   - Row-major order (pixels stored left-to-right, top-to-bottom)
- *   - Single byte per pixel (grayscale, 0=black, 255=white)
- *   - Total size: 600 * 600 = 360,000 bytes
+ *   - Row-major order, 1 bit per pixel (8 pixels per byte)
+ *   - MSB first (bit 7 = leftmost pixel in byte)
+ *   - Total size: 1024 * 1024 / 8 = 131,072 bytes (128KB)
  *
  * Initialized to black (0x00).
  */
 class Framebuffer {
 public:
-    /**
-     * Allocate framebuffer in SPIRAM.
-     * Check isValid() after construction to verify allocation succeeded.
-     */
     Framebuffer();
-
-    /**
-     * Move constructor (transfers ownership).
-     */
     Framebuffer(Framebuffer&& other) noexcept;
-
-    /**
-     * Move assignment operator.
-     */
     Framebuffer& operator=(Framebuffer&& other) noexcept;
-
-    /**
-     * Destructor - frees SPIRAM.
-     */
     ~Framebuffer();
 
-    // Disable copy (large buffer should not be copied)
+    // Disable copy
     Framebuffer(const Framebuffer&) = delete;
     Framebuffer& operator=(const Framebuffer&) = delete;
 
-    /**
-     * Clear framebuffer to black (0x00).
-     */
     void clear();
 
     /**
-     * Set pixel value with bounds checking.
+     * Set pixel (1 = white, 0 = black).
      * Out-of-bounds writes are silently ignored.
      */
-    void setPixel(int x, int y, uint8_t value);
+    void setPixel(int x, int y);
 
     /**
-     * Set pixel with alpha blending (for anti-aliasing).
-     * Uses additive blending for accumulating line intensity.
+     * Get pixel value. Returns false for out-of-bounds.
      */
-    void setPixelBlend(int x, int y, uint8_t value, float alpha);
-
-    /**
-     * Get pixel value. Returns 0 for out-of-bounds.
-     */
-    uint8_t getPixel(int x, int y) const;
+    bool getPixel(int x, int y) const;
 
     /**
      * Raw buffer access for PNG encoding.
@@ -72,21 +50,17 @@ public:
     uint8_t* data() { return buffer_; }
 
     /**
-     * Get pointer to specific row.
+     * Get pointer to specific row (ROW_BYTES per row).
      */
     const uint8_t* row(uint16_t y) const;
-    uint8_t* row(uint16_t y);
 
-    /**
-     * Check if buffer is valid/allocated.
-     */
     bool isValid() const { return buffer_ != nullptr; }
 
     /**
      * Buffer size in bytes.
      */
     static constexpr size_t size() {
-        return static_cast<size_t>(CANVAS_SIZE) * CANVAS_SIZE;
+        return static_cast<size_t>(CANVAS_SIZE) * ROW_BYTES;
     }
 
 private:

@@ -5,11 +5,8 @@
 
 namespace thumbnail {
 
-// Thumbnail canvas size
-static constexpr uint16_t CANVAS_SIZE = 600;
-
-// Line width for rendering
-static constexpr float LINE_WIDTH = 0.75f;
+// Thumbnail canvas size (1024x1024, 1-bit = 128KB buffer)
+static constexpr uint16_t CANVAS_SIZE = 1024;
 
 // Cartesian point
 struct CartesianPoint {
@@ -35,9 +32,8 @@ enum class ThumbnailError {
 
 // Polar to cartesian conversion
 // Maps: rho 0=center, 1=edge; theta 0=right, positive=counterclockwise
-// Note: True center for pixel array [0, CANVAS_SIZE-1] is (CANVAS_SIZE-1)/2 = 299.5
 inline CartesianPoint toCartesian(const PolarPoint& polar) {
-    constexpr float center = (CANVAS_SIZE - 1) / 2.0f;  // 299.5 for 600x600
+    constexpr float center = (CANVAS_SIZE - 1) / 2.0f;
     float r = polar.rho * center;  // Scale factor = distance from center to edge
     return CartesianPoint{
         center + r * std::cos(polar.theta),

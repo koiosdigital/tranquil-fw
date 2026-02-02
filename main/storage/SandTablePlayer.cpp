@@ -21,14 +21,14 @@ SemaphoreHandle_t SandTablePlayer::file_mutex_ = nullptr;
 PlaybackState SandTablePlayer::playback_state_ = PlaybackState::STOPPED;
 PlayMode SandTablePlayer::play_mode_ = PlayMode::SINGLE_PATTERN;
 
-char SandTablePlayer::current_pattern_uuid_[MAX_UUID_LEN] = {0};
+char SandTablePlayer::current_pattern_uuid_[MAX_UUID_LEN] = { 0 };
 std::optional<Pattern> SandTablePlayer::current_pattern_ = std::nullopt;
 std::unique_ptr<IPatternReader> SandTablePlayer::pattern_reader_;
 size_t SandTablePlayer::current_line_index_ = 0;
 size_t SandTablePlayer::total_lines_ = 0;
 bool SandTablePlayer::file_loaded_ = false;
 
-char SandTablePlayer::current_playlist_uuid_[MAX_UUID_LEN] = {0};
+char SandTablePlayer::current_playlist_uuid_[MAX_UUID_LEN] = { 0 };
 std::vector<std::string> SandTablePlayer::playlist_patterns_;
 std::vector<size_t> SandTablePlayer::playlist_order_;
 size_t SandTablePlayer::playlist_index_ = 0;
@@ -62,16 +62,13 @@ esp_err_t SandTablePlayer::initialize(sand_table::MotionController* controller) 
         return ESP_ERR_NO_MEM;
     }
 
-    // Create service task - DISABLED for memory profiling
-    // TODO: Re-enable after memory optimization
-    // if (xTaskCreate(serviceTaskWrapper, "sand_player", SERVICE_TASK_STACK_SIZE,
-    //                 nullptr, SERVICE_TASK_PRIORITY, &service_task_handle_) != pdPASS) {
-    //     ESP_LOGE(TAG, "Failed to create service task");
-    //     vSemaphoreDelete(state_mutex_);
-    //     vSemaphoreDelete(file_mutex_);
-    //     return ESP_ERR_NO_MEM;
-    // }
-    ESP_LOGW(TAG, "sand_player task DISABLED for memory profiling");
+    if (xTaskCreate(serviceTaskWrapper, "sand_player", SERVICE_TASK_STACK_SIZE,
+        nullptr, SERVICE_TASK_PRIORITY, &service_task_handle_) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create service task");
+        vSemaphoreDelete(state_mutex_);
+        vSemaphoreDelete(file_mutex_);
+        return ESP_ERR_NO_MEM;
+    }
 
     initialized_ = true;
     ESP_LOGI(TAG, "SandTablePlayer initialized");
@@ -163,7 +160,7 @@ esp_err_t SandTablePlayer::playPattern(const char* pattern_uuid) {
     xSemaphoreGive(state_mutex_);
 
     ESP_LOGI(TAG, "Started playing pattern: %s (%s)",
-             current_pattern_->name.c_str(), pattern_uuid);
+        current_pattern_->name.c_str(), pattern_uuid);
     return ESP_OK;
 }
 
@@ -205,7 +202,7 @@ esp_err_t SandTablePlayer::playPlaylist(const char* playlist_uuid, bool shuffle,
 
     playlist_index_ = 0;
     play_mode_ = is_loop_ ? PlayMode::PLAYLIST_LOOP :
-                 (is_shuffle_ ? PlayMode::PLAYLIST_SHUFFLE : PlayMode::PLAYLIST);
+        (is_shuffle_ ? PlayMode::PLAYLIST_SHUFFLE : PlayMode::PLAYLIST);
     playback_state_ = PlaybackState::PLAYING;
 
     startCurrentPattern();
@@ -213,7 +210,7 @@ esp_err_t SandTablePlayer::playPlaylist(const char* playlist_uuid, bool shuffle,
     xSemaphoreGive(state_mutex_);
 
     ESP_LOGI(TAG, "Started playlist: %s (shuffle=%d, loop=%d)",
-             playlist_uuid, (int)shuffle, (int)loop);
+        playlist_uuid, (int)shuffle, (int)loop);
     return ESP_OK;
 }
 
@@ -281,7 +278,8 @@ esp_err_t SandTablePlayer::playPlaylistFromPattern(const char* playlist_uuid, co
         for (size_t idx : remaining) {
             playlist_order_.push_back(idx);
         }
-    } else {
+    }
+    else {
         // Sequential from start pattern
         for (size_t i = 1; i < playlist_patterns_.size(); ++i) {
             playlist_order_.push_back((start_index + i) % playlist_patterns_.size());
@@ -290,7 +288,7 @@ esp_err_t SandTablePlayer::playPlaylistFromPattern(const char* playlist_uuid, co
 
     playlist_index_ = 0;
     play_mode_ = is_loop_ ? PlayMode::PLAYLIST_LOOP :
-                 (is_shuffle_ ? PlayMode::PLAYLIST_SHUFFLE : PlayMode::PLAYLIST);
+        (is_shuffle_ ? PlayMode::PLAYLIST_SHUFFLE : PlayMode::PLAYLIST);
     playback_state_ = PlaybackState::PLAYING;
 
     startCurrentPattern();
@@ -298,7 +296,7 @@ esp_err_t SandTablePlayer::playPlaylistFromPattern(const char* playlist_uuid, co
     xSemaphoreGive(state_mutex_);
 
     ESP_LOGI(TAG, "Started playlist: %s from pattern %s (shuffle=%d, loop=%d)",
-             playlist_uuid, pattern_uuid, (int)shuffle, (int)loop);
+        playlist_uuid, pattern_uuid, (int)shuffle, (int)loop);
     return ESP_OK;
 }
 
@@ -449,7 +447,7 @@ esp_err_t SandTablePlayer::setShuffle(bool shuffle) {
     is_shuffle_ = shuffle;
     if (play_mode_ != PlayMode::SINGLE_PATTERN) {
         play_mode_ = is_loop_ ? PlayMode::PLAYLIST_LOOP :
-                     (is_shuffle_ ? PlayMode::PLAYLIST_SHUFFLE : PlayMode::PLAYLIST);
+            (is_shuffle_ ? PlayMode::PLAYLIST_SHUFFLE : PlayMode::PLAYLIST);
     }
 
     xSemaphoreGive(state_mutex_);
@@ -471,7 +469,7 @@ esp_err_t SandTablePlayer::setLoop(bool loop) {
     is_loop_ = loop;
     if (play_mode_ != PlayMode::SINGLE_PATTERN) {
         play_mode_ = is_loop_ ? PlayMode::PLAYLIST_LOOP :
-                     (is_shuffle_ ? PlayMode::PLAYLIST_SHUFFLE : PlayMode::PLAYLIST);
+            (is_shuffle_ ? PlayMode::PLAYLIST_SHUFFLE : PlayMode::PLAYLIST);
     }
 
     xSemaphoreGive(state_mutex_);
@@ -515,18 +513,18 @@ cJSON* SandTablePlayer::getStateJSON() {
 
     const char* state_str = "STOPPED";
     switch (playback_state_) {
-        case PlaybackState::PLAYING: state_str = "PLAYING"; break;
-        case PlaybackState::PAUSED: state_str = "PAUSED"; break;
-        default: break;
+    case PlaybackState::PLAYING: state_str = "PLAYING"; break;
+    case PlaybackState::PAUSED: state_str = "PAUSED"; break;
+    default: break;
     }
     cJSON_AddStringToObject(root, "playback_state", state_str);
 
     const char* mode_str = "SINGLE_PATTERN";
     switch (play_mode_) {
-        case PlayMode::PLAYLIST: mode_str = "PLAYLIST"; break;
-        case PlayMode::PLAYLIST_LOOP: mode_str = "PLAYLIST_LOOP"; break;
-        case PlayMode::PLAYLIST_SHUFFLE: mode_str = "PLAYLIST_SHUFFLE"; break;
-        default: break;
+    case PlayMode::PLAYLIST: mode_str = "PLAYLIST"; break;
+    case PlayMode::PLAYLIST_LOOP: mode_str = "PLAYLIST_LOOP"; break;
+    case PlayMode::PLAYLIST_SHUFFLE: mode_str = "PLAYLIST_SHUFFLE"; break;
+    default: break;
     }
     cJSON_AddStringToObject(root, "play_mode", mode_str);
 
@@ -554,7 +552,7 @@ int SandTablePlayer::getTotalProgress() {
         auto mp = motion_controller_->get_motion_progress();
         if (mp.steps_queued > 0) {
             double motion_fraction = static_cast<double>(mp.steps_completed) /
-                                     static_cast<double>(mp.steps_queued);
+                static_cast<double>(mp.steps_queued);
             int percent = static_cast<int>(motion_fraction * 100.0);
             if (percent > 100) percent = 100;
             if (percent < 0) percent = 0;
@@ -617,11 +615,13 @@ void SandTablePlayer::serviceTask() {
                     if (processPatternLine(line)) {
                         popLine();
                     }
-                } else {
+                }
+                else {
                     ESP_LOGW(TAG, "Invalid line, skipping");
                     popLine();
                 }
-            } else {
+            }
+            else {
                 // All lines queued - wait for motion to complete before advancing
                 auto progress = motion_controller_->get_motion_progress();
                 if (!progress.is_executing && progress.segments_queued == 0) {
@@ -630,7 +630,8 @@ void SandTablePlayer::serviceTask() {
                     // Handle playlist mode
                     if (play_mode_ != PlayMode::SINGLE_PATTERN && !playlist_patterns_.empty()) {
                         advanceToNextPattern();
-                    } else {
+                    }
+                    else {
                         playback_state_ = PlaybackState::STOPPED;
                     }
                 }
@@ -681,7 +682,7 @@ esp_err_t SandTablePlayer::loadPatternFile(const char* pattern_uuid) {
     file_loaded_ = true;
 
     ESP_LOGI(TAG, "Loaded pattern: %s (%zu points, encrypted=%d)",
-             pattern_uuid, total_lines_, is_encrypted);
+        pattern_uuid, total_lines_, is_encrypted);
 
     xSemaphoreGive(file_mutex_);
     return ESP_OK;
@@ -793,7 +794,7 @@ void SandTablePlayer::startCurrentPattern() {
     pattern_position_ = PatternPosition();
 
     ESP_LOGI(TAG, "Starting pattern %zu/%zu: %s",
-             playlist_index_ + 1, playlist_patterns_.size(), pattern_uuid.c_str());
+        playlist_index_ + 1, playlist_patterns_.size(), pattern_uuid.c_str());
 }
 
 void SandTablePlayer::advanceToNextPattern() {
@@ -809,7 +810,8 @@ void SandTablePlayer::advanceToNextPattern() {
                 shufflePlaylistOrder();
             }
             ESP_LOGI(TAG, "Playlist looping");
-        } else {
+        }
+        else {
             // End of playlist
             playback_state_ = PlaybackState::STOPPED;
             ESP_LOGI(TAG, "Playlist finished");
@@ -881,12 +883,12 @@ void SandTablePlayer::sendMoveCommand(double theta_rad, double rho_normalized) {
         feedrate_rpm = static_cast<float>(sand_table::MotionConfig::RHO_MAX_SPEED_RPM);
     }
 
-    sand_table::PolarPosition target{theta_rad, rho_normalized};
+    sand_table::PolarPosition target{ theta_rad, rho_normalized };
     auto result = motion_controller_->move_to(target, feedrate_rpm);
 
     if (result.is_err()) {
         ESP_LOGW(TAG, "Failed to send move command: (%.4f rad, %.4f)",
-                 theta_rad, rho_normalized);
+            theta_rad, rho_normalized);
         if (result.error() != sand_table::MotionError::QueueFull) {
             ESP_LOGE(TAG, "Stopping due to motion error");
             stop();

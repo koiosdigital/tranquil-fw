@@ -22,17 +22,17 @@ esp_err_t JobQueue::initialize() {
             ESP_LOGE(TAG, "Failed to create /sd/previews directory");
             return ESP_FAIL;
         }
-        ESP_LOGI(TAG, "Created /sd/previews directory");
+        ESP_LOGD(TAG, "Created /sd/previews directory");
     }
 
     initialized_ = true;
-    ESP_LOGI(TAG, "JobQueue initialized");
+    ESP_LOGD(TAG, "JobQueue initialized");
     return ESP_OK;
 }
 
 void JobQueue::shutdown() {
     initialized_ = false;
-    ESP_LOGI(TAG, "JobQueue shutdown");
+    ESP_LOGD(TAG, "JobQueue shutdown");
 }
 
 bool JobQueue::isInitialized() const {

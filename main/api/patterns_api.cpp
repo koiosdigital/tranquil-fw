@@ -22,7 +22,7 @@
 static const char* TAG = "patterns_api";
 
 // Upload constants
-static constexpr size_t UPLOAD_CHUNK_SIZE = 4 * 1024;  // HTTP server stack is 8KB (set in kd_common)
+static constexpr size_t UPLOAD_CHUNK_SIZE = 8 * 1024;  // HTTP server stack is 8KB (set in kd_common)
 static constexpr size_t MAX_BOUNDARY_SIZE = 128;
 static constexpr size_t MAX_FILENAME_SIZE = 256;
 static constexpr size_t MAX_HEADER_SIZE = 1024;
@@ -202,7 +202,7 @@ static esp_err_t patterns_upload_handler(httpd_req_t* req) {
     // Stack-allocate buffers (total ~5.7KB - fits HTTP server 8KB stack)
     UploadContext ctx_storage = {};
     UploadContext* ctx = &ctx_storage;
-    char header_buf[MAX_HEADER_SIZE] = {0};
+    char header_buf[MAX_HEADER_SIZE] = { 0 };
     char buffer[UPLOAD_CHUNK_SIZE];
 
     // Extract multipart boundary
@@ -533,7 +533,7 @@ static esp_err_t patterns_download_handler(httpd_req_t* req) {
     size_t file_size = ftell(f);
     fseek(f, 0, SEEK_SET);
 
-    // Set response headers
+    // Set response headers (no Content-Length when using chunked transfer)
     httpd_resp_set_type(req, "application/octet-stream");
 
     char content_disp[256];
@@ -541,11 +541,7 @@ static esp_err_t patterns_download_handler(httpd_req_t* req) {
         pattern->name.empty() ? uuid : pattern->name.c_str());
     httpd_resp_set_hdr(req, "Content-Disposition", content_disp);
 
-    char content_len[32];
-    snprintf(content_len, sizeof(content_len), "%zu", file_size);
-    httpd_resp_set_hdr(req, "Content-Length", content_len);
-
-    // Stream file in chunks (use SPIRAM for cold-path download)
+    // Stream file in chunks
     constexpr size_t CHUNK_SIZE = 4096;
     char* chunk = static_cast<char*>(
         heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
@@ -557,6 +553,7 @@ static esp_err_t patterns_download_handler(httpd_req_t* req) {
     }
 
     size_t bytes_sent = 0;
+    esp_err_t err = ESP_OK;
     while (bytes_sent < file_size) {
         size_t to_read = std::min(CHUNK_SIZE, file_size - bytes_sent);
         size_t read = fread(chunk, 1, to_read, f);
@@ -564,8 +561,9 @@ static esp_err_t patterns_download_handler(httpd_req_t* req) {
             break;
         }
 
-        if (httpd_resp_send_chunk(req, chunk, read) != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to send chunk");
+        err = httpd_resp_send_chunk(req, chunk, read);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Send failed at %zu/%zu bytes", bytes_sent, file_size);
             break;
         }
         bytes_sent += read;
@@ -577,7 +575,11 @@ static esp_err_t patterns_download_handler(httpd_req_t* req) {
     heap_caps_free(chunk);
     fclose(f);
 
-    ESP_LOGI(TAG, "Pattern downloaded: %s (%zu bytes)", uuid, bytes_sent);
+    if (err != ESP_OK || bytes_sent != file_size) {
+        return ESP_FAIL;
+    }
+
+    ESP_LOGD(TAG, "Pattern downloaded: %s (%zu bytes)", uuid, bytes_sent);
     return ESP_OK;
 }
 
@@ -593,7 +595,7 @@ static esp_err_t pattern_thumb_handler(httpd_req_t* req) {
 
     // Extract UUID (strip .png extension)
     const char* uuid_start = uri + strlen(base);
-    char uuid[64] = {0};
+    char uuid[64] = { 0 };
     size_t uuid_len = 0;
 
     // Copy until '.' or end
@@ -646,7 +648,7 @@ static esp_err_t pattern_thumb_handler(httpd_req_t* req) {
     constexpr size_t CHUNK_SIZE = 4096;
     char* chunk = static_cast<char*>(
         heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
-    );
+        );
     if (!chunk) {
         fclose(f);
         httpd_resp_send_500(req);

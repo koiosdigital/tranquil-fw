@@ -1,72 +1,12 @@
 #include "png_encoder.h"
 #include "esp_log.h"
-#include <png.h>
+#include "spng.h"
 #include <cstdio>
-#include <csetjmp>
 #include <cstring>
 
 static const char* TAG = "PngEncoder";
 
 namespace thumbnail {
-
-// Memory write context for encodeToMemory
-struct MemoryWriteContext {
-    uint8_t* buffer;
-    size_t capacity;
-    size_t position;
-    bool overflow;
-};
-
-static void pngMemoryWriteCallback(png_structp png_ptr, png_bytep data, png_size_t length) {
-    auto* ctx = static_cast<MemoryWriteContext*>(png_get_io_ptr(png_ptr));
-
-    if (ctx->position + length > ctx->capacity) {
-        ctx->overflow = true;
-        return;
-    }
-
-    std::memcpy(ctx->buffer + ctx->position, data, length);
-    ctx->position += length;
-}
-
-static void pngMemoryFlushCallback(png_structp /*png_ptr*/) {
-    // No-op for memory writes
-}
-
-static ThumbnailError encodeInternal(const Framebuffer& fb,
-                                     png_structp png_ptr,
-                                     png_infop info_ptr) {
-    // Set image attributes
-    png_set_IHDR(
-        png_ptr, info_ptr,
-        CANVAS_SIZE, CANVAS_SIZE,
-        8,                      // bit depth
-        PNG_COLOR_TYPE_GRAY,    // grayscale
-        PNG_INTERLACE_NONE,
-        PNG_COMPRESSION_TYPE_DEFAULT,
-        PNG_FILTER_TYPE_DEFAULT
-    );
-
-    // Set transparency for grayscale value 0 (black background becomes transparent)
-    png_color_16 trans_color;
-    trans_color.gray = 0;
-    png_set_tRNS(png_ptr, info_ptr, nullptr, 0, &trans_color);
-
-    png_write_info(png_ptr, info_ptr);
-
-    // Write image data row by row
-    for (uint16_t y = 0; y < CANVAS_SIZE; ++y) {
-        const uint8_t* rowData = fb.row(y);
-        if (!rowData) {
-            return ThumbnailError::PNG_ENCODE_FAILED;
-        }
-        png_write_row(png_ptr, const_cast<uint8_t*>(rowData));
-    }
-
-    png_write_end(png_ptr, nullptr);
-
-    return ThumbnailError::OK;
-}
 
 ThumbnailError PngEncoder::encodeToFile(const Framebuffer& fb,
                                         const char* filepath) {
@@ -76,41 +16,50 @@ ThumbnailError PngEncoder::encodeToFile(const Framebuffer& fb,
         return ThumbnailError::FILE_OPEN_FAILED;
     }
 
-    png_structp png_ptr = png_create_write_struct(
-        PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
-    if (!png_ptr) {
+    spng_ctx* ctx = spng_ctx_new(SPNG_CTX_ENCODER);
+    if (!ctx) {
         std::fclose(fp);
-        ESP_LOGE(TAG, "Failed to create PNG write struct");
+        ESP_LOGE(TAG, "Failed to create spng context");
         return ThumbnailError::PNG_ENCODE_FAILED;
     }
 
-    png_infop info_ptr = png_create_info_struct(png_ptr);
-    if (!info_ptr) {
-        png_destroy_write_struct(&png_ptr, nullptr);
+    // Set output file
+    spng_set_png_file(ctx, fp);
+
+    // Set image header (1-bit grayscale)
+    spng_ihdr ihdr = {};
+    ihdr.width = CANVAS_SIZE;
+    ihdr.height = CANVAS_SIZE;
+    ihdr.bit_depth = 1;
+    ihdr.color_type = SPNG_COLOR_TYPE_GRAYSCALE;
+    ihdr.interlace_method = SPNG_INTERLACE_NONE;
+
+    int ret = spng_set_ihdr(ctx, &ihdr);
+    if (ret != SPNG_OK) {
+        spng_ctx_free(ctx);
         std::fclose(fp);
-        ESP_LOGE(TAG, "Failed to create PNG info struct");
+        ESP_LOGE(TAG, "spng_set_ihdr failed: %s", spng_strerror(ret));
         return ThumbnailError::PNG_ENCODE_FAILED;
     }
 
-    if (setjmp(png_jmpbuf(png_ptr))) {
-        png_destroy_write_struct(&png_ptr, &info_ptr);
-        std::fclose(fp);
-        ESP_LOGE(TAG, "PNG encoding error");
-        return ThumbnailError::PNG_ENCODE_FAILED;
-    }
+    // Set transparency for value 0 (black background becomes transparent)
+    spng_trns trns = {};
+    trns.gray = 0;
+    spng_set_trns(ctx, &trns);
 
-    png_init_io(png_ptr, fp);
+    // Encode image - 1-bit packed format
+    ret = spng_encode_image(ctx, fb.data(), Framebuffer::size(), SPNG_FMT_PNG, SPNG_ENCODE_FINALIZE);
 
-    ThumbnailError result = encodeInternal(fb, png_ptr, info_ptr);
-
-    png_destroy_write_struct(&png_ptr, &info_ptr);
+    spng_ctx_free(ctx);
     std::fclose(fp);
 
-    if (result == ThumbnailError::OK) {
-        ESP_LOGI(TAG, "PNG saved to %s", filepath);
+    if (ret != SPNG_OK) {
+        ESP_LOGE(TAG, "spng_encode_image failed: %s", spng_strerror(ret));
+        return ThumbnailError::PNG_ENCODE_FAILED;
     }
 
-    return result;
+    ESP_LOGD(TAG, "PNG saved to %s", filepath);
+    return ThumbnailError::OK;
 }
 
 ThumbnailError PngEncoder::encodeToMemory(const Framebuffer& fb,
@@ -121,43 +70,68 @@ ThumbnailError PngEncoder::encodeToMemory(const Framebuffer& fb,
         return ThumbnailError::INVALID_INPUT;
     }
 
-    MemoryWriteContext ctx{output_buffer, buffer_size, 0, false};
-
-    png_structp png_ptr = png_create_write_struct(
-        PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
-    if (!png_ptr) {
-        ESP_LOGE(TAG, "Failed to create PNG write struct");
+    spng_ctx* ctx = spng_ctx_new(SPNG_CTX_ENCODER);
+    if (!ctx) {
+        ESP_LOGE(TAG, "Failed to create spng context");
         return ThumbnailError::PNG_ENCODE_FAILED;
     }
 
-    png_infop info_ptr = png_create_info_struct(png_ptr);
-    if (!info_ptr) {
-        png_destroy_write_struct(&png_ptr, nullptr);
-        ESP_LOGE(TAG, "Failed to create PNG info struct");
+    // Enable encoding to internal buffer
+    spng_set_option(ctx, SPNG_ENCODE_TO_BUFFER, 1);
+
+    // Set image header (1-bit grayscale)
+    spng_ihdr ihdr = {};
+    ihdr.width = CANVAS_SIZE;
+    ihdr.height = CANVAS_SIZE;
+    ihdr.bit_depth = 1;
+    ihdr.color_type = SPNG_COLOR_TYPE_GRAYSCALE;
+    ihdr.interlace_method = SPNG_INTERLACE_NONE;
+
+    int ret = spng_set_ihdr(ctx, &ihdr);
+    if (ret != SPNG_OK) {
+        spng_ctx_free(ctx);
+        ESP_LOGE(TAG, "spng_set_ihdr failed: %s", spng_strerror(ret));
         return ThumbnailError::PNG_ENCODE_FAILED;
     }
 
-    if (setjmp(png_jmpbuf(png_ptr))) {
-        png_destroy_write_struct(&png_ptr, &info_ptr);
-        ESP_LOGE(TAG, "PNG encoding error");
+    // Set transparency for value 0 (black background becomes transparent)
+    spng_trns trns = {};
+    trns.gray = 0;
+    spng_set_trns(ctx, &trns);
+
+    // Encode image - 1-bit packed format
+    ret = spng_encode_image(ctx, fb.data(), Framebuffer::size(), SPNG_FMT_PNG, SPNG_ENCODE_FINALIZE);
+
+    if (ret != SPNG_OK) {
+        spng_ctx_free(ctx);
+        ESP_LOGE(TAG, "spng_encode_image failed: %s", spng_strerror(ret));
         return ThumbnailError::PNG_ENCODE_FAILED;
     }
 
-    png_set_write_fn(png_ptr, &ctx, pngMemoryWriteCallback, pngMemoryFlushCallback);
+    // Get encoded buffer
+    size_t png_size = 0;
+    int error = 0;
+    void* png_buf = spng_get_png_buffer(ctx, &png_size, &error);
 
-    ThumbnailError result = encodeInternal(fb, png_ptr, info_ptr);
-
-    png_destroy_write_struct(&png_ptr, &info_ptr);
-
-    if (ctx.overflow) {
-        ESP_LOGE(TAG, "Buffer overflow during PNG encoding");
+    if (!png_buf || error != SPNG_OK) {
+        spng_ctx_free(ctx);
+        ESP_LOGE(TAG, "spng_get_png_buffer failed");
         return ThumbnailError::PNG_ENCODE_FAILED;
     }
 
-    *bytes_written = ctx.position;
-    ESP_LOGI(TAG, "PNG encoded to memory: %zu bytes", ctx.position);
+    if (png_size > buffer_size) {
+        spng_ctx_free(ctx);
+        ESP_LOGE(TAG, "Buffer too small: need %zu, have %zu", png_size, buffer_size);
+        return ThumbnailError::PNG_ENCODE_FAILED;
+    }
 
-    return result;
+    std::memcpy(output_buffer, png_buf, png_size);
+    *bytes_written = png_size;
+
+    spng_ctx_free(ctx);
+
+    ESP_LOGD(TAG, "PNG encoded to memory: %zu bytes", png_size);
+    return ThumbnailError::OK;
 }
 
 } // namespace thumbnail

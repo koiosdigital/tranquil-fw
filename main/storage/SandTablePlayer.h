@@ -37,7 +37,8 @@ struct PatternLine {
 
     PatternLine() : theta(0.0), rho(0.0), is_first_line(false), is_valid(false) {}
     PatternLine(double t, double r, bool first = false)
-        : theta(t), rho(r), is_first_line(first), is_valid(true) {}
+        : theta(t), rho(r), is_first_line(first), is_valid(true) {
+    }
 };
 
 // Tracks previous position for pattern playback

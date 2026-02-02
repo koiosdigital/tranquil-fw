@@ -10,9 +10,9 @@
  */
 #define BINARY_PATTERN_MAGIC 0x42524854
 
-/**
- * @brief Unencrypted binary pattern header (8 bytes)
- */
+ /**
+  * @brief Unencrypted binary pattern header (8 bytes)
+  */
 #pragma pack(push, 1)
 struct UnencryptedPatternHeader {
     uint32_t magic;        // "THRB" (0x42524854)

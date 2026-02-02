@@ -37,7 +37,7 @@ JobResult ThumbnailExecutor::execute(const Job& job) {
 JobResult ThumbnailExecutor::renderPattern(const std::string& pattern_uuid,
                                             bool encrypted,
                                             const std::string& output_path) {
-    ESP_LOGI(TAG, "Rendering thumbnail for pattern: %s (encrypted=%d)",
+    ESP_LOGD(TAG, "Rendering thumbnail for pattern: %s (encrypted=%d)",
         pattern_uuid.c_str(), encrypted);
 
     // Create pattern reader
@@ -58,7 +58,7 @@ JobResult ThumbnailExecutor::renderPattern(const std::string& pattern_uuid,
         return JobResult::fail("Pattern has no points");
     }
 
-    ESP_LOGI(TAG, "Pattern has %zu points", total_points);
+    ESP_LOGD(TAG, "Pattern has %zu points", total_points);
 
     // Allocate framebuffer in SPIRAM
     auto fb = std::make_unique<thumbnail::Framebuffer>();
@@ -99,7 +99,7 @@ JobResult ThumbnailExecutor::renderPattern(const std::string& pattern_uuid,
     renderer.endPath();
     reader->close();
 
-    ESP_LOGI(TAG, "Rendered %zu points (total %zu, step %zu)",
+    ESP_LOGD(TAG, "Rendered %zu points (total %zu, step %zu)",
         rendered_count, total_points, step);
 
     // Encode to PNG
@@ -111,7 +111,7 @@ JobResult ThumbnailExecutor::renderPattern(const std::string& pattern_uuid,
     // Get output file size for logging
     struct stat st;
     if (stat(output_path.c_str(), &st) == 0) {
-        ESP_LOGI(TAG, "Thumbnail saved: %s (%ld bytes)", output_path.c_str(), (long)st.st_size);
+        ESP_LOGD(TAG, "Thumbnail saved: %s (%ld bytes)", output_path.c_str(), (long)st.st_size);
     }
 
     return JobResult::ok();

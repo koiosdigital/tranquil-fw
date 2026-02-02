@@ -10,27 +10,27 @@
  */
 #define ENCRYPTED_PATTERN_MAGIC 0x5045444B
 
-/**
- * @brief Encrypted pattern file format version
- */
+ /**
+  * @brief Encrypted pattern file format version
+  */
 #define ENCRYPTED_PATTERN_VERSION 0x0001
 
-/**
- * @brief Encryption scheme: RSA-OAEP + AES-256-CTR
- */
+  /**
+   * @brief Encryption scheme: RSA-OAEP + AES-256-CTR
+   */
 #define ENCRYPTION_SCHEME_RSA_OAEP_AES_CTR 1
 
-/**
- * @brief Encrypted pattern header flags
- */
+   /**
+    * @brief Encrypted pattern header flags
+    */
 #define ENCRYPTED_PATTERN_FLAG_BINARY 0x01
 
-/**
- * @brief Encrypted pattern file header (576 bytes total)
- *
- * Uses AES-256-CTR for streaming decryption with random seek support.
- * Integrity verified on download only (SHA-256 in original_hash).
- */
+    /**
+     * @brief Encrypted pattern file header (576 bytes total)
+     *
+     * Uses AES-256-CTR for streaming decryption with random seek support.
+     * Integrity verified on download only (SHA-256 in original_hash).
+     */
 #pragma pack(push, 1)
 struct EncryptedPatternHeader {
     uint32_t magic;              // 0x0000: "KDEP" (0x4B444550)

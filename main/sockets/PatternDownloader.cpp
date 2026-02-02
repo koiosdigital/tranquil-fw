@@ -67,41 +67,41 @@ public:
     }
 
     DownloadResult queueDownload(const Kd__V1__PatternDownloadResponse* response,
-                                  DownloadCallback callback) {
+        DownloadCallback callback) {
         if (!initialized_) {
-            return {DownloadStatus::InvalidResponse, "", "Downloader not initialized"};
+            return { DownloadStatus::InvalidResponse, "", "Downloader not initialized" };
         }
 
         if (!response || !response->pattern_uuid || !response->download_url) {
-            return {DownloadStatus::InvalidResponse, "", "Invalid download response"};
+            return { DownloadStatus::InvalidResponse, "", "Invalid download response" };
         }
 
         std::string pattern_uuid = response->pattern_uuid;
 
         // Check if this is a purchased pattern (has receipt)
         bool has_receipt = response->purchase_receipt_payload.data &&
-                           response->purchase_receipt_payload.len > 0 &&
-                           response->purchase_receipt_signature.data &&
-                           response->purchase_receipt_signature.len > 0;
+            response->purchase_receipt_payload.len > 0 &&
+            response->purchase_receipt_signature.data &&
+            response->purchase_receipt_signature.len > 0;
 
         // For subscription patterns, check license validity and limits
         // For purchased patterns, we can download regardless of subscription status
         if (!has_receipt) {
             if (!drm_license_is_valid()) {
                 drm_license_status_t status = drm_license_get_status();
-                return {DownloadStatus::LicenseInvalid, pattern_uuid,
-                        "License invalid: " + std::to_string(static_cast<int>(status))};
+                return { DownloadStatus::LicenseInvalid, pattern_uuid,
+                        "License invalid: " + std::to_string(static_cast<int>(status)) };
             }
 
             if (!drm_license_can_download()) {
-                return {DownloadStatus::PatternLimitReached, pattern_uuid,
-                        "Pattern download limit reached"};
+                return { DownloadStatus::PatternLimitReached, pattern_uuid,
+                        "Pattern download limit reached" };
             }
         }
 
         // Check if download job already exists
         if (jobs::JobQueue::instance().hasJob(pattern_uuid, jobs::JobType::Download)) {
-            return {DownloadStatus::InProgress, pattern_uuid, "Already downloading"};
+            return { DownloadStatus::InProgress, pattern_uuid, "Already downloading" };
         }
 
         // Build job data from response
@@ -156,26 +156,26 @@ public:
         if (err != ESP_OK) {
             MutexGuard lock(mutex_);
             pending_callbacks_.erase(pattern_uuid);
-            return {DownloadStatus::FileError, pattern_uuid, "Failed to enqueue download"};
+            return { DownloadStatus::FileError, pattern_uuid, "Failed to enqueue download" };
         }
 
         ESP_LOGI(TAG, "Queued download job for pattern: %s", pattern_uuid.c_str());
-        return {DownloadStatus::Queued, pattern_uuid, ""};
+        return { DownloadStatus::Queued, pattern_uuid, "" };
     }
 
     DownloadResult queueDownloadByUuid(const std::string& pattern_uuid,
-                                        DownloadCallback callback) {
+        DownloadCallback callback) {
         if (!initialized_) {
-            return {DownloadStatus::InvalidResponse, pattern_uuid, "Downloader not initialized"};
+            return { DownloadStatus::InvalidResponse, pattern_uuid, "Downloader not initialized" };
         }
 
         // Check license first
         if (!drm_license_is_valid()) {
-            return {DownloadStatus::LicenseInvalid, pattern_uuid, "License invalid"};
+            return { DownloadStatus::LicenseInvalid, pattern_uuid, "License invalid" };
         }
 
         if (!drm_license_can_download()) {
-            return {DownloadStatus::PatternLimitReached, pattern_uuid, "Pattern limit reached"};
+            return { DownloadStatus::PatternLimitReached, pattern_uuid, "Pattern limit reached" };
         }
 
         // Store callback for when response arrives
@@ -187,7 +187,7 @@ public:
         // Request download info from cloud
         cloud_msg_send_pattern_download_request(pattern_uuid.c_str());
 
-        return {DownloadStatus::Queued, pattern_uuid, "Waiting for server response"};
+        return { DownloadStatus::Queued, pattern_uuid, "Waiting for server response" };
     }
 
     bool cancelDownload(const std::string& pattern_uuid) {
@@ -255,16 +255,16 @@ bool PatternDownloader::isDownloading(const std::string& pattern_uuid) const {
 
 const char* downloadStatusToString(DownloadStatus status) {
     switch (status) {
-        case DownloadStatus::Success: return "Success";
-        case DownloadStatus::Queued: return "Queued";
-        case DownloadStatus::InProgress: return "InProgress";
-        case DownloadStatus::LicenseInvalid: return "LicenseInvalid";
-        case DownloadStatus::PatternLimitReached: return "PatternLimitReached";
-        case DownloadStatus::NetworkError: return "NetworkError";
-        case DownloadStatus::FileError: return "FileError";
-        case DownloadStatus::InvalidResponse: return "InvalidResponse";
-        case DownloadStatus::DecryptionError: return "DecryptionError";
-        case DownloadStatus::Cancelled: return "Cancelled";
-        default: return "Unknown";
+    case DownloadStatus::Success: return "Success";
+    case DownloadStatus::Queued: return "Queued";
+    case DownloadStatus::InProgress: return "InProgress";
+    case DownloadStatus::LicenseInvalid: return "LicenseInvalid";
+    case DownloadStatus::PatternLimitReached: return "PatternLimitReached";
+    case DownloadStatus::NetworkError: return "NetworkError";
+    case DownloadStatus::FileError: return "FileError";
+    case DownloadStatus::InvalidResponse: return "InvalidResponse";
+    case DownloadStatus::DecryptionError: return "DecryptionError";
+    case DownloadStatus::Cancelled: return "Cancelled";
+    default: return "Unknown";
     }
 }
