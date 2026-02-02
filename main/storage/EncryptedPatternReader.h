@@ -2,7 +2,7 @@
 
 #include "PatternReader.h"
 #include "drm/drm_crypto.h"
-#include <mbedtls/aes.h>
+#include <psa/crypto.h>
 #include <stdint.h>
 
 /**
@@ -54,9 +54,9 @@ static_assert(sizeof(EncryptedPatternHeader) == 576,
  * Opens encrypted .dat pattern files (KDEP magic), recovers the AES key
  * using the DS peripheral, and provides streaming decryption access.
  *
- * Bufferless design: decrypts one point (4 bytes) at a time directly from file.
- * AES-CTR maintains partial block state, allowing byte-granular decryption.
- * Total memory footprint: ~1.2KB (dominated by mbedtls_aes_context).
+ * Uses PSA Crypto API for AES-CTR. Bufferless design: decrypts one point
+ * at a time directly from file. CTR mode is seekable via position-based
+ * counter calculation, enabling rewind and peek support.
  *
  * Note: Integrity (SHA-256) is verified on download only, not during playback.
  */
@@ -92,12 +92,18 @@ private:
     uint8_t aes_key_[DRM_AES_KEY_BYTES];
     bool has_key_ = false;
 
-    // AES-CTR context for streaming decryption
-    mbedtls_aes_context aes_;
-    bool aes_initialized_ = false;
-    size_t nc_off_ = 0;              // Offset within current block
-    uint8_t nonce_counter_[16];      // Current counter value
-    uint8_t stream_block_[16];       // Cached keystream block
+    // PSA key for cipher (imported once per file open)
+    psa_key_id_t aes_key_id_ = PSA_KEY_ID_NULL;
+
+    // Active PSA cipher operation
+    psa_cipher_operation_t cipher_op_ = PSA_CIPHER_OPERATION_INIT;
+    bool cipher_active_ = false;
+
+    // Base IV from header (kept for rewind/seek)
+    uint8_t base_iv_[16];
+
+    // Track decrypted byte position (for seek calculations)
+    size_t decrypt_position_ = 0;
 
     // Point tracking
     size_t current_point_ = 0;
@@ -106,11 +112,6 @@ private:
     bool has_peeked_ = false;
     PatternPoint peeked_point_;
 
-    // Saved CTR state for peek restore
-    size_t saved_nc_off_ = 0;
-    uint8_t saved_nonce_counter_[16];
-    uint8_t saved_stream_block_[16];
-
     // Helper functions
     void getFilePath(const char* uuid, char* path, size_t path_size);
     PatternPoint readBinaryPoint();
@@ -118,7 +119,7 @@ private:
     // Streaming helpers
     esp_err_t openFile(const char* path);
     esp_err_t initDecryption();
-    void saveCtrState();
-    void restoreCtrState();
+    esp_err_t importAesKey();
+    esp_err_t startCipherAtPosition(size_t byte_position);
     void clearKey();
 };

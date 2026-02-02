@@ -65,7 +65,7 @@ struct PaginatedResult {
     PaginationInfo pagination;
 };
 
-// SQLite-backed manifest database
+// Binary file-backed manifest database (.tqdb format)
 // Thread-safe singleton with RAII resource management
 class ManifestDatabase {
 public:
@@ -125,7 +125,7 @@ public:
     static std::string currentTimestamp();
 
     // Memory management
-    void releaseMemory();   // Release SQLite page cache
+    void releaseMemory();   // No-op, kept for API compatibility
     esp_err_t vacuum();     // Compact database file (reclaim deleted space)
 
     // Job queue operations
@@ -147,7 +147,7 @@ private:
     ManifestDatabase(const ManifestDatabase&) = delete;
     ManifestDatabase& operator=(const ManifestDatabase&) = delete;
 
-    // Pimpl - hides SQLite implementation
+    // Pimpl - hides implementation
     class Impl;
     std::unique_ptr<Impl> impl_;
 };

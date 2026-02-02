@@ -42,7 +42,7 @@ extern "C" void app_main(void)
 
     stusb_init();
 
-    kd_common_set_provisioning_pop_token_format(ProvisioningPOPTokenFormat_t::NONE);
+    kd_common_set_provisioning_srp_password_format(ProvisioningSRPPasswordFormat_t::STATIC);
     kd_common_init();
 
     // Initialize ConfigManager early (before components that need config)
@@ -50,6 +50,8 @@ extern "C" void app_main(void)
     if (cfg_err != ESP_OK) {
         ESP_LOGW(TAG, "ConfigManager init failed: %s, using defaults", esp_err_to_name(cfg_err));
     }
+
+    /*
 
     ManifestDatabase::instance().initialize();
 
@@ -61,6 +63,8 @@ extern "C" void app_main(void)
     executors[jobs::JobType::Download] = std::make_unique<jobs::DownloadExecutor>();
     jobs::JobProcessor::instance().init(std::move(executors));
     ESP_LOGI(TAG, "Job processing system initialized");
+
+    */
 
     // Initialize motion controller
     g_motion_controller = new sand_table::MotionController();

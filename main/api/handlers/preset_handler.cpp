@@ -23,24 +23,24 @@ HandleResult PresetHandler::handle(
     }
 
     switch (msg->message_case) {
-        case KD__V1__TRANQUIL_MESSAGE__MESSAGE_LIST_PRESETS_REQUEST:
-            return handleListPresets(response);
+    case KD__V1__TRANQUIL_MESSAGE__MESSAGE_LIST_PRESETS_REQUEST:
+        return handleListPresets(response);
 
-        case KD__V1__TRANQUIL_MESSAGE__MESSAGE_LOAD_PRESET_REQUEST:
-            return handleLoadPreset(msg->load_preset_request, response);
+    case KD__V1__TRANQUIL_MESSAGE__MESSAGE_LOAD_PRESET_REQUEST:
+        return handleLoadPreset(msg->load_preset_request, response);
 
-        default:
-            return HandleResult::notHandled();
+    default:
+        return HandleResult::notHandled();
     }
 }
 
 bool PresetHandler::canHandle(Kd__V1__TranquilMessage__MessageCase msg_case) const {
     switch (msg_case) {
-        case KD__V1__TRANQUIL_MESSAGE__MESSAGE_LIST_PRESETS_REQUEST:
-        case KD__V1__TRANQUIL_MESSAGE__MESSAGE_LOAD_PRESET_REQUEST:
-            return true;
-        default:
-            return false;
+    case KD__V1__TRANQUIL_MESSAGE__MESSAGE_LIST_PRESETS_REQUEST:
+    case KD__V1__TRANQUIL_MESSAGE__MESSAGE_LOAD_PRESET_REQUEST:
+        return true;
+    default:
+        return false;
     }
 }
 
@@ -61,7 +61,7 @@ HandleResult PresetHandler::handleListPresets(ResponseMessage& response) {
     static Kd__V1__ListPresetsResponse list_resp = KD__V1__LIST_PRESETS_RESPONSE__INIT;
     static std::vector<Kd__V1__PresetInfoProto*> preset_ptrs;
     static std::vector<Kd__V1__PresetInfoProto> preset_infos;
-    static char active_id[32] = {0};
+    static char active_id[32] = { 0 };
 
     preset_ptrs.clear();
     preset_infos.clear();
@@ -75,7 +75,7 @@ HandleResult PresetHandler::handleListPresets(ResponseMessage& response) {
         preset_ptrs.push_back(&preset_infos[i]);
     }
 
-    strncpy(active_id, cfg.active_preset_id(), sizeof(active_id) - 1);
+    strncpy(active_id, cfg.active_preset_id(), sizeof(active_id));
 
     list_resp.n_presets = preset_ptrs.size();
     list_resp.presets = preset_ptrs.data();
@@ -113,13 +113,14 @@ HandleResult PresetHandler::handleLoadPreset(
 
     // Build response
     static Kd__V1__LoadPresetResponse load_resp = KD__V1__LOAD_PRESET_RESPONSE__INIT;
-    static char error_buf[64] = {0};
+    static char error_buf[64] = { 0 };
 
     load_resp.success = (ret == ESP_OK);
     if (ret != ESP_OK) {
         snprintf(error_buf, sizeof(error_buf), "Failed to load preset: %s", esp_err_to_name(ret));
         load_resp.error = error_buf;
-    } else {
+    }
+    else {
         load_resp.error = nullptr;
     }
 

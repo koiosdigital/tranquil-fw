@@ -175,9 +175,7 @@ namespace sand_table {
             .intr_priority = 0,
             .flags = {
                 .invert_out = false,
-                .with_dma = false,  // Use interrupt mode for low latency
-                .io_loop_back = false,
-                .io_od_mode = false,
+                .with_dma = false
             },
         };
 

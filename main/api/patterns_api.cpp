@@ -222,10 +222,14 @@ static esp_err_t patterns_upload_handler(httpd_req_t* req) {
     snprintf(ctx->final_path, sizeof(ctx->final_path), "/sd/patterns/%.36s.thr", ctx->uuid);
 
     // Pre-build boundary strings (avoid repeated stack allocation in loop)
-    char first_boundary[MAX_BOUNDARY_SIZE + 4];
+    // first_boundary: "--" + boundary + null = 2 + 127 + 1 = 130 max
+    // close_boundary: "\r\n--" + boundary + null = 4 + 127 + 1 = 132 max
+    char first_boundary[MAX_BOUNDARY_SIZE + 8];
     char close_boundary[MAX_BOUNDARY_SIZE + 8];
-    snprintf(first_boundary, sizeof(first_boundary), "--%s", ctx->boundary);
-    snprintf(close_boundary, sizeof(close_boundary), "\r\n--%s", ctx->boundary);
+    snprintf(first_boundary, sizeof(first_boundary), "--%.*s",
+             (int)(MAX_BOUNDARY_SIZE - 1), ctx->boundary);
+    snprintf(close_boundary, sizeof(close_boundary), "\r\n--%.*s",
+             (int)(MAX_BOUNDARY_SIZE - 1), ctx->boundary);
     size_t fb_len = strlen(first_boundary);
     size_t cb_len = strlen(close_boundary);
 

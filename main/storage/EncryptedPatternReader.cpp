@@ -4,7 +4,6 @@
 #include "drm/drm_purchase.h"
 
 #include <esp_log.h>
-#include <mbedtls/aes.h>
 #include <mbedtls/platform_util.h>
 
 #include <stdio.h>
@@ -13,18 +12,13 @@
 static const char* TAG = "encrypted_reader";
 
 EncryptedPatternReader::EncryptedPatternReader() {
-    mbedtls_aes_init(&aes_);
     memset(aes_key_, 0, sizeof(aes_key_));
     memset(&header_, 0, sizeof(header_));
-    memset(nonce_counter_, 0, sizeof(nonce_counter_));
-    memset(stream_block_, 0, sizeof(stream_block_));
-    memset(saved_nonce_counter_, 0, sizeof(saved_nonce_counter_));
-    memset(saved_stream_block_, 0, sizeof(saved_stream_block_));
+    memset(base_iv_, 0, sizeof(base_iv_));
 }
 
 EncryptedPatternReader::~EncryptedPatternReader() {
     close();
-    mbedtls_aes_free(&aes_);
 }
 
 void EncryptedPatternReader::getFilePath(const char* uuid, char* path, size_t path_size) {
@@ -36,16 +30,80 @@ void EncryptedPatternReader::clearKey() {
     has_key_ = false;
 }
 
-void EncryptedPatternReader::saveCtrState() {
-    saved_nc_off_ = nc_off_;
-    memcpy(saved_nonce_counter_, nonce_counter_, sizeof(nonce_counter_));
-    memcpy(saved_stream_block_, stream_block_, sizeof(stream_block_));
+esp_err_t EncryptedPatternReader::importAesKey() {
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_DECRYPT);
+    psa_set_key_algorithm(&attributes, PSA_ALG_CTR);
+    psa_set_key_type(&attributes, PSA_KEY_TYPE_AES);
+    psa_set_key_bits(&attributes, 256);
+    psa_set_key_lifetime(&attributes, PSA_KEY_LIFETIME_VOLATILE);
+
+    psa_status_t status = psa_import_key(&attributes, aes_key_,
+        DRM_AES_KEY_BYTES, &aes_key_id_);
+    psa_reset_key_attributes(&attributes);
+
+    if (status != PSA_SUCCESS) {
+        ESP_LOGE(TAG, "Failed to import AES key to PSA: %d", status);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
 }
 
-void EncryptedPatternReader::restoreCtrState() {
-    nc_off_ = saved_nc_off_;
-    memcpy(nonce_counter_, saved_nonce_counter_, sizeof(nonce_counter_));
-    memcpy(stream_block_, saved_stream_block_, sizeof(stream_block_));
+esp_err_t EncryptedPatternReader::startCipherAtPosition(size_t byte_position) {
+    // Abort any active operation
+    if (cipher_active_) {
+        psa_cipher_abort(&cipher_op_);
+        cipher_active_ = false;
+    }
+
+    // Calculate counter value for this position
+    // CTR counter = base_IV + (position / 16)
+    uint8_t iv[16];
+    memcpy(iv, base_iv_, 16);
+
+    // Add position/16 to counter (big-endian, last 8 bytes used as counter)
+    uint64_t block_num = byte_position / 16;
+    for (int i = 15; i >= 8 && block_num > 0; i--) {
+        uint16_t sum = iv[i] + (block_num & 0xFF);
+        iv[i] = sum & 0xFF;
+        block_num = (block_num >> 8) + (sum >> 8);  // carry
+    }
+
+    // Setup new cipher operation
+    cipher_op_ = PSA_CIPHER_OPERATION_INIT;
+    psa_status_t status = psa_cipher_decrypt_setup(&cipher_op_, aes_key_id_, PSA_ALG_CTR);
+    if (status != PSA_SUCCESS) {
+        ESP_LOGE(TAG, "psa_cipher_decrypt_setup failed: %d", status);
+        return ESP_FAIL;
+    }
+
+    status = psa_cipher_set_iv(&cipher_op_, iv, sizeof(iv));
+    if (status != PSA_SUCCESS) {
+        psa_cipher_abort(&cipher_op_);
+        ESP_LOGE(TAG, "psa_cipher_set_iv failed: %d", status);
+        return ESP_FAIL;
+    }
+
+    cipher_active_ = true;
+    decrypt_position_ = byte_position;
+
+    // Handle partial block: skip bytes within current block
+    size_t skip = byte_position % 16;
+    if (skip > 0) {
+        // Decrypt dummy bytes to advance keystream
+        uint8_t dummy_in[16] = {0};
+        uint8_t dummy_out[16];
+        size_t out_len = 0;
+        status = psa_cipher_update(&cipher_op_, dummy_in, skip, dummy_out, sizeof(dummy_out), &out_len);
+        if (status != PSA_SUCCESS) {
+            psa_cipher_abort(&cipher_op_);
+            cipher_active_ = false;
+            ESP_LOGE(TAG, "psa_cipher_update (skip) failed: %d", status);
+            return ESP_FAIL;
+        }
+    }
+
+    return ESP_OK;
 }
 
 esp_err_t EncryptedPatternReader::open(const char* uuid) {
@@ -151,35 +209,35 @@ esp_err_t EncryptedPatternReader::openFile(const char* path) {
 }
 
 esp_err_t EncryptedPatternReader::initDecryption() {
-    if (aes_initialized_) {
-        mbedtls_aes_free(&aes_);
-        mbedtls_aes_init(&aes_);
+    // Copy IV from header for rewind/seek
+    memcpy(base_iv_, header_.iv, sizeof(base_iv_));
+
+    // Import key to PSA
+    esp_err_t ret = importAesKey();
+    if (ret != ESP_OK) {
+        return ret;
     }
 
-    // Set up AES key for encryption (CTR mode uses encryption for both directions)
-    int ret = mbedtls_aes_setkey_enc(&aes_, aes_key_, 256);
-    if (ret != 0) {
-        ESP_LOGE(TAG, "Failed to set AES key: -0x%04X", -ret);
-        return ESP_FAIL;
-    }
-
-    // Initialize counter from IV
-    memcpy(nonce_counter_, header_.iv, sizeof(nonce_counter_));
-    nc_off_ = 0;
-    memset(stream_block_, 0, sizeof(stream_block_));
-
-    aes_initialized_ = true;
-    return ESP_OK;
+    // Start cipher at position 0
+    return startCipherAtPosition(0);
 }
 
 void EncryptedPatternReader::close() {
-    if (aes_initialized_) {
-        mbedtls_aes_free(&aes_);
-        mbedtls_aes_init(&aes_);
-        aes_initialized_ = false;
+    // Abort cipher operation
+    if (cipher_active_) {
+        psa_cipher_abort(&cipher_op_);
+        cipher_active_ = false;
     }
 
+    // Destroy PSA key
+    if (aes_key_id_ != PSA_KEY_ID_NULL) {
+        psa_destroy_key(aes_key_id_);
+        aes_key_id_ = PSA_KEY_ID_NULL;
+    }
+
+    // Zeroize sensitive data
     clearKey();
+    mbedtls_platform_zeroize(base_iv_, sizeof(base_iv_));
 
     if (file_) {
         fclose(file_);
@@ -187,18 +245,13 @@ void EncryptedPatternReader::close() {
     }
 
     memset(&header_, 0, sizeof(header_));
-    memset(nonce_counter_, 0, sizeof(nonce_counter_));
-    memset(stream_block_, 0, sizeof(stream_block_));
-    memset(saved_nonce_counter_, 0, sizeof(saved_nonce_counter_));
-    memset(saved_stream_block_, 0, sizeof(saved_stream_block_));
-    nc_off_ = 0;
-    saved_nc_off_ = 0;
+    decrypt_position_ = 0;
     current_point_ = 0;
     has_peeked_ = false;
 }
 
 bool EncryptedPatternReader::isOpen() const {
-    return file_ != nullptr && aes_initialized_;
+    return file_ != nullptr && cipher_active_ && aes_key_id_ != PSA_KEY_ID_NULL;
 }
 
 size_t EncryptedPatternReader::getTotalLines() {
@@ -221,23 +274,27 @@ PatternPoint EncryptedPatternReader::readBinaryPoint() {
         return PatternPoint();
     }
 
-    // Decrypt in place using AES-CTR (handles partial blocks via nc_off_/stream_block_)
-    int ret = mbedtls_aes_crypt_ctr(&aes_,
-        sizeof(bp),
-        &nc_off_,
-        nonce_counter_,
-        stream_block_,
-        reinterpret_cast<uint8_t*>(&bp),
-        reinterpret_cast<uint8_t*>(&bp));
-    if (ret != 0) {
-        ESP_LOGE(TAG, "AES-CTR decryption failed: -0x%04X", -ret);
+    // Decrypt using PSA cipher
+    uint8_t decrypted[sizeof(BinaryPoint)];
+    size_t out_len = 0;
+    psa_status_t status = psa_cipher_update(&cipher_op_,
+        reinterpret_cast<uint8_t*>(&bp), sizeof(bp),
+        decrypted, sizeof(decrypted), &out_len);
+
+    if (status != PSA_SUCCESS) {
+        ESP_LOGE(TAG, "psa_cipher_update failed: %d", status);
         return PatternPoint();
     }
 
-    // Convert uint16 rho to float 0.0-1.0
-    double rho = static_cast<double>(bp.rho) / 65535.0;
+    decrypt_position_ += sizeof(bp);
 
-    return PatternPoint(static_cast<double>(bp.theta), rho);
+    // Parse decrypted point
+    BinaryPoint* dbp = reinterpret_cast<BinaryPoint*>(decrypted);
+
+    // Convert uint16 rho to float 0.0-1.0
+    double rho = static_cast<double>(dbp->rho) / 65535.0;
+
+    return PatternPoint(static_cast<double>(dbp->theta), rho);
 }
 
 PatternPoint EncryptedPatternReader::readNext() {
@@ -263,16 +320,20 @@ PatternPoint EncryptedPatternReader::peekNext() {
         return PatternPoint();
     }
 
-    // Save file position and CTR state
-    long prev_pos = ftell(file_);
-    saveCtrState();
+    // Save state
+    long saved_file_pos = ftell(file_);
+    size_t saved_decrypt_pos = decrypt_position_;
+    size_t saved_point = current_point_;
 
-    // Read next point
+    // Read next point (advances cipher state)
     peeked_point_ = readBinaryPoint();
 
-    // Restore file position and CTR state
-    fseek(file_, prev_pos, SEEK_SET);
-    restoreCtrState();
+    // Restore file position
+    fseek(file_, saved_file_pos, SEEK_SET);
+
+    // Restart cipher at saved position
+    startCipherAtPosition(saved_decrypt_pos);
+    current_point_ = saved_point;
 
     if (peeked_point_.valid) {
         has_peeked_ = true;
@@ -296,8 +357,8 @@ esp_err_t EncryptedPatternReader::rewind() {
     // Seek file back to start of ciphertext (after header)
     fseek(file_, sizeof(header_), SEEK_SET);
 
-    // Re-initialize AES-CTR context with original IV
-    esp_err_t ret = initDecryption();
+    // Restart cipher at position 0
+    esp_err_t ret = startCipherAtPosition(0);
     if (ret != ESP_OK) {
         return ret;
     }

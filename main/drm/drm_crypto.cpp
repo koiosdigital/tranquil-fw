@@ -6,7 +6,7 @@
 #include <esp_heap_caps.h>
 #include <hal/hmac_types.h>
 
-#include <mbedtls/sha256.h>
+#include <psa/crypto.h>
 #include <mbedtls/platform_util.h>
 
 #include <string.h>
@@ -24,18 +24,18 @@ static const uint8_t OAEP_LHASH_SHA256[32] = {
 void drm_mgf1_sha256(const uint8_t* seed, size_t seed_len,
     uint8_t* mask, size_t mask_len) {
     // MGF1 with SHA-256: mask = H(seed || counter_0) || H(seed || counter_1) || ...
-    uint8_t hash[32];
+    uint8_t hash[PSA_HASH_LENGTH(PSA_ALG_SHA_256)];
     uint8_t counter[4] = { 0, 0, 0, 0 };
     size_t offset = 0;
 
     while (offset < mask_len) {
-        mbedtls_sha256_context ctx;
-        mbedtls_sha256_init(&ctx);
-        mbedtls_sha256_starts(&ctx, 0);  // 0 = SHA-256 (not SHA-224)
-        mbedtls_sha256_update(&ctx, seed, seed_len);
-        mbedtls_sha256_update(&ctx, counter, 4);
-        mbedtls_sha256_finish(&ctx, hash);
-        mbedtls_sha256_free(&ctx);
+        psa_hash_operation_t op = PSA_HASH_OPERATION_INIT;
+        size_t hash_len = 0;
+
+        psa_hash_setup(&op, PSA_ALG_SHA_256);
+        psa_hash_update(&op, seed, seed_len);
+        psa_hash_update(&op, counter, 4);
+        psa_hash_finish(&op, hash, sizeof(hash), &hash_len);
 
         // Copy as much as needed from this hash block
         size_t to_copy = mask_len - offset;

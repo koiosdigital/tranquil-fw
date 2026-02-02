@@ -3,8 +3,8 @@
 #include <kd_common.h>
 #include <esp_heap_caps.h>
 #include <esp_log.h>
+#include <psa/crypto.h>
 #include <mbedtls/pk.h>
-#include <mbedtls/sha256.h>
 #include <mbedtls/x509_crt.h>
 #include <mbedtls/platform_util.h>
 
@@ -69,14 +69,80 @@ static struct {
     .signature_len = 0,
 };
 
+// PSA Crypto key storage
+static uint8_t s_server_pubkey_der[512];
+static size_t s_server_pubkey_der_len = 0;
+static psa_key_id_t s_server_key_id = PSA_KEY_ID_NULL;
+
 static esp_err_t load_license_file(void);
 static esp_err_t parse_license_payload(void);
 static drm_license_status_t validate_license(void);
 static void free_license_data(void);
 
+// Convert PEM public key to DER format for PSA import
+static esp_err_t parse_server_key_pem_to_der(void) {
+    mbedtls_pk_context pk;
+    mbedtls_pk_init(&pk);
+
+    int ret = mbedtls_pk_parse_public_key(&pk,
+        reinterpret_cast<const unsigned char*>(SERVER_PUBLIC_KEY_PEM),
+        strlen(SERVER_PUBLIC_KEY_PEM) + 1);
+
+    if (ret != 0) {
+        ESP_LOGE(TAG, "Failed to parse PEM public key: -0x%04X", -ret);
+        mbedtls_pk_free(&pk);
+        return ESP_FAIL;
+    }
+
+    // mbedtls_pk_write_pubkey_der writes to the END of the buffer
+    int der_len = mbedtls_pk_write_pubkey_der(&pk, s_server_pubkey_der, sizeof(s_server_pubkey_der));
+    mbedtls_pk_free(&pk);
+
+    if (der_len < 0) {
+        ESP_LOGE(TAG, "Failed to write DER: -0x%04X", -der_len);
+        return ESP_FAIL;
+    }
+
+    // Move from end of buffer to start
+    memmove(s_server_pubkey_der, s_server_pubkey_der + sizeof(s_server_pubkey_der) - der_len, der_len);
+    s_server_pubkey_der_len = der_len;
+
+    ESP_LOGD(TAG, "Server public key parsed: %zu bytes DER", s_server_pubkey_der_len);
+    return ESP_OK;
+}
+
+// Import server public key into PSA keystore
+static esp_err_t import_server_key_to_psa(void) {
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_VERIFY_HASH);
+    psa_set_key_algorithm(&attributes, PSA_ALG_RSA_PKCS1V15_SIGN(PSA_ALG_SHA_256));
+    psa_set_key_type(&attributes, PSA_KEY_TYPE_RSA_PUBLIC_KEY);
+    psa_set_key_bits(&attributes, 2048);
+    psa_set_key_lifetime(&attributes, PSA_KEY_LIFETIME_VOLATILE);
+
+    psa_status_t status = psa_import_key(&attributes, s_server_pubkey_der,
+        s_server_pubkey_der_len, &s_server_key_id);
+    psa_reset_key_attributes(&attributes);
+
+    if (status != PSA_SUCCESS) {
+        ESP_LOGE(TAG, "Failed to import server public key: %d", status);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGD(TAG, "Server public key imported to PSA, key_id: %lu", (unsigned long)s_server_key_id);
+    return ESP_OK;
+}
+
 esp_err_t drm_license_init(void) {
     if (license_state.initialized) {
         return ESP_OK;
+    }
+
+    // Initialize PSA Crypto subsystem (idempotent)
+    psa_status_t psa_status = psa_crypto_init();
+    if (psa_status != PSA_SUCCESS) {
+        ESP_LOGE(TAG, "Failed to initialize PSA crypto: %d", psa_status);
+        return ESP_FAIL;
     }
 
     license_state.mutex = xSemaphoreCreateMutex();
@@ -85,10 +151,23 @@ esp_err_t drm_license_init(void) {
         return ESP_ERR_NO_MEM;
     }
 
+    // Parse and import server public key for signature verification
+    esp_err_t ret = parse_server_key_pem_to_der();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to parse server public key PEM");
+        return ret;
+    }
+
+    ret = import_server_key_to_psa();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to import server public key to PSA");
+        return ret;
+    }
+
     license_state.initialized = true;
 
     // Try to load license (may fail if no license file)
-    esp_err_t ret = load_license_file();
+    ret = load_license_file();
     if (ret == ESP_OK) {
         license_state.status = validate_license();
     }
@@ -215,29 +294,32 @@ esp_err_t drm_license_save(const uint8_t* payload, size_t payload_len,
 
 esp_err_t drm_license_verify_signature(const uint8_t* payload, size_t payload_len,
     const uint8_t* signature, size_t signature_len) {
-    mbedtls_pk_context pk;
-    mbedtls_pk_init(&pk);
+    if (s_server_key_id == PSA_KEY_ID_NULL) {
+        ESP_LOGE(TAG, "Server key not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
 
-    int ret = mbedtls_pk_parse_public_key(&pk,
-        reinterpret_cast<const unsigned char*>(SERVER_PUBLIC_KEY_PEM),
-        strlen(SERVER_PUBLIC_KEY_PEM) + 1);
+    // Calculate SHA-256 hash of payload using PSA
+    uint8_t hash[PSA_HASH_LENGTH(PSA_ALG_SHA_256)];
+    size_t hash_len = 0;
 
-    if (ret != 0) {
-        ESP_LOGE(TAG, "Failed to parse server public key: -0x%04X", -ret);
-        mbedtls_pk_free(&pk);
+    psa_status_t status = psa_hash_compute(PSA_ALG_SHA_256, payload, payload_len,
+        hash, sizeof(hash), &hash_len);
+    if (status != PSA_SUCCESS) {
+        ESP_LOGE(TAG, "SHA-256 hash failed: %d", status);
         return ESP_FAIL;
     }
 
-    // Calculate SHA-256 hash of payload
-    uint8_t hash[32];
-    mbedtls_sha256(payload, payload_len, hash, 0);
+    // Verify signature using cached PSA key
+    status = psa_verify_hash(s_server_key_id, PSA_ALG_RSA_PKCS1V15_SIGN(PSA_ALG_SHA_256),
+        hash, hash_len, signature, signature_len);
 
-    // Verify signature
-    ret = mbedtls_pk_verify(&pk, MBEDTLS_MD_SHA256, hash, 32, signature, signature_len);
-    mbedtls_pk_free(&pk);
-
-    if (ret != 0) {
-        ESP_LOGE(TAG, "Signature verification failed: -0x%04X", -ret);
+    if (status != PSA_SUCCESS) {
+        if (status == PSA_ERROR_INVALID_SIGNATURE) {
+            ESP_LOGE(TAG, "Signature verification failed: invalid signature");
+        } else {
+            ESP_LOGE(TAG, "Signature verification failed: %d", status);
+        }
         return ESP_ERR_INVALID_ARG;
     }
 

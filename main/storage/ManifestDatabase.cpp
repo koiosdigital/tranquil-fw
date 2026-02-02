@@ -1,345 +1,530 @@
 #include "ManifestDatabase.h"
 #include "jobs/job_types.h"
 #include "sd.h"
-#include "sqlite3.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
-#include "freertos/queue.h"
-#include "freertos/task.h"
 #include <sys/stat.h>
 #include <ctime>
 #include <algorithm>
 #include <unistd.h>
-#include <functional>
-#include <type_traits>
+#include <unordered_map>
+#include <cstring>
 
 static const char* TAG = "ManifestDB";
-static constexpr const char* DB_PATH = "/sd/manifest.db";
+static constexpr const char* DB_PATH = "/sd/manifest.tqdb";
+static constexpr const char* DB_TMP_PATH = "/sd/manifest.tqdb.tmp";
+static constexpr const char* DB_BAK_PATH = "/sd/manifest.tqdb.bak";
 
-// SQLite task stack size - needs to be large for SQLite operations
-static constexpr size_t SQLITE_TASK_STACK_SIZE = 16 * 1024;
+static constexpr uint32_t TQDB_MAGIC = 0x42445154;  // "TQDB" little-endian
+static constexpr uint16_t TQDB_VERSION = 1;
 
-// Command structure for the SQLite task queue
-struct SqliteCommand {
-    std::function<void()>* fn;
-    SemaphoreHandle_t done;
-};
+// Max sanity limits for corrupt file detection
+static constexpr uint32_t MAX_PATTERNS = 10000;
+static constexpr uint32_t MAX_PLAYLISTS = 5000;
+static constexpr uint32_t MAX_JOBS = 5000;
+static constexpr uint16_t MAX_STRING = 4096;
 
-// Pimpl implementation
-class ManifestDatabase::Impl {
+// I/O buffer size (4KB matches SD card allocation and HTTP chunk patterns)
+static constexpr size_t IO_BUFFER_SIZE = 4096;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CRC32 (standard polynomial 0xEDB88320)
+// ─────────────────────────────────────────────────────────────────────────────
+
+static uint32_t s_crc32_table[256];
+static bool s_crc32_ready = false;
+
+static void crc32_init() {
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t c = i;
+        for (int j = 0; j < 8; j++)
+            c = (c >> 1) ^ (c & 1 ? 0xEDB88320u : 0);
+        s_crc32_table[i] = c;
+    }
+    s_crc32_ready = true;
+}
+
+static inline uint32_t crc32_byte(uint32_t crc, uint8_t b) {
+    return s_crc32_table[(crc ^ b) & 0xFF] ^ (crc >> 8);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Buffered binary stream writers/readers with integrated CRC tracking
+// Uses caller-provided 4KB buffer to reduce syscall overhead on SD card
+// ─────────────────────────────────────────────────────────────────────────────
+
+class BinaryWriter {
+    FILE* f_;
+    uint32_t crc_;
+    bool error_;
+    uint8_t* buf_;
+    size_t buf_size_;
+    size_t buf_pos_;
+
 public:
-    sqlite3* db = nullptr;
-    SemaphoreHandle_t mutex = nullptr;
-    bool initialized = false;
-
-    // SQLite task handles
-    TaskHandle_t sqliteTask = nullptr;
-    QueueHandle_t commandQueue = nullptr;
-    SemaphoreHandle_t completionSem = nullptr;  // Reusable completion semaphore
-    volatile bool taskRunning = false;
-
-    // Execute a function on the SQLite task and wait for completion
-    // Uses raw function pointer to avoid std::function heap allocation
-    template<typename F>
-    auto executeOnSqliteTask(F&& func) -> decltype(func()) {
-        using ReturnType = decltype(func());
-
-        if constexpr (std::is_void_v<ReturnType>) {
-            std::function<void()> wrapper = [&func]() { func(); };
-            SqliteCommand cmd = { &wrapper, completionSem };
-            xQueueSend(commandQueue, &cmd, portMAX_DELAY);
-            xSemaphoreTake(completionSem, portMAX_DELAY);
-        }
-        else {
-            ReturnType result{};
-            std::function<void()> wrapper = [&func, &result]() { result = func(); };
-            SqliteCommand cmd = { &wrapper, completionSem };
-            xQueueSend(commandQueue, &cmd, portMAX_DELAY);
-            xSemaphoreTake(completionSem, portMAX_DELAY);
-            return result;
-        }
+    BinaryWriter(FILE* f, uint8_t* buffer, size_t buffer_size)
+        : f_(f), crc_(0xFFFFFFFF), error_(false),
+        buf_(buffer), buf_size_(buffer_size), buf_pos_(0) {
     }
 
-    static void sqliteTaskFunction(void* param) {
-        auto* impl = static_cast<Impl*>(param);
-        SqliteCommand cmd;
-        ESP_LOGI(TAG, "SQLite task started");
+    bool hasError() const { return error_; }
+    uint32_t crc() const { return ~crc_; }
 
-        while (impl->taskRunning) {
-            if (xQueueReceive(impl->commandQueue, &cmd, pdMS_TO_TICKS(100)) == pdTRUE) {
-                if (cmd.fn) {
-                    (*cmd.fn)();
-                }
-                if (cmd.done) {
-                    xSemaphoreGive(cmd.done);
+    void flush() {
+        if (error_ || buf_pos_ == 0) return;
+        if (fwrite(buf_, 1, buf_pos_, f_) != buf_pos_) {
+            error_ = true;
+        }
+        buf_pos_ = 0;
+    }
+
+    void raw(const void* data, size_t len) {
+        if (error_) return;
+        auto p = static_cast<const uint8_t*>(data);
+
+        // Update CRC as data arrives
+        for (size_t i = 0; i < len; i++)
+            crc_ = crc32_byte(crc_, p[i]);
+
+        // Fast path: fits in buffer
+        if (len <= buf_size_ - buf_pos_) {
+            memcpy(buf_ + buf_pos_, p, len);
+            buf_pos_ += len;
+            return;
+        }
+
+        // Flush current buffer
+        flush();
+        if (error_) return;
+
+        // Large write: bypass buffer
+        if (len >= buf_size_) {
+            if (fwrite(p, 1, len, f_) != len) error_ = true;
+            return;
+        }
+
+        // Copy to fresh buffer
+        memcpy(buf_, p, len);
+        buf_pos_ = len;
+    }
+
+    void u8(uint8_t  v) { raw(&v, 1); }
+    void u16(uint16_t v) { raw(&v, 2); }
+    void u32(uint32_t v) { raw(&v, 4); }
+    void i32(int32_t  v) { raw(&v, 4); }
+    void i64(int64_t  v) { raw(&v, 8); }
+
+    void str(const std::string& s) {
+        uint16_t len = static_cast<uint16_t>(std::min(s.size(), size_t(0xFFFF)));
+        u16(len);
+        if (len > 0) raw(s.data(), len);
+    }
+};
+
+class BinaryReader {
+    FILE* f_;
+    uint32_t crc_;
+    bool error_;
+    uint8_t* buf_;
+    size_t buf_size_;
+    size_t buf_pos_;
+    size_t buf_filled_;
+
+public:
+    BinaryReader(FILE* f, uint8_t* buffer, size_t buffer_size)
+        : f_(f), crc_(0xFFFFFFFF), error_(false),
+        buf_(buffer), buf_size_(buffer_size), buf_pos_(0), buf_filled_(0) {
+    }
+
+    bool hasError() const { return error_; }
+    uint32_t crc() const { return ~crc_; }
+
+    void raw(void* data, size_t len) {
+        if (error_) return;
+        auto p = static_cast<uint8_t*>(data);
+        size_t written = 0;
+
+        while (written < len && !error_) {
+            size_t avail = buf_filled_ - buf_pos_;
+            if (avail > 0) {
+                size_t to_copy = std::min(avail, len - written);
+                memcpy(p + written, buf_ + buf_pos_, to_copy);
+                buf_pos_ += to_copy;
+                written += to_copy;
+            }
+            else {
+                // Refill buffer
+                buf_filled_ = fread(buf_, 1, buf_size_, f_);
+                buf_pos_ = 0;
+                if (buf_filled_ == 0) {
+                    error_ = true;
+                    return;
                 }
             }
         }
 
-        ESP_LOGI(TAG, "SQLite task exiting");
-        vTaskDelete(nullptr);
+        // Update CRC
+        for (size_t i = 0; i < len; i++)
+            crc_ = crc32_byte(crc_, p[i]);
     }
+
+    uint8_t  u8() { uint8_t  v = 0; raw(&v, 1); return v; }
+    uint16_t u16() { uint16_t v = 0; raw(&v, 2); return v; }
+    uint32_t u32() { uint32_t v = 0; raw(&v, 4); return v; }
+    int32_t  i32() { int32_t  v = 0; raw(&v, 4); return v; }
+    int64_t  i64() { int64_t  v = 0; raw(&v, 8); return v; }
+
+    std::string str() {
+        uint16_t len = u16();
+        if (error_ || len > MAX_STRING) { error_ = true; return ""; }
+        std::string s(len, '\0');
+        if (len > 0) raw(s.data(), len);
+        return s;
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Impl – in-memory storage + binary persistence
+// ─────────────────────────────────────────────────────────────────────────────
+
+class ManifestDatabase::Impl {
+public:
+    std::unordered_map<std::string, Pattern>    patterns;
+    std::unordered_map<std::string, Playlist>   playlists;
+    std::unordered_map<std::string, jobs::Job>  jobs;
+
+    SemaphoreHandle_t mutex = nullptr;
+    bool initialized = false;
 
     // RAII mutex guard
     class Lock {
     public:
         explicit Lock(SemaphoreHandle_t m, TickType_t timeout = pdMS_TO_TICKS(5000))
             : mutex_(m), acquired_(false) {
-            if (mutex_ && xSemaphoreTake(mutex_, timeout) == pdTRUE) {
+            if (mutex_ && xSemaphoreTake(mutex_, timeout) == pdTRUE)
                 acquired_ = true;
-            }
         }
-        ~Lock() {
-            if (acquired_ && mutex_) {
-                xSemaphoreGive(mutex_);
-            }
-        }
+        ~Lock() { if (acquired_ && mutex_) xSemaphoreGive(mutex_); }
         bool acquired() const { return acquired_; }
     private:
         SemaphoreHandle_t mutex_;
         bool acquired_;
     };
 
-    // RAII transaction
-    class Transaction {
-    public:
-        explicit Transaction(sqlite3* db) : db_(db), committed_(false) {
-            sqlite3_exec(db_, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr);
-        }
-        ~Transaction() {
-            if (!committed_) {
-                sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-            }
-        }
-        void commit() {
-            sqlite3_exec(db_, "COMMIT", nullptr, nullptr, nullptr);
-            committed_ = true;
-        }
-    private:
-        sqlite3* db_;
-        bool committed_;
-    };
+    // ── Sorted helpers (sort-on-demand; fast for <1000 items) ────────────
 
-    // RAII statement wrapper
-    class Statement {
-    public:
-        Statement(sqlite3* db, const char* sql) : stmt_(nullptr) {
-            sqlite3_prepare_v2(db, sql, -1, &stmt_, nullptr);
-        }
-        ~Statement() {
-            if (stmt_) sqlite3_finalize(stmt_);
-        }
-        operator sqlite3_stmt* () { return stmt_; }
-        sqlite3_stmt* get() { return stmt_; }
-        bool valid() const { return stmt_ != nullptr; }
-
-        void bindText(int idx, const std::string& val) {
-            sqlite3_bind_text(stmt_, idx, val.c_str(), -1, SQLITE_TRANSIENT);
-        }
-        void bindInt(int idx, int val) {
-            sqlite3_bind_int(stmt_, idx, val);
-        }
-        void bindInt64(int idx, int64_t val) {
-            sqlite3_bind_int64(stmt_, idx, val);
-        }
-        void bindNull(int idx) {
-            sqlite3_bind_null(stmt_, idx);
-        }
-
-        int step() { return sqlite3_step(stmt_); }
-        void reset() { sqlite3_reset(stmt_); sqlite3_clear_bindings(stmt_); }
-
-        const char* columnText(int idx) {
-            const char* t = reinterpret_cast<const char*>(sqlite3_column_text(stmt_, idx));
-            return t ? t : "";
-        }
-        int columnInt(int idx) { return sqlite3_column_int(stmt_, idx); }
-        int64_t columnInt64(int idx) { return sqlite3_column_int64(stmt_, idx); }
-
-    private:
-        sqlite3_stmt* stmt_;
-    };
-
-    esp_err_t createSchema() {
-        const char* schema = R"(
-            CREATE TABLE IF NOT EXISTS patterns (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                uuid TEXT NOT NULL UNIQUE,
-                name TEXT NOT NULL,
-                creator TEXT DEFAULT 'Uploaded',
-                date TEXT,
-                popularity INTEGER DEFAULT 0,
-                reversible INTEGER DEFAULT 0,
-                start_point INTEGER DEFAULT 0,
-                encrypted INTEGER DEFAULT 0,
-                size_bytes INTEGER DEFAULT 0,
-                created_at TEXT,
-                last_played_at TEXT,
-                downloaded_at TEXT,
-                purchased INTEGER DEFAULT 0,
-                purchased_at INTEGER DEFAULT 0,
-                receipt_id TEXT DEFAULT ''
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_patterns_uuid ON patterns(uuid);
-            CREATE INDEX IF NOT EXISTS idx_patterns_popularity ON patterns(popularity DESC);
-            CREATE INDEX IF NOT EXISTS idx_patterns_last_played ON patterns(last_played_at);
-
-            CREATE TABLE IF NOT EXISTS playlists (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                uuid TEXT NOT NULL UNIQUE,
-                name TEXT NOT NULL,
-                description TEXT DEFAULT '',
-                featured_pattern_uuid TEXT,
-                date TEXT,
-                created_at TEXT,
-                updated_at TEXT
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_playlists_uuid ON playlists(uuid);
-
-            CREATE TABLE IF NOT EXISTS playlist_patterns (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                playlist_id INTEGER NOT NULL,
-                pattern_id INTEGER NOT NULL,
-                position INTEGER NOT NULL,
-                FOREIGN KEY (playlist_id) REFERENCES playlists(id) ON DELETE CASCADE,
-                FOREIGN KEY (pattern_id) REFERENCES patterns(id) ON DELETE CASCADE,
-                UNIQUE(playlist_id, pattern_id),
-                UNIQUE(playlist_id, position)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_pp_playlist ON playlist_patterns(playlist_id, position);
-
-            CREATE TABLE IF NOT EXISTS jobs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                uuid TEXT NOT NULL UNIQUE,
-                job_type TEXT NOT NULL,
-                pattern_uuid TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                priority INTEGER DEFAULT 0,
-                retry_count INTEGER DEFAULT 0,
-                max_retries INTEGER DEFAULT 3,
-                created_at TEXT NOT NULL,
-                started_at TEXT,
-                completed_at TEXT,
-                error_message TEXT,
-                job_data TEXT,
-                FOREIGN KEY (pattern_uuid) REFERENCES patterns(uuid) ON DELETE CASCADE
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_jobs_status_priority ON jobs(status, priority DESC, created_at);
-            CREATE INDEX IF NOT EXISTS idx_jobs_pattern ON jobs(pattern_uuid);
-
-            PRAGMA foreign_keys = ON;
-        )";
-
-        char* err_msg = nullptr;
-        int rc = sqlite3_exec(db, schema, nullptr, nullptr, &err_msg);
-        if (rc != SQLITE_OK) {
-            ESP_LOGE(TAG, "Schema error: %s", err_msg);
-            sqlite3_free(err_msg);
-            return ESP_FAIL;
-        }
-
-        // Migration: add new columns to existing databases (silently fails if columns exist)
-        const char* migrations[] = {
-            "ALTER TABLE patterns ADD COLUMN purchased INTEGER DEFAULT 0",
-            "ALTER TABLE patterns ADD COLUMN purchased_at INTEGER DEFAULT 0",
-            "ALTER TABLE patterns ADD COLUMN receipt_id TEXT DEFAULT ''",
-            nullptr
-        };
-        for (int i = 0; migrations[i] != nullptr; i++) {
-            sqlite3_exec(db, migrations[i], nullptr, nullptr, nullptr);
-        }
-
-        return ESP_OK;
+    std::vector<const Pattern*> patternsSortedByName() const {
+        std::vector<const Pattern*> v;
+        v.reserve(patterns.size());
+        for (auto& [_, p] : patterns) v.push_back(&p);
+        std::sort(v.begin(), v.end(),
+            [](const Pattern* a, const Pattern* b) { return a->name < b->name; });
+        return v;
     }
 
-    Pattern rowToPattern(Statement& stmt) {
+    std::vector<const Playlist*> playlistsSortedByName() const {
+        std::vector<const Playlist*> v;
+        v.reserve(playlists.size());
+        for (auto& [_, pl] : playlists) v.push_back(&pl);
+        std::sort(v.begin(), v.end(),
+            [](const Playlist* a, const Playlist* b) { return a->name < b->name; });
+        return v;
+    }
+
+    // ── Binary serialization ─────────────────────────────────────────────
+
+    static void writePattern(BinaryWriter& w, const Pattern& p) {
+        w.str(p.uuid);
+        w.str(p.name);
+        w.str(p.creator);
+        w.str(p.date);
+        w.i32(p.popularity);
+        uint8_t flags = (p.reversible ? 0x01 : 0)
+            | (p.encrypted ? 0x02 : 0)
+            | (p.purchased ? 0x04 : 0);
+        w.u8(flags);
+        w.i32(p.start_point);
+        w.i64(p.size_bytes);
+        w.str(p.created_at);
+        w.str(p.last_played_at);
+        w.str(p.downloaded_at);
+        w.i64(p.purchased_at);
+        w.str(p.receipt_id);
+    }
+
+    static Pattern readPattern(BinaryReader& r) {
         Pattern p;
-        p.uuid = stmt.columnText(0);
-        p.name = stmt.columnText(1);
-        p.creator = stmt.columnText(2);
-        p.date = stmt.columnText(3);
-        p.popularity = stmt.columnInt(4);
-        p.reversible = stmt.columnInt(5) != 0;
-        p.start_point = stmt.columnInt(6);
-        p.encrypted = stmt.columnInt(7) != 0;
-        p.size_bytes = stmt.columnInt64(8);
-        p.created_at = stmt.columnText(9);
-        p.last_played_at = stmt.columnText(10);
-        p.downloaded_at = stmt.columnText(11);
-        p.purchased = stmt.columnInt(12) != 0;
-        p.purchased_at = stmt.columnInt64(13);
-        p.receipt_id = stmt.columnText(14);
+        p.uuid = r.str();
+        p.name = r.str();
+        p.creator = r.str();
+        p.date = r.str();
+        p.popularity = r.i32();
+        uint8_t flags = r.u8();
+        p.reversible = flags & 0x01;
+        p.encrypted = flags & 0x02;
+        p.purchased = flags & 0x04;
+        p.start_point = r.i32();
+        p.size_bytes = r.i64();
+        p.created_at = r.str();
+        p.last_played_at = r.str();
+        p.downloaded_at = r.str();
+        p.purchased_at = r.i64();
+        p.receipt_id = r.str();
         return p;
     }
 
-    Playlist rowToPlaylist(Statement& stmt) {
+    static void writePlaylist(BinaryWriter& w, const Playlist& pl) {
+        w.str(pl.uuid);
+        w.str(pl.name);
+        w.str(pl.description);
+        w.str(pl.featured_pattern);
+        w.str(pl.date);
+        w.str(pl.created_at);
+        w.str(pl.updated_at);
+        w.u32(static_cast<uint32_t>(pl.patterns.size()));
+        for (auto& uuid : pl.patterns) w.str(uuid);
+    }
+
+    static Playlist readPlaylist(BinaryReader& r) {
         Playlist pl;
-        pl.uuid = stmt.columnText(0);
-        pl.name = stmt.columnText(1);
-        pl.description = stmt.columnText(2);
-        pl.featured_pattern = stmt.columnText(3);
-        pl.date = stmt.columnText(4);
-        pl.created_at = stmt.columnText(5);
-        pl.updated_at = stmt.columnText(6);
+        pl.uuid = r.str();
+        pl.name = r.str();
+        pl.description = r.str();
+        pl.featured_pattern = r.str();
+        pl.date = r.str();
+        pl.created_at = r.str();
+        pl.updated_at = r.str();
+        uint32_t n = r.u32();
+        if (n > MAX_PATTERNS) { return pl; }  // sanity
+        pl.patterns.reserve(n);
+        for (uint32_t i = 0; i < n; i++) pl.patterns.push_back(r.str());
         return pl;
     }
 
-    int getPlaylistId(const std::string& uuid) {
-        Statement stmt(db, "SELECT id FROM playlists WHERE uuid = ?");
-        stmt.bindText(1, uuid);
-        if (stmt.step() == SQLITE_ROW) {
-            return stmt.columnInt(0);
-        }
-        return -1;
+    static void writeJob(BinaryWriter& w, const jobs::Job& j) {
+        w.str(j.uuid);
+        w.str(jobs::jobTypeToString(j.type));
+        w.str(j.pattern_uuid);
+        w.str(jobs::jobStatusToString(j.status));
+        w.i32(j.priority);
+        w.i32(j.retry_count);
+        w.i32(j.max_retries);
+        w.str(j.created_at);
+        w.str(j.started_at);
+        w.str(j.completed_at);
+        w.str(j.error_message);
+        w.str(j.job_data);
     }
 
-    int getPatternId(const std::string& uuid) {
-        Statement stmt(db, "SELECT id FROM patterns WHERE uuid = ?");
-        stmt.bindText(1, uuid);
-        if (stmt.step() == SQLITE_ROW) {
-            return stmt.columnInt(0);
-        }
-        return -1;
-    }
-
-    std::vector<std::string> getPlaylistPatternUuids(int playlistId) {
-        std::vector<std::string> uuids;
-        Statement stmt(db,
-            "SELECT p.uuid FROM patterns p "
-            "JOIN playlist_patterns pp ON p.id = pp.pattern_id "
-            "WHERE pp.playlist_id = ? ORDER BY pp.position");
-        stmt.bindInt(1, playlistId);
-        while (stmt.step() == SQLITE_ROW) {
-            uuids.push_back(stmt.columnText(0));
-        }
-        return uuids;
-    }
-
-    jobs::Job rowToJob(Statement& stmt) {
+    static jobs::Job readJob(BinaryReader& r) {
         jobs::Job j;
-        j.uuid = stmt.columnText(0);
-        j.type = jobs::jobTypeFromString(stmt.columnText(1));
-        j.pattern_uuid = stmt.columnText(2);
-        j.status = jobs::jobStatusFromString(stmt.columnText(3));
-        j.priority = stmt.columnInt(4);
-        j.retry_count = stmt.columnInt(5);
-        j.max_retries = stmt.columnInt(6);
-        j.created_at = stmt.columnText(7);
-        j.started_at = stmt.columnText(8);
-        j.completed_at = stmt.columnText(9);
-        j.error_message = stmt.columnText(10);
-        j.job_data = stmt.columnText(11);
+        j.uuid = r.str();
+        j.type = jobs::jobTypeFromString(r.str().c_str());
+        j.pattern_uuid = r.str();
+        j.status = jobs::jobStatusFromString(r.str().c_str());
+        j.priority = r.i32();
+        j.retry_count = r.i32();
+        j.max_retries = r.i32();
+        j.created_at = r.str();
+        j.started_at = r.str();
+        j.completed_at = r.str();
+        j.error_message = r.str();
+        j.job_data = r.str();
         return j;
+    }
+
+    // ── Persistence ──────────────────────────────────────────────────────
+
+    esp_err_t save() {
+        FILE* f = fopen(DB_TMP_PATH, "wb");
+        if (!f) {
+            ESP_LOGE(TAG, "Failed to open %s for writing", DB_TMP_PATH);
+            return ESP_FAIL;
+        }
+
+        // Write 16-byte header (CRC placeholder at offset 8)
+        uint32_t magic = TQDB_MAGIC;
+        uint16_t version = TQDB_VERSION;
+        uint16_t flags = 0;
+        uint32_t crc_placeholder = 0;
+        uint32_t reserved = 0;
+        fwrite(&magic, 4, 1, f);
+        fwrite(&version, 2, 1, f);
+        fwrite(&flags, 2, 1, f);
+        fwrite(&crc_placeholder, 4, 1, f);
+        fwrite(&reserved, 4, 1, f);
+
+        // 4KB stack buffer for buffered writes
+        uint8_t scratch[IO_BUFFER_SIZE];
+        BinaryWriter w(f, scratch, sizeof(scratch));
+
+        // Patterns
+        w.u32(static_cast<uint32_t>(patterns.size()));
+        for (auto& [_, p] : patterns) writePattern(w, p);
+
+        // Playlists
+        w.u32(static_cast<uint32_t>(playlists.size()));
+        for (auto& [_, pl] : playlists) writePlaylist(w, pl);
+
+        // Jobs
+        w.u32(static_cast<uint32_t>(jobs.size()));
+        for (auto& [_, j] : jobs) writeJob(w, j);
+
+        // Flush remaining buffered data
+        w.flush();
+
+        if (w.hasError()) {
+            fclose(f);
+            unlink(DB_TMP_PATH);
+            ESP_LOGE(TAG, "Write error during save");
+            return ESP_FAIL;
+        }
+
+        // Patch CRC into header
+        uint32_t crc = w.crc();
+        fseek(f, 8, SEEK_SET);
+        fwrite(&crc, 4, 1, f);
+        fflush(f);
+        fclose(f);
+
+        // Atomic-ish swap: tmp → live (safe on FAT32 power loss)
+        remove(DB_BAK_PATH);
+        rename(DB_PATH, DB_BAK_PATH);    // old → bak (may fail if no old file)
+        if (rename(DB_TMP_PATH, DB_PATH) != 0) {
+            // Try to restore backup
+            rename(DB_BAK_PATH, DB_PATH);
+            ESP_LOGE(TAG, "Failed to rename tmp to live");
+            return ESP_FAIL;
+        }
+        remove(DB_BAK_PATH);
+
+        ESP_LOGD(TAG, "Saved: %zu patterns, %zu playlists, %zu jobs",
+            patterns.size(), playlists.size(), jobs.size());
+        return ESP_OK;
+    }
+
+    esp_err_t load() {
+        // Recovery: handle incomplete previous writes
+        struct stat st;
+        if (stat(DB_PATH, &st) != 0) {
+            // No main file — check for temp or backup
+            if (stat(DB_TMP_PATH, &st) == 0) {
+                rename(DB_TMP_PATH, DB_PATH);
+            }
+            else if (stat(DB_BAK_PATH, &st) == 0) {
+                rename(DB_BAK_PATH, DB_PATH);
+            }
+            else {
+                ESP_LOGI(TAG, "No existing database — starting fresh");
+                return ESP_ERR_NOT_FOUND;
+            }
+        }
+        else {
+            // Main file exists — clean up any stale temp
+            unlink(DB_TMP_PATH);
+        }
+
+        FILE* f = fopen(DB_PATH, "rb");
+        if (!f) {
+            ESP_LOGW(TAG, "Cannot open %s", DB_PATH);
+            return ESP_ERR_NOT_FOUND;
+        }
+
+        // Read and validate header
+        uint32_t magic = 0;
+        uint16_t version = 0, flags = 0;
+        uint32_t stored_crc = 0, reserved = 0;
+        fread(&magic, 4, 1, f);
+        fread(&version, 2, 1, f);
+        fread(&flags, 2, 1, f);
+        fread(&stored_crc, 4, 1, f);
+        fread(&reserved, 4, 1, f);
+
+        if (magic != TQDB_MAGIC) {
+            ESP_LOGE(TAG, "Bad magic: 0x%08lx", (unsigned long)magic);
+            fclose(f);
+            return ESP_ERR_INVALID_STATE;
+        }
+        if (version > TQDB_VERSION) {
+            ESP_LOGE(TAG, "Unsupported version: %u (max %u)", version, TQDB_VERSION);
+            fclose(f);
+            return ESP_ERR_INVALID_VERSION;
+        }
+
+        // 4KB stack buffer for buffered reads
+        uint8_t scratch[IO_BUFFER_SIZE];
+        BinaryReader r(f, scratch, sizeof(scratch));
+
+        // Patterns
+        uint32_t nPatterns = r.u32();
+        if (nPatterns > MAX_PATTERNS) {
+            ESP_LOGE(TAG, "Pattern count too large: %lu", (unsigned long)nPatterns);
+            fclose(f);
+            return ESP_ERR_INVALID_STATE;
+        }
+        for (uint32_t i = 0; i < nPatterns && !r.hasError(); i++) {
+            Pattern p = readPattern(r);
+            if (!p.uuid.empty()) patterns[p.uuid] = std::move(p);
+        }
+
+        // Playlists
+        uint32_t nPlaylists = r.u32();
+        if (nPlaylists > MAX_PLAYLISTS) {
+            ESP_LOGE(TAG, "Playlist count too large: %lu", (unsigned long)nPlaylists);
+            fclose(f);
+            patterns.clear();
+            return ESP_ERR_INVALID_STATE;
+        }
+        for (uint32_t i = 0; i < nPlaylists && !r.hasError(); i++) {
+            Playlist pl = readPlaylist(r);
+            if (!pl.uuid.empty()) playlists[pl.uuid] = std::move(pl);
+        }
+
+        // Jobs
+        uint32_t nJobs = r.u32();
+        if (nJobs > MAX_JOBS) {
+            ESP_LOGE(TAG, "Job count too large: %lu", (unsigned long)nJobs);
+            fclose(f);
+            patterns.clear();
+            playlists.clear();
+            return ESP_ERR_INVALID_STATE;
+        }
+        for (uint32_t i = 0; i < nJobs && !r.hasError(); i++) {
+            jobs::Job j = readJob(r);
+            if (!j.uuid.empty()) jobs[j.uuid] = std::move(j);
+        }
+
+        fclose(f);
+
+        if (r.hasError()) {
+            ESP_LOGE(TAG, "Read error during load");
+            patterns.clear();
+            playlists.clear();
+            jobs.clear();
+            return ESP_ERR_INVALID_STATE;
+        }
+
+        // Validate CRC
+        if (r.crc() != stored_crc) {
+            ESP_LOGE(TAG, "CRC mismatch: computed=0x%08lx stored=0x%08lx",
+                (unsigned long)r.crc(), (unsigned long)stored_crc);
+            patterns.clear();
+            playlists.clear();
+            jobs.clear();
+            return ESP_ERR_INVALID_CRC;
+        }
+
+        ESP_LOGI(TAG, "Loaded: %zu patterns, %zu playlists, %zu jobs",
+            patterns.size(), playlists.size(), jobs.size());
+        return ESP_OK;
     }
 };
 
-// ManifestDatabase implementation
+// ═════════════════════════════════════════════════════════════════════════════
+// ManifestDatabase public API implementation
+// ═════════════════════════════════════════════════════════════════════════════
 
 ManifestDatabase::ManifestDatabase() : impl_(std::make_unique<Impl>()) {}
 ManifestDatabase::~ManifestDatabase() { shutdown(); }
@@ -356,11 +541,11 @@ bool ManifestDatabase::isInitialized() const {
 esp_err_t ManifestDatabase::initialize() {
     if (impl_->initialized) return ESP_OK;
 
-    // Initialize SD card (can run on main task - not SQLite)
-    init_sd();
-    format_sd();
+    if (!s_crc32_ready) crc32_init();
 
-    // Ensure patterns directory exists
+    init_sd();
+    //format_sd();
+
     struct stat st = { 0 };
     if (stat("/sd/patterns", &st) == -1) {
         if (mkdir("/sd/patterns", 0775) != 0) {
@@ -369,88 +554,17 @@ esp_err_t ManifestDatabase::initialize() {
         }
     }
 
-    // Create mutex for serializing SQLite operations
     impl_->mutex = xSemaphoreCreateMutex();
     if (!impl_->mutex) {
         ESP_LOGE(TAG, "Failed to create mutex");
         return ESP_FAIL;
     }
 
-    // Create command queue for SQLite task
-    impl_->commandQueue = xQueueCreate(4, sizeof(SqliteCommand));
-    if (!impl_->commandQueue) {
-        ESP_LOGE(TAG, "Failed to create command queue");
-        vSemaphoreDelete(impl_->mutex);
-        impl_->mutex = nullptr;
-        return ESP_FAIL;
-    }
-
-    // Create reusable completion semaphore (avoids per-call allocation)
-    impl_->completionSem = xSemaphoreCreateBinary();
-    if (!impl_->completionSem) {
-        ESP_LOGE(TAG, "Failed to create completion semaphore");
-        vQueueDelete(impl_->commandQueue);
-        impl_->commandQueue = nullptr;
-        vSemaphoreDelete(impl_->mutex);
-        impl_->mutex = nullptr;
-        return ESP_FAIL;
-    }
-
-    // Start SQLite task with large stack (SQLite is stack-hungry)
-    impl_->taskRunning = true;
-    BaseType_t ret = xTaskCreatePinnedToCore(
-        Impl::sqliteTaskFunction,
-        "sqlite_task",
-        SQLITE_TASK_STACK_SIZE,
-        impl_.get(),
-        5,  // Priority
-        &impl_->sqliteTask,
-        1   // Core 1
-    );
-    if (ret != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create SQLite task");
-        impl_->taskRunning = false;
-        vSemaphoreDelete(impl_->completionSem);
-        impl_->completionSem = nullptr;
-        vQueueDelete(impl_->commandQueue);
-        impl_->commandQueue = nullptr;
-        vSemaphoreDelete(impl_->mutex);
-        impl_->mutex = nullptr;
-        return ESP_FAIL;
-    }
-
-    // Run SQLite initialization on the dedicated task
-    esp_err_t initResult = impl_->executeOnSqliteTask([this]() -> esp_err_t {
-        // Initialize SQLite (required because SQLITE_OMIT_AUTOINIT is set)
-        int rc = sqlite3_initialize();
-        if (rc != SQLITE_OK) {
-            ESP_LOGE(TAG, "Failed to initialize SQLite: %d", rc);
-            return ESP_FAIL;
-        }
-
-        // Open database
-        rc = sqlite3_open(DB_PATH, &impl_->db);
-        if (rc != SQLITE_OK) {
-            ESP_LOGE(TAG, "Failed to open database: %s",
-                impl_->db ? sqlite3_errmsg(impl_->db) : "null db");
-            return ESP_FAIL;
-        }
-
-        // Create schema
-        return impl_->createSchema();
-        });
-
-    if (initResult != ESP_OK) {
-        // Cleanup on failure
-        impl_->taskRunning = false;
-        vTaskDelay(pdMS_TO_TICKS(150));  // Let task exit
-        vSemaphoreDelete(impl_->completionSem);
-        impl_->completionSem = nullptr;
-        vQueueDelete(impl_->commandQueue);
-        impl_->commandQueue = nullptr;
-        vSemaphoreDelete(impl_->mutex);
-        impl_->mutex = nullptr;
-        return initResult;
+    // Load existing data (ESP_ERR_NOT_FOUND is fine — first boot)
+    esp_err_t rc = impl_->load();
+    if (rc != ESP_OK && rc != ESP_ERR_NOT_FOUND) {
+        ESP_LOGW(TAG, "Load failed (rc=%d), starting with empty database", rc);
+        // Continue with empty data — non-fatal
     }
 
     impl_->initialized = true;
@@ -461,719 +575,593 @@ esp_err_t ManifestDatabase::initialize() {
 void ManifestDatabase::shutdown() {
     if (!impl_->initialized) return;
 
-    // Close database on SQLite task
-    if (impl_->commandQueue && impl_->taskRunning) {
-        impl_->executeOnSqliteTask([this]() {
-            if (impl_->db) {
-                sqlite3_close(impl_->db);
-                impl_->db = nullptr;
-            }
-            });
-    }
+    // Persist current state
+    impl_->save();
 
-    // Stop the SQLite task
-    impl_->taskRunning = false;
-    vTaskDelay(pdMS_TO_TICKS(150));  // Let task exit cleanly
-
-    if (impl_->completionSem) {
-        vSemaphoreDelete(impl_->completionSem);
-        impl_->completionSem = nullptr;
-    }
-    if (impl_->commandQueue) {
-        vQueueDelete(impl_->commandQueue);
-        impl_->commandQueue = nullptr;
-    }
     if (impl_->mutex) {
         vSemaphoreDelete(impl_->mutex);
         impl_->mutex = nullptr;
     }
+
+    impl_->patterns.clear();
+    impl_->playlists.clear();
+    impl_->jobs.clear();
     impl_->initialized = false;
     ESP_LOGI(TAG, "Shutdown complete");
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
 // Pattern CRUD
+// ─────────────────────────────────────────────────────────────────────────────
 
 esp_err_t ManifestDatabase::addPattern(const Pattern& pattern) {
     Impl::Lock lock(impl_->mutex);
     if (!lock.acquired()) return ESP_ERR_TIMEOUT;
 
-    return impl_->executeOnSqliteTask([this, &pattern]() -> esp_err_t {
-        Impl::Statement stmt(impl_->db,
-            "INSERT INTO patterns (uuid, name, creator, date, popularity, reversible, "
-            "start_point, encrypted, size_bytes, created_at, last_played_at, downloaded_at, "
-            "purchased, purchased_at, receipt_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    if (impl_->patterns.count(pattern.uuid)) {
+        ESP_LOGW(TAG, "Pattern already exists: %s", pattern.uuid.c_str());
+        return ESP_ERR_INVALID_STATE;
+    }
 
-        std::string ts = pattern.created_at.empty() ? currentTimestamp() : pattern.created_at;
+    Pattern p = pattern;
+    if (p.created_at.empty()) p.created_at = currentTimestamp();
+    if (p.creator.empty()) p.creator = "Uploaded";
 
-        stmt.bindText(1, pattern.uuid);
-        stmt.bindText(2, pattern.name);
-        stmt.bindText(3, pattern.creator.empty() ? "Uploaded" : pattern.creator);
-        stmt.bindText(4, pattern.date);
-        stmt.bindInt(5, pattern.popularity);
-        stmt.bindInt(6, pattern.reversible ? 1 : 0);
-        stmt.bindInt(7, pattern.start_point);
-        stmt.bindInt(8, pattern.encrypted ? 1 : 0);
-        stmt.bindInt64(9, pattern.size_bytes);
-        stmt.bindText(10, ts);
-        if (pattern.last_played_at.empty()) stmt.bindNull(11);
-        else stmt.bindText(11, pattern.last_played_at);
-        if (pattern.downloaded_at.empty()) stmt.bindNull(12);
-        else stmt.bindText(12, pattern.downloaded_at);
-        stmt.bindInt(13, pattern.purchased ? 1 : 0);
-        stmt.bindInt64(14, pattern.purchased_at);
-        stmt.bindText(15, pattern.receipt_id);
+    impl_->patterns[p.uuid] = std::move(p);
 
-        if (stmt.step() != SQLITE_DONE) {
-            ESP_LOGE(TAG, "Failed to add pattern: %s", sqlite3_errmsg(impl_->db));
-            return ESP_FAIL;
-        }
-
+    esp_err_t rc = impl_->save();
+    if (rc == ESP_OK) {
         ESP_LOGI(TAG, "Pattern added: %s", pattern.uuid.c_str());
-        return ESP_OK;
-        });
+    }
+    return rc;
 }
 
 esp_err_t ManifestDatabase::updatePattern(const std::string& uuid, const Pattern& pattern) {
     Impl::Lock lock(impl_->mutex);
     if (!lock.acquired()) return ESP_ERR_TIMEOUT;
 
-    return impl_->executeOnSqliteTask([this, &uuid, &pattern]() -> esp_err_t {
-        Impl::Statement stmt(impl_->db,
-            "UPDATE patterns SET name=?, creator=?, date=?, popularity=?, reversible=?, "
-            "start_point=?, encrypted=?, size_bytes=?, purchased=?, purchased_at=?, receipt_id=? "
-            "WHERE uuid=?");
+    auto it = impl_->patterns.find(uuid);
+    if (it == impl_->patterns.end()) return ESP_ERR_NOT_FOUND;
 
-        stmt.bindText(1, pattern.name);
-        stmt.bindText(2, pattern.creator);
-        stmt.bindText(3, pattern.date);
-        stmt.bindInt(4, pattern.popularity);
-        stmt.bindInt(5, pattern.reversible ? 1 : 0);
-        stmt.bindInt(6, pattern.start_point);
-        stmt.bindInt(7, pattern.encrypted ? 1 : 0);
-        stmt.bindInt64(8, pattern.size_bytes);
-        stmt.bindInt(9, pattern.purchased ? 1 : 0);
-        stmt.bindInt64(10, pattern.purchased_at);
-        stmt.bindText(11, pattern.receipt_id);
-        stmt.bindText(12, uuid);
+    // Preserve fields not in the update
+    Pattern& existing = it->second;
+    existing.name = pattern.name;
+    existing.creator = pattern.creator;
+    existing.date = pattern.date;
+    existing.popularity = pattern.popularity;
+    existing.reversible = pattern.reversible;
+    existing.start_point = pattern.start_point;
+    existing.encrypted = pattern.encrypted;
+    existing.size_bytes = pattern.size_bytes;
+    existing.purchased = pattern.purchased;
+    existing.purchased_at = pattern.purchased_at;
+    existing.receipt_id = pattern.receipt_id;
 
-        if (stmt.step() != SQLITE_DONE) {
-            ESP_LOGE(TAG, "Failed to update pattern: %s", sqlite3_errmsg(impl_->db));
-            return ESP_FAIL;
-        }
-
-        if (sqlite3_changes(impl_->db) == 0) {
-            return ESP_ERR_NOT_FOUND;
-        }
-
-        return ESP_OK;
-        });
+    return impl_->save();
 }
 
 esp_err_t ManifestDatabase::deletePattern(const std::string& uuid) {
     Impl::Lock lock(impl_->mutex);
     if (!lock.acquired()) return ESP_ERR_TIMEOUT;
 
-    esp_err_t result = impl_->executeOnSqliteTask([this, &uuid]() -> esp_err_t {
-        Impl::Transaction txn(impl_->db);
+    if (!impl_->patterns.erase(uuid)) return ESP_ERR_NOT_FOUND;
 
-        // Get pattern ID for junction cleanup
-        int patternId = impl_->getPatternId(uuid);
-        if (patternId < 0) {
-            return ESP_ERR_NOT_FOUND;
-        }
+    // Remove from all playlists
+    for (auto& [_, pl] : impl_->playlists) {
+        auto& pats = pl.patterns;
+        pats.erase(std::remove(pats.begin(), pats.end(), uuid), pats.end());
+        if (pl.featured_pattern == uuid) pl.featured_pattern.clear();
+    }
 
-        // Delete from junction table (CASCADE should handle this, but be explicit)
-        Impl::Statement delJunction(impl_->db,
-            "DELETE FROM playlist_patterns WHERE pattern_id = ?");
-        delJunction.bindInt(1, patternId);
-        delJunction.step();
-
-        // Delete pattern
-        Impl::Statement delPattern(impl_->db, "DELETE FROM patterns WHERE uuid = ?");
-        delPattern.bindText(1, uuid);
-        if (delPattern.step() != SQLITE_DONE) {
-            ESP_LOGE(TAG, "Failed to delete pattern: %s", sqlite3_errmsg(impl_->db));
-            return ESP_FAIL;
-        }
-
-        txn.commit();
-        return ESP_OK;
-        });
-
-    if (result == ESP_OK) {
-        // Delete pattern files (try both extensions since DB record is gone)
+    esp_err_t rc = impl_->save();
+    if (rc == ESP_OK) {
+        // Delete pattern files
         char path[128];
         snprintf(path, sizeof(path), "/sd/patterns/%s.thr", uuid.c_str());
-        unlink(path);  // Unencrypted
+        unlink(path);
         snprintf(path, sizeof(path), "/sd/patterns/%s.dat", uuid.c_str());
-        unlink(path);  // Encrypted
-        // Delete thumbnail if exists
+        unlink(path);
         snprintf(path, sizeof(path), "/sd/previews/%s.png", uuid.c_str());
         unlink(path);
         ESP_LOGI(TAG, "Pattern deleted: %s", uuid.c_str());
     }
-    return result;
+    return rc;
 }
 
 std::vector<Pattern> ManifestDatabase::getAllPatterns() {
     Impl::Lock lock(impl_->mutex);
     if (!lock.acquired()) return {};
 
-    return impl_->executeOnSqliteTask([this]() -> std::vector<Pattern> {
-        std::vector<Pattern> patterns;
-        Impl::Statement stmt(impl_->db,
-            "SELECT uuid, name, creator, date, popularity, reversible, start_point, "
-            "encrypted, size_bytes, created_at, last_played_at, downloaded_at, "
-            "purchased, purchased_at, receipt_id "
-            "FROM patterns ORDER BY name");
-
-        while (stmt.step() == SQLITE_ROW) {
-            patterns.push_back(impl_->rowToPattern(stmt));
-        }
-        return patterns;
-        });
+    auto sorted = impl_->patternsSortedByName();
+    std::vector<Pattern> result;
+    result.reserve(sorted.size());
+    for (auto* p : sorted) result.push_back(*p);
+    return result;
 }
 
 PaginatedResult<Pattern> ManifestDatabase::getPatterns(int page, int per_page) {
     Impl::Lock lock(impl_->mutex);
     if (!lock.acquired()) return {};
 
-    return impl_->executeOnSqliteTask([this, page, per_page]() -> PaginatedResult<Pattern> {
-        PaginatedResult<Pattern> result;
+    PaginatedResult<Pattern> result;
+    auto sorted = impl_->patternsSortedByName();
 
-        // Get total count (scoped to finalize before next query)
-        {
-            Impl::Statement countStmt(impl_->db, "SELECT COUNT(*) FROM patterns");
-            if (countStmt.step() == SQLITE_ROW) {
-                result.pagination.total_items = countStmt.columnInt(0);
-            }
-        }
+    result.pagination.total_items = static_cast<int>(sorted.size());
+    result.pagination.page = page;
+    result.pagination.per_page = per_page;
+    result.pagination.total_pages = (result.pagination.total_items + per_page - 1) / per_page;
 
-        result.pagination.page = page;
-        result.pagination.per_page = per_page;
-        result.pagination.total_pages = (result.pagination.total_items + per_page - 1) / per_page;
-
-        // Get page of patterns
-        Impl::Statement stmt(impl_->db,
-            "SELECT uuid, name, creator, date, popularity, reversible, start_point, "
-            "encrypted, size_bytes, created_at, last_played_at, downloaded_at, "
-            "purchased, purchased_at, receipt_id "
-            "FROM patterns ORDER BY name LIMIT ? OFFSET ?");
-
-        if (!stmt.valid()) {
-            ESP_LOGE(TAG, "Failed to prepare patterns SELECT: %s", sqlite3_errmsg(impl_->db));
-            return result;
-        }
-
-        stmt.bindInt(1, per_page);
-        stmt.bindInt(2, page * per_page);
-
-        int rc;
-        while ((rc = stmt.step()) == SQLITE_ROW) {
-            result.items.push_back(impl_->rowToPattern(stmt));
-        }
-        if (rc != SQLITE_DONE) {
-            ESP_LOGE(TAG, "patterns SELECT step failed: %d - %s", rc, sqlite3_errmsg(impl_->db));
-        }
-        return result;
-        });
+    int start = page * per_page;
+    int end = std::min(start + per_page, static_cast<int>(sorted.size()));
+    for (int i = start; i < end; i++) {
+        result.items.push_back(*sorted[i]);
+    }
+    return result;
 }
 
 std::optional<Pattern> ManifestDatabase::getPattern(const std::string& uuid) {
     Impl::Lock lock(impl_->mutex);
     if (!lock.acquired()) return std::nullopt;
 
-    return impl_->executeOnSqliteTask([this, &uuid]() -> std::optional<Pattern> {
-        Impl::Statement stmt(impl_->db,
-            "SELECT uuid, name, creator, date, popularity, reversible, start_point, "
-            "encrypted, size_bytes, created_at, last_played_at, downloaded_at, "
-            "purchased, purchased_at, receipt_id "
-            "FROM patterns WHERE uuid = ?");
-        stmt.bindText(1, uuid);
-
-        if (stmt.step() == SQLITE_ROW) {
-            return impl_->rowToPattern(stmt);
-        }
-        return std::nullopt;
-        });
+    auto it = impl_->patterns.find(uuid);
+    if (it != impl_->patterns.end()) return it->second;
+    return std::nullopt;
 }
 
 bool ManifestDatabase::patternExists(const std::string& uuid) {
     Impl::Lock lock(impl_->mutex);
     if (!lock.acquired()) return false;
-
-    return impl_->executeOnSqliteTask([this, &uuid]() -> bool {
-        Impl::Statement stmt(impl_->db, "SELECT 1 FROM patterns WHERE uuid = ? LIMIT 1");
-        stmt.bindText(1, uuid);
-        return stmt.step() == SQLITE_ROW;
-        });
+    return impl_->patterns.count(uuid) > 0;
 }
 
 size_t ManifestDatabase::getPatternCount() {
     Impl::Lock lock(impl_->mutex);
     if (!lock.acquired()) return 0;
-
-    return impl_->executeOnSqliteTask([this]() -> size_t {
-        Impl::Statement stmt(impl_->db, "SELECT COUNT(*) FROM patterns");
-        if (stmt.step() == SQLITE_ROW) {
-            return stmt.columnInt(0);
-        }
-        return 0;
-        });
+    return impl_->patterns.size();
 }
 
 size_t ManifestDatabase::getSubscriptionPatternCount() {
     Impl::Lock lock(impl_->mutex);
     if (!lock.acquired()) return 0;
 
-    return impl_->executeOnSqliteTask([this]() -> size_t {
-        // Count patterns that are NOT purchased (subscription patterns only)
-        Impl::Statement stmt(impl_->db, "SELECT COUNT(*) FROM patterns WHERE purchased = 0");
-        if (stmt.step() == SQLITE_ROW) {
-            return stmt.columnInt(0);
-        }
-        return 0;
-        });
+    size_t count = 0;
+    for (auto& [_, p] : impl_->patterns) {
+        if (!p.purchased) count++;
+    }
+    return count;
 }
 
 esp_err_t ManifestDatabase::updateLastPlayed(const std::string& uuid) {
     Impl::Lock lock(impl_->mutex);
     if (!lock.acquired()) return ESP_ERR_TIMEOUT;
 
-    return impl_->executeOnSqliteTask([this, &uuid]() -> esp_err_t {
-        Impl::Statement stmt(impl_->db, "UPDATE patterns SET last_played_at = ? WHERE uuid = ?");
-        stmt.bindText(1, currentTimestamp());
-        stmt.bindText(2, uuid);
+    auto it = impl_->patterns.find(uuid);
+    if (it == impl_->patterns.end()) return ESP_ERR_NOT_FOUND;
 
-        if (stmt.step() != SQLITE_DONE || sqlite3_changes(impl_->db) == 0) {
-            return ESP_ERR_NOT_FOUND;
-        }
-        return ESP_OK;
-        });
+    it->second.last_played_at = currentTimestamp();
+    return impl_->save();
 }
 
 esp_err_t ManifestDatabase::incrementPopularity(const std::string& uuid) {
     Impl::Lock lock(impl_->mutex);
     if (!lock.acquired()) return ESP_ERR_TIMEOUT;
 
-    return impl_->executeOnSqliteTask([this, &uuid]() -> esp_err_t {
-        Impl::Statement stmt(impl_->db, "UPDATE patterns SET popularity = popularity + 1 WHERE uuid = ?");
-        stmt.bindText(1, uuid);
+    auto it = impl_->patterns.find(uuid);
+    if (it == impl_->patterns.end()) return ESP_ERR_NOT_FOUND;
 
-        if (stmt.step() != SQLITE_DONE || sqlite3_changes(impl_->db) == 0) {
-            return ESP_ERR_NOT_FOUND;
-        }
-        return ESP_OK;
-        });
+    it->second.popularity++;
+    return impl_->save();
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
 // Playlist CRUD
+// ─────────────────────────────────────────────────────────────────────────────
 
 esp_err_t ManifestDatabase::addPlaylist(const Playlist& playlist) {
     Impl::Lock lock(impl_->mutex);
     if (!lock.acquired()) return ESP_ERR_TIMEOUT;
 
-    return impl_->executeOnSqliteTask([this, &playlist]() -> esp_err_t {
-        Impl::Transaction txn(impl_->db);
+    if (impl_->playlists.count(playlist.uuid)) return ESP_ERR_INVALID_STATE;
 
-        std::string ts = playlist.created_at.empty() ? currentTimestamp() : playlist.created_at;
+    Playlist pl = playlist;
+    std::string ts = pl.created_at.empty() ? currentTimestamp() : pl.created_at;
+    pl.created_at = ts;
+    if (pl.updated_at.empty()) pl.updated_at = ts;
 
-        Impl::Statement stmt(impl_->db,
-            "INSERT INTO playlists (uuid, name, description, featured_pattern_uuid, date, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)");
+    // Filter to only patterns that exist
+    std::vector<std::string> valid;
+    for (auto& puuid : pl.patterns) {
+        if (impl_->patterns.count(puuid)) valid.push_back(puuid);
+    }
+    pl.patterns = std::move(valid);
 
-        stmt.bindText(1, playlist.uuid);
-        stmt.bindText(2, playlist.name);
-        stmt.bindText(3, playlist.description);
-        stmt.bindText(4, playlist.featured_pattern);
-        stmt.bindText(5, playlist.date);
-        stmt.bindText(6, ts);
-        stmt.bindText(7, ts);
+    impl_->playlists[pl.uuid] = std::move(pl);
 
-        if (stmt.step() != SQLITE_DONE) {
-            ESP_LOGE(TAG, "Failed to add playlist: %s", sqlite3_errmsg(impl_->db));
-            return ESP_FAIL;
-        }
-
-        int playlistId = sqlite3_last_insert_rowid(impl_->db);
-
-        // Add patterns to junction table
-        int position = 0;
-        for (const auto& patternUuid : playlist.patterns) {
-            int patternId = impl_->getPatternId(patternUuid);
-            if (patternId < 0) continue;
-
-            Impl::Statement ppStmt(impl_->db,
-                "INSERT INTO playlist_patterns (playlist_id, pattern_id, position) VALUES (?, ?, ?)");
-            ppStmt.bindInt(1, playlistId);
-            ppStmt.bindInt(2, patternId);
-            ppStmt.bindInt(3, position++);
-            ppStmt.step();
-        }
-
-        txn.commit();
+    esp_err_t rc = impl_->save();
+    if (rc == ESP_OK) {
         ESP_LOGI(TAG, "Playlist added: %s", playlist.uuid.c_str());
-        return ESP_OK;
-        });
+    }
+    return rc;
 }
 
 esp_err_t ManifestDatabase::updatePlaylist(const std::string& uuid, const Playlist& playlist) {
     Impl::Lock lock(impl_->mutex);
     if (!lock.acquired()) return ESP_ERR_TIMEOUT;
 
-    return impl_->executeOnSqliteTask([this, &uuid, &playlist]() -> esp_err_t {
-        Impl::Transaction txn(impl_->db);
+    auto it = impl_->playlists.find(uuid);
+    if (it == impl_->playlists.end()) return ESP_ERR_NOT_FOUND;
 
-        int playlistId = impl_->getPlaylistId(uuid);
-        if (playlistId < 0) return ESP_ERR_NOT_FOUND;
+    Playlist& existing = it->second;
+    existing.name = playlist.name;
+    existing.description = playlist.description;
+    existing.featured_pattern = playlist.featured_pattern;
+    existing.date = playlist.date;
+    existing.updated_at = currentTimestamp();
 
-        Impl::Statement stmt(impl_->db,
-            "UPDATE playlists SET name=?, description=?, featured_pattern_uuid=?, date=?, updated_at=? "
-            "WHERE uuid=?");
+    // Filter to existing patterns
+    std::vector<std::string> valid;
+    for (auto& puuid : playlist.patterns) {
+        if (impl_->patterns.count(puuid)) valid.push_back(puuid);
+    }
+    existing.patterns = std::move(valid);
 
-        stmt.bindText(1, playlist.name);
-        stmt.bindText(2, playlist.description);
-        stmt.bindText(3, playlist.featured_pattern);
-        stmt.bindText(4, playlist.date);
-        stmt.bindText(5, currentTimestamp());
-        stmt.bindText(6, uuid);
-
-        if (stmt.step() != SQLITE_DONE) {
-            ESP_LOGE(TAG, "Failed to update playlist: %s", sqlite3_errmsg(impl_->db));
-            return ESP_FAIL;
-        }
-
-        // Update patterns: clear and re-add
-        Impl::Statement delPp(impl_->db, "DELETE FROM playlist_patterns WHERE playlist_id = ?");
-        delPp.bindInt(1, playlistId);
-        delPp.step();
-
-        int position = 0;
-        for (const auto& patternUuid : playlist.patterns) {
-            int patternId = impl_->getPatternId(patternUuid);
-            if (patternId < 0) continue;
-
-            Impl::Statement ppStmt(impl_->db,
-                "INSERT INTO playlist_patterns (playlist_id, pattern_id, position) VALUES (?, ?, ?)");
-            ppStmt.bindInt(1, playlistId);
-            ppStmt.bindInt(2, patternId);
-            ppStmt.bindInt(3, position++);
-            ppStmt.step();
-        }
-
-        txn.commit();
-        return ESP_OK;
-        });
+    return impl_->save();
 }
 
 esp_err_t ManifestDatabase::deletePlaylist(const std::string& uuid) {
     Impl::Lock lock(impl_->mutex);
     if (!lock.acquired()) return ESP_ERR_TIMEOUT;
 
-    return impl_->executeOnSqliteTask([this, &uuid]() -> esp_err_t {
-        Impl::Statement stmt(impl_->db, "DELETE FROM playlists WHERE uuid = ?");
-        stmt.bindText(1, uuid);
+    if (!impl_->playlists.erase(uuid)) return ESP_ERR_NOT_FOUND;
 
-        if (stmt.step() != SQLITE_DONE) {
-            ESP_LOGE(TAG, "Failed to delete playlist: %s", sqlite3_errmsg(impl_->db));
-            return ESP_FAIL;
-        }
-
-        if (sqlite3_changes(impl_->db) == 0) {
-            return ESP_ERR_NOT_FOUND;
-        }
-
+    esp_err_t rc = impl_->save();
+    if (rc == ESP_OK) {
         ESP_LOGI(TAG, "Playlist deleted: %s", uuid.c_str());
-        return ESP_OK;
-        });
+    }
+    return rc;
 }
 
 std::vector<Playlist> ManifestDatabase::getAllPlaylists() {
     Impl::Lock lock(impl_->mutex);
     if (!lock.acquired()) return {};
 
-    return impl_->executeOnSqliteTask([this]() -> std::vector<Playlist> {
-        std::vector<Playlist> playlists;
-        Impl::Statement stmt(impl_->db,
-            "SELECT uuid, name, description, featured_pattern_uuid, date, created_at, updated_at "
-            "FROM playlists ORDER BY name");
-
-        while (stmt.step() == SQLITE_ROW) {
-            Playlist pl = impl_->rowToPlaylist(stmt);
-            int plId = impl_->getPlaylistId(pl.uuid);
-            pl.patterns = impl_->getPlaylistPatternUuids(plId);
-            playlists.push_back(std::move(pl));
-        }
-        return playlists;
-        });
+    auto sorted = impl_->playlistsSortedByName();
+    std::vector<Playlist> result;
+    result.reserve(sorted.size());
+    for (auto* pl : sorted) result.push_back(*pl);
+    return result;
 }
 
 PaginatedResult<Playlist> ManifestDatabase::getPlaylists(int page, int per_page) {
     Impl::Lock lock(impl_->mutex);
     if (!lock.acquired()) return {};
 
-    return impl_->executeOnSqliteTask([this, page, per_page]() -> PaginatedResult<Playlist> {
-        PaginatedResult<Playlist> result;
+    PaginatedResult<Playlist> result;
+    auto sorted = impl_->playlistsSortedByName();
 
-        // Get total count (scoped to finalize before next query)
-        {
-            Impl::Statement countStmt(impl_->db, "SELECT COUNT(*) FROM playlists");
-            if (countStmt.step() == SQLITE_ROW) {
-                result.pagination.total_items = countStmt.columnInt(0);
-            }
-        }
+    result.pagination.total_items = static_cast<int>(sorted.size());
+    result.pagination.page = page;
+    result.pagination.per_page = per_page;
+    result.pagination.total_pages = (result.pagination.total_items + per_page - 1) / per_page;
 
-        result.pagination.page = page;
-        result.pagination.per_page = per_page;
-        result.pagination.total_pages = (result.pagination.total_items + per_page - 1) / per_page;
-
-        // Get page of playlists
-        Impl::Statement stmt(impl_->db,
-            "SELECT uuid, name, description, featured_pattern_uuid, date, created_at, updated_at "
-            "FROM playlists ORDER BY name LIMIT ? OFFSET ?");
-        stmt.bindInt(1, per_page);
-        stmt.bindInt(2, page * per_page);
-
-        while (stmt.step() == SQLITE_ROW) {
-            Playlist pl = impl_->rowToPlaylist(stmt);
-            int plId = impl_->getPlaylistId(pl.uuid);
-            pl.patterns = impl_->getPlaylistPatternUuids(plId);
-            result.items.push_back(std::move(pl));
-        }
-        return result;
-        });
+    int start = page * per_page;
+    int end = std::min(start + per_page, static_cast<int>(sorted.size()));
+    for (int i = start; i < end; i++) {
+        result.items.push_back(*sorted[i]);
+    }
+    return result;
 }
 
 std::optional<Playlist> ManifestDatabase::getPlaylist(const std::string& uuid) {
     Impl::Lock lock(impl_->mutex);
     if (!lock.acquired()) return std::nullopt;
 
-    return impl_->executeOnSqliteTask([this, &uuid]() -> std::optional<Playlist> {
-        Impl::Statement stmt(impl_->db,
-            "SELECT uuid, name, description, featured_pattern_uuid, date, created_at, updated_at "
-            "FROM playlists WHERE uuid = ?");
-        stmt.bindText(1, uuid);
-
-        if (stmt.step() == SQLITE_ROW) {
-            Playlist pl = impl_->rowToPlaylist(stmt);
-            int plId = impl_->getPlaylistId(pl.uuid);
-            pl.patterns = impl_->getPlaylistPatternUuids(plId);
-            return pl;
-        }
-        return std::nullopt;
-        });
+    auto it = impl_->playlists.find(uuid);
+    if (it != impl_->playlists.end()) return it->second;
+    return std::nullopt;
 }
 
 bool ManifestDatabase::playlistExists(const std::string& uuid) {
     Impl::Lock lock(impl_->mutex);
     if (!lock.acquired()) return false;
-
-    return impl_->executeOnSqliteTask([this, &uuid]() -> bool {
-        Impl::Statement stmt(impl_->db, "SELECT 1 FROM playlists WHERE uuid = ? LIMIT 1");
-        stmt.bindText(1, uuid);
-        return stmt.step() == SQLITE_ROW;
-        });
+    return impl_->playlists.count(uuid) > 0;
 }
 
 size_t ManifestDatabase::getPlaylistCount() {
     Impl::Lock lock(impl_->mutex);
     if (!lock.acquired()) return 0;
-
-    return impl_->executeOnSqliteTask([this]() -> size_t {
-        Impl::Statement stmt(impl_->db, "SELECT COUNT(*) FROM playlists");
-        if (stmt.step() == SQLITE_ROW) {
-            return stmt.columnInt(0);
-        }
-        return 0;
-        });
+    return impl_->playlists.size();
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
 // Playlist-pattern operations
+// ─────────────────────────────────────────────────────────────────────────────
 
-esp_err_t ManifestDatabase::addPatternToPlaylist(const std::string& playlistUuid, const std::string& patternUuid) {
+esp_err_t ManifestDatabase::addPatternToPlaylist(const std::string& playlistUuid,
+    const std::string& patternUuid) {
     Impl::Lock lock(impl_->mutex);
     if (!lock.acquired()) return ESP_ERR_TIMEOUT;
 
-    return impl_->executeOnSqliteTask([this, &playlistUuid, &patternUuid]() -> esp_err_t {
-        int playlistId = impl_->getPlaylistId(playlistUuid);
-        if (playlistId < 0) return ESP_ERR_NOT_FOUND;
+    auto plIt = impl_->playlists.find(playlistUuid);
+    if (plIt == impl_->playlists.end()) return ESP_ERR_NOT_FOUND;
+    if (!impl_->patterns.count(patternUuid)) return ESP_ERR_NOT_FOUND;
 
-        int patternId = impl_->getPatternId(patternUuid);
-        if (patternId < 0) return ESP_ERR_NOT_FOUND;
+    auto& pats = plIt->second.patterns;
+    // Don't add duplicates
+    if (std::find(pats.begin(), pats.end(), patternUuid) != pats.end()) return ESP_OK;
 
-        // Get max position
-        Impl::Statement maxStmt(impl_->db,
-            "SELECT COALESCE(MAX(position), -1) + 1 FROM playlist_patterns WHERE playlist_id = ?");
-        maxStmt.bindInt(1, playlistId);
-        int position = 0;
-        if (maxStmt.step() == SQLITE_ROW) {
-            position = maxStmt.columnInt(0);
-        }
-
-        Impl::Statement stmt(impl_->db,
-            "INSERT OR IGNORE INTO playlist_patterns (playlist_id, pattern_id, position) VALUES (?, ?, ?)");
-        stmt.bindInt(1, playlistId);
-        stmt.bindInt(2, patternId);
-        stmt.bindInt(3, position);
-
-        if (stmt.step() != SQLITE_DONE) {
-            return ESP_FAIL;
-        }
-
-        // Update playlist updated_at
-        Impl::Statement updateStmt(impl_->db, "UPDATE playlists SET updated_at = ? WHERE id = ?");
-        updateStmt.bindText(1, currentTimestamp());
-        updateStmt.bindInt(2, playlistId);
-        updateStmt.step();
-
-        return ESP_OK;
-        });
+    pats.push_back(patternUuid);
+    plIt->second.updated_at = currentTimestamp();
+    return impl_->save();
 }
 
-esp_err_t ManifestDatabase::removePatternFromPlaylist(const std::string& playlistUuid, const std::string& patternUuid) {
+esp_err_t ManifestDatabase::removePatternFromPlaylist(const std::string& playlistUuid,
+    const std::string& patternUuid) {
     Impl::Lock lock(impl_->mutex);
     if (!lock.acquired()) return ESP_ERR_TIMEOUT;
 
-    return impl_->executeOnSqliteTask([this, &playlistUuid, &patternUuid]() -> esp_err_t {
-        int playlistId = impl_->getPlaylistId(playlistUuid);
-        if (playlistId < 0) return ESP_ERR_NOT_FOUND;
+    auto plIt = impl_->playlists.find(playlistUuid);
+    if (plIt == impl_->playlists.end()) return ESP_ERR_NOT_FOUND;
 
-        int patternId = impl_->getPatternId(patternUuid);
-        if (patternId < 0) return ESP_ERR_NOT_FOUND;
+    auto& pl = plIt->second;
+    auto& pats = pl.patterns;
+    auto it = std::find(pats.begin(), pats.end(), patternUuid);
+    if (it == pats.end()) return ESP_ERR_NOT_FOUND;
 
-        Impl::Statement stmt(impl_->db,
-            "DELETE FROM playlist_patterns WHERE playlist_id = ? AND pattern_id = ?");
-        stmt.bindInt(1, playlistId);
-        stmt.bindInt(2, patternId);
+    pats.erase(it);
 
-        if (stmt.step() != SQLITE_DONE || sqlite3_changes(impl_->db) == 0) {
-            return ESP_ERR_NOT_FOUND;
-        }
-
-        // Clear featured if it was this pattern
-        Impl::Statement clearFeatured(impl_->db,
-            "UPDATE playlists SET featured_pattern_uuid = '', updated_at = ? "
-            "WHERE id = ? AND featured_pattern_uuid = ?");
-        clearFeatured.bindText(1, currentTimestamp());
-        clearFeatured.bindInt(2, playlistId);
-        clearFeatured.bindText(3, patternUuid);
-        clearFeatured.step();
-
-        return ESP_OK;
-        });
+    if (pl.featured_pattern == patternUuid) {
+        pl.featured_pattern.clear();
+    }
+    pl.updated_at = currentTimestamp();
+    return impl_->save();
 }
 
-esp_err_t ManifestDatabase::setFeaturedPattern(const std::string& playlistUuid, const std::string& patternUuid) {
+esp_err_t ManifestDatabase::setFeaturedPattern(const std::string& playlistUuid,
+    const std::string& patternUuid) {
     Impl::Lock lock(impl_->mutex);
     if (!lock.acquired()) return ESP_ERR_TIMEOUT;
 
-    return impl_->executeOnSqliteTask([this, &playlistUuid, &patternUuid]() -> esp_err_t {
-        // Verify pattern is in playlist
-        int playlistId = impl_->getPlaylistId(playlistUuid);
-        if (playlistId < 0) return ESP_ERR_NOT_FOUND;
+    auto plIt = impl_->playlists.find(playlistUuid);
+    if (plIt == impl_->playlists.end()) return ESP_ERR_NOT_FOUND;
+    if (!impl_->patterns.count(patternUuid)) return ESP_ERR_NOT_FOUND;
 
-        int patternId = impl_->getPatternId(patternUuid);
-        if (patternId < 0) return ESP_ERR_NOT_FOUND;
+    auto& pl = plIt->second;
+    // Verify pattern is in this playlist
+    if (std::find(pl.patterns.begin(), pl.patterns.end(), patternUuid) == pl.patterns.end()) {
+        return ESP_ERR_NOT_FOUND;
+    }
 
-        Impl::Statement checkStmt(impl_->db,
-            "SELECT 1 FROM playlist_patterns WHERE playlist_id = ? AND pattern_id = ?");
-        checkStmt.bindInt(1, playlistId);
-        checkStmt.bindInt(2, patternId);
-        if (checkStmt.step() != SQLITE_ROW) {
-            return ESP_ERR_NOT_FOUND;  // Pattern not in playlist
-        }
-
-        Impl::Statement stmt(impl_->db,
-            "UPDATE playlists SET featured_pattern_uuid = ?, updated_at = ? WHERE id = ?");
-        stmt.bindText(1, patternUuid);
-        stmt.bindText(2, currentTimestamp());
-        stmt.bindInt(3, playlistId);
-
-        if (stmt.step() != SQLITE_DONE) {
-            return ESP_FAIL;
-        }
-        return ESP_OK;
-        });
+    pl.featured_pattern = patternUuid;
+    pl.updated_at = currentTimestamp();
+    return impl_->save();
 }
 
-esp_err_t ManifestDatabase::reorderPlaylist(const std::string& playlistUuid, const std::vector<std::string>& newOrder) {
+esp_err_t ManifestDatabase::reorderPlaylist(const std::string& playlistUuid,
+    const std::vector<std::string>& newOrder) {
     Impl::Lock lock(impl_->mutex);
     if (!lock.acquired()) return ESP_ERR_TIMEOUT;
 
-    return impl_->executeOnSqliteTask([this, &playlistUuid, &newOrder]() -> esp_err_t {
-        int playlistId = impl_->getPlaylistId(playlistUuid);
-        if (playlistId < 0) return ESP_ERR_NOT_FOUND;
+    auto plIt = impl_->playlists.find(playlistUuid);
+    if (plIt == impl_->playlists.end()) return ESP_ERR_NOT_FOUND;
 
-        auto currentOrder = impl_->getPlaylistPatternUuids(playlistId);
+    auto& pl = plIt->second;
+    if (newOrder.size() != pl.patterns.size()) return ESP_ERR_INVALID_ARG;
 
-        // Validate: same patterns, no duplicates
-        if (newOrder.size() != currentOrder.size()) return ESP_ERR_INVALID_ARG;
+    // Validate same elements
+    auto sortedOld = pl.patterns;
+    auto sortedNew = newOrder;
+    std::sort(sortedOld.begin(), sortedOld.end());
+    std::sort(sortedNew.begin(), sortedNew.end());
+    if (sortedOld != sortedNew) return ESP_ERR_INVALID_ARG;
 
-        auto sortedCurrent = currentOrder;
-        auto sortedNew = newOrder;
-        std::sort(sortedCurrent.begin(), sortedCurrent.end());
-        std::sort(sortedNew.begin(), sortedNew.end());
-        if (sortedCurrent != sortedNew) return ESP_ERR_INVALID_ARG;
-
-        Impl::Transaction txn(impl_->db);
-
-        // Delete existing positions
-        Impl::Statement delStmt(impl_->db, "DELETE FROM playlist_patterns WHERE playlist_id = ?");
-        delStmt.bindInt(1, playlistId);
-        delStmt.step();
-
-        // Re-insert with new order
-        int position = 0;
-        for (const auto& patternUuid : newOrder) {
-            int patternId = impl_->getPatternId(patternUuid);
-            if (patternId < 0) continue;
-
-            Impl::Statement insStmt(impl_->db,
-                "INSERT INTO playlist_patterns (playlist_id, pattern_id, position) VALUES (?, ?, ?)");
-            insStmt.bindInt(1, playlistId);
-            insStmt.bindInt(2, patternId);
-            insStmt.bindInt(3, position++);
-            insStmt.step();
-        }
-
-        // Update timestamp
-        Impl::Statement updateStmt(impl_->db, "UPDATE playlists SET updated_at = ? WHERE id = ?");
-        updateStmt.bindText(1, currentTimestamp());
-        updateStmt.bindInt(2, playlistId);
-        updateStmt.step();
-
-        txn.commit();
-        return ESP_OK;
-        });
+    pl.patterns = newOrder;
+    pl.updated_at = currentTimestamp();
+    return impl_->save();
 }
 
 std::vector<Pattern> ManifestDatabase::getPlaylistPatterns(const std::string& playlistUuid) {
     Impl::Lock lock(impl_->mutex);
     if (!lock.acquired()) return {};
 
-    return impl_->executeOnSqliteTask([this, &playlistUuid]() -> std::vector<Pattern> {
-        std::vector<Pattern> patterns;
+    auto plIt = impl_->playlists.find(playlistUuid);
+    if (plIt == impl_->playlists.end()) return {};
 
-        int playlistId = impl_->getPlaylistId(playlistUuid);
-        if (playlistId < 0) return patterns;
-
-        Impl::Statement stmt(impl_->db,
-            "SELECT p.uuid, p.name, p.creator, p.date, p.popularity, p.reversible, p.start_point, "
-            "p.encrypted, p.size_bytes, p.created_at, p.last_played_at, p.downloaded_at "
-            "FROM patterns p "
-            "JOIN playlist_patterns pp ON p.id = pp.pattern_id "
-            "WHERE pp.playlist_id = ? ORDER BY pp.position");
-        stmt.bindInt(1, playlistId);
-
-        while (stmt.step() == SQLITE_ROW) {
-            patterns.push_back(impl_->rowToPattern(stmt));
+    std::vector<Pattern> result;
+    for (auto& puuid : plIt->second.patterns) {
+        auto pIt = impl_->patterns.find(puuid);
+        if (pIt != impl_->patterns.end()) {
+            result.push_back(pIt->second);
         }
-        return patterns;
-        });
+    }
+    return result;
 }
 
-// Utility functions
+// ─────────────────────────────────────────────────────────────────────────────
+// Job queue operations
+// ─────────────────────────────────────────────────────────────────────────────
+
+esp_err_t ManifestDatabase::enqueueJob(const jobs::Job& job) {
+    Impl::Lock lock(impl_->mutex);
+    if (!lock.acquired()) return ESP_ERR_TIMEOUT;
+
+    jobs::Job j = job;
+    if (j.created_at.empty()) j.created_at = currentTimestamp();
+
+    impl_->jobs[j.uuid] = std::move(j);
+
+    esp_err_t rc = impl_->save();
+    if (rc == ESP_OK) {
+        ESP_LOGI(TAG, "Job enqueued: %s (type=%s, pattern=%s)",
+            job.uuid.c_str(), jobs::jobTypeToString(job.type), job.pattern_uuid.c_str());
+    }
+    return rc;
+}
+
+std::optional<jobs::Job> ManifestDatabase::claimNextPendingJob() {
+    Impl::Lock lock(impl_->mutex);
+    if (!lock.acquired()) return std::nullopt;
+
+    // Linear scan for highest priority, oldest created_at among pending jobs
+    jobs::Job* best = nullptr;
+    for (auto& [_, j] : impl_->jobs) {
+        if (j.status != jobs::JobStatus::Pending) continue;
+        if (!best ||
+            j.priority > best->priority ||
+            (j.priority == best->priority && j.created_at < best->created_at)) {
+            best = &j;
+        }
+    }
+    if (!best) return std::nullopt;
+
+    best->status = jobs::JobStatus::InProgress;
+    best->started_at = currentTimestamp();
+
+    jobs::Job result = *best;  // Copy before save
+    impl_->save();
+
+    ESP_LOGI(TAG, "Job claimed: %s", result.uuid.c_str());
+    return result;
+}
+
+std::optional<jobs::Job> ManifestDatabase::getJob(const std::string& uuid) {
+    Impl::Lock lock(impl_->mutex);
+    if (!lock.acquired()) return std::nullopt;
+
+    auto it = impl_->jobs.find(uuid);
+    if (it != impl_->jobs.end()) return it->second;
+    return std::nullopt;
+}
+
+std::optional<jobs::Job> ManifestDatabase::getJobByPattern(const std::string& pattern_uuid,
+    jobs::JobType type) {
+    Impl::Lock lock(impl_->mutex);
+    if (!lock.acquired()) return std::nullopt;
+
+    for (auto& [_, j] : impl_->jobs) {
+        if (j.pattern_uuid == pattern_uuid &&
+            j.type == type &&
+            (j.status == jobs::JobStatus::Pending || j.status == jobs::JobStatus::InProgress)) {
+            return j;
+        }
+    }
+    return std::nullopt;
+}
+
+bool ManifestDatabase::hasJob(const std::string& pattern_uuid, jobs::JobType type) {
+    Impl::Lock lock(impl_->mutex);
+    if (!lock.acquired()) return false;
+
+    for (auto& [_, j] : impl_->jobs) {
+        if (j.pattern_uuid == pattern_uuid &&
+            j.type == type &&
+            (j.status == jobs::JobStatus::Pending || j.status == jobs::JobStatus::InProgress)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+esp_err_t ManifestDatabase::markJobCompleted(const std::string& uuid) {
+    Impl::Lock lock(impl_->mutex);
+    if (!lock.acquired()) return ESP_ERR_TIMEOUT;
+
+    auto it = impl_->jobs.find(uuid);
+    if (it == impl_->jobs.end()) return ESP_ERR_NOT_FOUND;
+
+    it->second.status = jobs::JobStatus::Completed;
+    it->second.completed_at = currentTimestamp();
+
+    ESP_LOGI(TAG, "Job completed: %s", uuid.c_str());
+    return impl_->save();
+}
+
+esp_err_t ManifestDatabase::markJobFailed(const std::string& uuid, const std::string& error) {
+    Impl::Lock lock(impl_->mutex);
+    if (!lock.acquired()) return ESP_ERR_TIMEOUT;
+
+    auto it = impl_->jobs.find(uuid);
+    if (it == impl_->jobs.end()) return ESP_ERR_NOT_FOUND;
+
+    auto& j = it->second;
+    if (j.retry_count < j.max_retries) {
+        // Re-queue for retry
+        j.status = jobs::JobStatus::Pending;
+        j.retry_count++;
+        j.error_message = error;
+        j.started_at.clear();
+        ESP_LOGW(TAG, "Job retry queued: %s (attempt %d/%d) - %s",
+            uuid.c_str(), j.retry_count, j.max_retries, error.c_str());
+    }
+    else {
+        // Permanent failure
+        j.status = jobs::JobStatus::Failed;
+        j.error_message = error;
+        j.completed_at = currentTimestamp();
+        ESP_LOGE(TAG, "Job failed permanently: %s - %s", uuid.c_str(), error.c_str());
+    }
+
+    return impl_->save();
+}
+
+esp_err_t ManifestDatabase::deleteJob(const std::string& uuid) {
+    Impl::Lock lock(impl_->mutex);
+    if (!lock.acquired()) return ESP_ERR_TIMEOUT;
+
+    if (!impl_->jobs.erase(uuid)) return ESP_ERR_NOT_FOUND;
+
+    ESP_LOGI(TAG, "Job deleted: %s", uuid.c_str());
+    return impl_->save();
+}
+
+esp_err_t ManifestDatabase::cancelJobsForPattern(const std::string& pattern_uuid) {
+    Impl::Lock lock(impl_->mutex);
+    if (!lock.acquired()) return ESP_ERR_TIMEOUT;
+
+    int deleted = 0;
+    for (auto it = impl_->jobs.begin(); it != impl_->jobs.end(); ) {
+        if (it->second.pattern_uuid == pattern_uuid &&
+            it->second.status == jobs::JobStatus::Pending) {
+            it = impl_->jobs.erase(it);
+            deleted++;
+        }
+        else {
+            ++it;
+        }
+    }
+
+    if (deleted > 0) {
+        ESP_LOGI(TAG, "Cancelled %d pending jobs for pattern: %s", deleted, pattern_uuid.c_str());
+        return impl_->save();
+    }
+    return ESP_OK;
+}
+
+size_t ManifestDatabase::getPendingJobCount() {
+    Impl::Lock lock(impl_->mutex);
+    if (!lock.acquired()) return 0;
+
+    size_t count = 0;
+    for (auto& [_, j] : impl_->jobs) {
+        if (j.status == jobs::JobStatus::Pending) count++;
+    }
+    return count;
+}
+
+size_t ManifestDatabase::getInProgressJobCount() {
+    Impl::Lock lock(impl_->mutex);
+    if (!lock.acquired()) return 0;
+
+    size_t count = 0;
+    for (auto& [_, j] : impl_->jobs) {
+        if (j.status == jobs::JobStatus::InProgress) count++;
+    }
+    return count;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Utility
+// ─────────────────────────────────────────────────────────────────────────────
 
 std::string ManifestDatabase::generateUUID() {
     uint32_t r1 = esp_random();
@@ -1202,30 +1190,37 @@ std::string ManifestDatabase::currentTimestamp() {
 }
 
 void ManifestDatabase::releaseMemory() {
-    if (!impl_->initialized || !impl_->db) return;
-
-    impl_->executeOnSqliteTask([this]() {
-        sqlite3_db_release_memory(impl_->db);
-        ESP_LOGI(TAG, "Released SQLite cache memory");
-        });
+    // No-op: kept for API compatibility (no external cache to release)
 }
 
 esp_err_t ManifestDatabase::vacuum() {
     Impl::Lock lock(impl_->mutex);
     if (!lock.acquired()) return ESP_ERR_TIMEOUT;
 
-    return impl_->executeOnSqliteTask([this]() -> esp_err_t {
-        char* errMsg = nullptr;
-        int rc = sqlite3_exec(impl_->db, "VACUUM", nullptr, nullptr, &errMsg);
-        if (rc != SQLITE_OK) {
-            ESP_LOGE(TAG, "VACUUM failed: %s", errMsg ? errMsg : "unknown");
-            sqlite3_free(errMsg);
-            return ESP_FAIL;
+    // Prune completed/failed jobs
+    int pruned = 0;
+    for (auto it = impl_->jobs.begin(); it != impl_->jobs.end(); ) {
+        auto& j = it->second;
+        if (j.status == jobs::JobStatus::Completed || j.status == jobs::JobStatus::Failed) {
+            it = impl_->jobs.erase(it);
+            pruned++;
         }
-        ESP_LOGI(TAG, "Database vacuumed");
-        return ESP_OK;
-        });
+        else {
+            ++it;
+        }
+    }
+
+    // Rewrite file (compacts any fragmentation)
+    esp_err_t rc = impl_->save();
+    if (rc == ESP_OK) {
+        ESP_LOGI(TAG, "Vacuum complete (pruned %d finished jobs)", pruned);
+    }
+    return rc;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// JSON conversion
+// ─────────────────────────────────────────────────────────────────────────────
 
 cJSON* ManifestDatabase::patternToJson(const Pattern& p) {
     cJSON* json = cJSON_CreateObject();
@@ -1247,7 +1242,6 @@ cJSON* ManifestDatabase::patternToJson(const Pattern& p) {
     if (!p.downloaded_at.empty())
         cJSON_AddStringToObject(json, "downloaded_at", p.downloaded_at.c_str());
 
-    // Ownership fields (for purchased patterns)
     cJSON_AddBoolToObject(json, "is_owned", p.purchased);
     if (p.purchased) {
         cJSON_AddNumberToObject(json, "purchased_at", static_cast<double>(p.purchased_at));
@@ -1312,7 +1306,6 @@ Pattern ManifestDatabase::jsonToPattern(const cJSON* json) {
     p.last_played_at = getText("last_played_at");
     p.downloaded_at = getText("downloaded_at");
 
-    // Ownership fields
     p.purchased = getBool("is_owned");
     const cJSON* purchasedAt = cJSON_GetObjectItem(json, "purchased_at");
     p.purchased_at = (purchasedAt && cJSON_IsNumber(purchasedAt))
@@ -1350,256 +1343,4 @@ Playlist ManifestDatabase::jsonToPlaylist(const cJSON* json) {
     }
 
     return pl;
-}
-
-// Job queue operations
-
-esp_err_t ManifestDatabase::enqueueJob(const jobs::Job& job) {
-    Impl::Lock lock(impl_->mutex);
-    if (!lock.acquired()) return ESP_ERR_TIMEOUT;
-
-    return impl_->executeOnSqliteTask([this, &job]() -> esp_err_t {
-        Impl::Statement stmt(impl_->db,
-            "INSERT INTO jobs (uuid, job_type, pattern_uuid, status, priority, retry_count, "
-            "max_retries, created_at, job_data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
-
-        stmt.bindText(1, job.uuid);
-        stmt.bindText(2, jobs::jobTypeToString(job.type));
-        stmt.bindText(3, job.pattern_uuid);
-        stmt.bindText(4, jobs::jobStatusToString(job.status));
-        stmt.bindInt(5, job.priority);
-        stmt.bindInt(6, job.retry_count);
-        stmt.bindInt(7, job.max_retries);
-        stmt.bindText(8, job.created_at.empty() ? currentTimestamp() : job.created_at);
-        stmt.bindText(9, job.job_data);
-
-        if (stmt.step() != SQLITE_DONE) {
-            ESP_LOGE(TAG, "Failed to enqueue job: %s", sqlite3_errmsg(impl_->db));
-            return ESP_FAIL;
-        }
-
-        ESP_LOGI(TAG, "Job enqueued: %s (type=%s, pattern=%s)",
-            job.uuid.c_str(), jobs::jobTypeToString(job.type), job.pattern_uuid.c_str());
-        return ESP_OK;
-    });
-}
-
-std::optional<jobs::Job> ManifestDatabase::claimNextPendingJob() {
-    Impl::Lock lock(impl_->mutex);
-    if (!lock.acquired()) return std::nullopt;
-
-    return impl_->executeOnSqliteTask([this]() -> std::optional<jobs::Job> {
-        Impl::Transaction txn(impl_->db);
-
-        // Find oldest pending job with highest priority
-        Impl::Statement selectStmt(impl_->db,
-            "SELECT uuid, job_type, pattern_uuid, status, priority, retry_count, max_retries, "
-            "created_at, started_at, completed_at, error_message, job_data "
-            "FROM jobs WHERE status = 'pending' ORDER BY priority DESC, created_at ASC LIMIT 1");
-
-        if (selectStmt.step() != SQLITE_ROW) {
-            return std::nullopt;
-        }
-
-        jobs::Job job = impl_->rowToJob(selectStmt);
-
-        // Atomically mark as in_progress
-        Impl::Statement updateStmt(impl_->db,
-            "UPDATE jobs SET status = 'in_progress', started_at = ? WHERE uuid = ?");
-        updateStmt.bindText(1, currentTimestamp());
-        updateStmt.bindText(2, job.uuid);
-
-        if (updateStmt.step() != SQLITE_DONE) {
-            ESP_LOGE(TAG, "Failed to claim job: %s", sqlite3_errmsg(impl_->db));
-            return std::nullopt;
-        }
-
-        txn.commit();
-        job.status = jobs::JobStatus::InProgress;
-        job.started_at = currentTimestamp();
-
-        ESP_LOGI(TAG, "Job claimed: %s", job.uuid.c_str());
-        return job;
-    });
-}
-
-std::optional<jobs::Job> ManifestDatabase::getJob(const std::string& uuid) {
-    Impl::Lock lock(impl_->mutex);
-    if (!lock.acquired()) return std::nullopt;
-
-    return impl_->executeOnSqliteTask([this, &uuid]() -> std::optional<jobs::Job> {
-        Impl::Statement stmt(impl_->db,
-            "SELECT uuid, job_type, pattern_uuid, status, priority, retry_count, max_retries, "
-            "created_at, started_at, completed_at, error_message, job_data "
-            "FROM jobs WHERE uuid = ?");
-        stmt.bindText(1, uuid);
-
-        if (stmt.step() == SQLITE_ROW) {
-            return impl_->rowToJob(stmt);
-        }
-        return std::nullopt;
-    });
-}
-
-std::optional<jobs::Job> ManifestDatabase::getJobByPattern(const std::string& pattern_uuid, jobs::JobType type) {
-    Impl::Lock lock(impl_->mutex);
-    if (!lock.acquired()) return std::nullopt;
-
-    return impl_->executeOnSqliteTask([this, &pattern_uuid, type]() -> std::optional<jobs::Job> {
-        Impl::Statement stmt(impl_->db,
-            "SELECT uuid, job_type, pattern_uuid, status, priority, retry_count, max_retries, "
-            "created_at, started_at, completed_at, error_message, job_data "
-            "FROM jobs WHERE pattern_uuid = ? AND job_type = ? AND status IN ('pending', 'in_progress')");
-        stmt.bindText(1, pattern_uuid);
-        stmt.bindText(2, jobs::jobTypeToString(type));
-
-        if (stmt.step() == SQLITE_ROW) {
-            return impl_->rowToJob(stmt);
-        }
-        return std::nullopt;
-    });
-}
-
-bool ManifestDatabase::hasJob(const std::string& pattern_uuid, jobs::JobType type) {
-    Impl::Lock lock(impl_->mutex);
-    if (!lock.acquired()) return false;
-
-    return impl_->executeOnSqliteTask([this, &pattern_uuid, type]() -> bool {
-        Impl::Statement stmt(impl_->db,
-            "SELECT 1 FROM jobs WHERE pattern_uuid = ? AND job_type = ? "
-            "AND status IN ('pending', 'in_progress') LIMIT 1");
-        stmt.bindText(1, pattern_uuid);
-        stmt.bindText(2, jobs::jobTypeToString(type));
-        return stmt.step() == SQLITE_ROW;
-    });
-}
-
-esp_err_t ManifestDatabase::markJobCompleted(const std::string& uuid) {
-    Impl::Lock lock(impl_->mutex);
-    if (!lock.acquired()) return ESP_ERR_TIMEOUT;
-
-    return impl_->executeOnSqliteTask([this, &uuid]() -> esp_err_t {
-        Impl::Statement stmt(impl_->db,
-            "UPDATE jobs SET status = 'completed', completed_at = ? WHERE uuid = ?");
-        stmt.bindText(1, currentTimestamp());
-        stmt.bindText(2, uuid);
-
-        if (stmt.step() != SQLITE_DONE || sqlite3_changes(impl_->db) == 0) {
-            return ESP_ERR_NOT_FOUND;
-        }
-
-        ESP_LOGI(TAG, "Job completed: %s", uuid.c_str());
-        return ESP_OK;
-    });
-}
-
-esp_err_t ManifestDatabase::markJobFailed(const std::string& uuid, const std::string& error) {
-    Impl::Lock lock(impl_->mutex);
-    if (!lock.acquired()) return ESP_ERR_TIMEOUT;
-
-    return impl_->executeOnSqliteTask([this, &uuid, &error]() -> esp_err_t {
-        // First get the job to check retry count
-        Impl::Statement selectStmt(impl_->db,
-            "SELECT retry_count, max_retries FROM jobs WHERE uuid = ?");
-        selectStmt.bindText(1, uuid);
-
-        if (selectStmt.step() != SQLITE_ROW) {
-            return ESP_ERR_NOT_FOUND;
-        }
-
-        int retry_count = selectStmt.columnInt(0);
-        int max_retries = selectStmt.columnInt(1);
-
-        if (retry_count < max_retries) {
-            // Re-queue for retry
-            Impl::Statement retryStmt(impl_->db,
-                "UPDATE jobs SET status = 'pending', retry_count = retry_count + 1, "
-                "error_message = ?, started_at = NULL WHERE uuid = ?");
-            retryStmt.bindText(1, error);
-            retryStmt.bindText(2, uuid);
-
-            if (retryStmt.step() != SQLITE_DONE) {
-                return ESP_FAIL;
-            }
-
-            ESP_LOGW(TAG, "Job retry queued: %s (attempt %d/%d) - %s",
-                uuid.c_str(), retry_count + 1, max_retries, error.c_str());
-        } else {
-            // Mark as permanently failed
-            Impl::Statement failStmt(impl_->db,
-                "UPDATE jobs SET status = 'failed', error_message = ?, completed_at = ? WHERE uuid = ?");
-            failStmt.bindText(1, error);
-            failStmt.bindText(2, currentTimestamp());
-            failStmt.bindText(3, uuid);
-
-            if (failStmt.step() != SQLITE_DONE) {
-                return ESP_FAIL;
-            }
-
-            ESP_LOGE(TAG, "Job failed permanently: %s - %s", uuid.c_str(), error.c_str());
-        }
-
-        return ESP_OK;
-    });
-}
-
-esp_err_t ManifestDatabase::deleteJob(const std::string& uuid) {
-    Impl::Lock lock(impl_->mutex);
-    if (!lock.acquired()) return ESP_ERR_TIMEOUT;
-
-    return impl_->executeOnSqliteTask([this, &uuid]() -> esp_err_t {
-        Impl::Statement stmt(impl_->db, "DELETE FROM jobs WHERE uuid = ?");
-        stmt.bindText(1, uuid);
-
-        if (stmt.step() != SQLITE_DONE || sqlite3_changes(impl_->db) == 0) {
-            return ESP_ERR_NOT_FOUND;
-        }
-
-        ESP_LOGI(TAG, "Job deleted: %s", uuid.c_str());
-        return ESP_OK;
-    });
-}
-
-esp_err_t ManifestDatabase::cancelJobsForPattern(const std::string& pattern_uuid) {
-    Impl::Lock lock(impl_->mutex);
-    if (!lock.acquired()) return ESP_ERR_TIMEOUT;
-
-    return impl_->executeOnSqliteTask([this, &pattern_uuid]() -> esp_err_t {
-        Impl::Statement stmt(impl_->db,
-            "DELETE FROM jobs WHERE pattern_uuid = ? AND status = 'pending'");
-        stmt.bindText(1, pattern_uuid);
-
-        stmt.step();
-        int deleted = sqlite3_changes(impl_->db);
-        if (deleted > 0) {
-            ESP_LOGI(TAG, "Cancelled %d pending jobs for pattern: %s", deleted, pattern_uuid.c_str());
-        }
-        return ESP_OK;
-    });
-}
-
-size_t ManifestDatabase::getPendingJobCount() {
-    Impl::Lock lock(impl_->mutex);
-    if (!lock.acquired()) return 0;
-
-    return impl_->executeOnSqliteTask([this]() -> size_t {
-        Impl::Statement stmt(impl_->db, "SELECT COUNT(*) FROM jobs WHERE status = 'pending'");
-        if (stmt.step() == SQLITE_ROW) {
-            return stmt.columnInt(0);
-        }
-        return 0;
-    });
-}
-
-size_t ManifestDatabase::getInProgressJobCount() {
-    Impl::Lock lock(impl_->mutex);
-    if (!lock.acquired()) return 0;
-
-    return impl_->executeOnSqliteTask([this]() -> size_t {
-        Impl::Statement stmt(impl_->db, "SELECT COUNT(*) FROM jobs WHERE status = 'in_progress'");
-        if (stmt.step() == SQLITE_ROW) {
-            return stmt.columnInt(0);
-        }
-        return 0;
-    });
 }

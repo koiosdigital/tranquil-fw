@@ -6,7 +6,7 @@
 #include <esp_partition.h>
 #include <esp_app_desc.h>
 #include <esp_timer.h>
-#include <mbedtls/sha256.h>
+#include <psa/crypto.h>
 #include <kd_common.h>
 #include <ctime>
 #include <kd/v1/common.pb-c.h>
@@ -228,7 +228,9 @@ void cloud_msg_send_license_request() {
     if (drm_license_get_info(&info) == ESP_OK) {
         // Hash the current license info as a freshness check
         // In production, this would be the hash of the actual license file
-        mbedtls_sha256(reinterpret_cast<const uint8_t*>(&info), sizeof(info), license_hash, 0);
+        size_t hash_len = 0;
+        psa_hash_compute(PSA_ALG_SHA_256, reinterpret_cast<const uint8_t*>(&info),
+            sizeof(info), license_hash, sizeof(license_hash), &hash_len);
         req.current_license_hash.data = license_hash;
         req.current_license_hash.len = sizeof(license_hash);
     }

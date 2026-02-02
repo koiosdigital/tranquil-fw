@@ -97,7 +97,7 @@ HandleResult ConfigHandler::handleGetConfig(ResponseMessage& response) {
     cal_proto.timestamp = cal.timestamp;
 
     // Active preset
-    strncpy(preset_id, cfg.active_preset_id(), sizeof(preset_id) - 1);
+    snprintf(preset_id, sizeof(preset_id), "%s", cfg.active_preset_id());
 
     config_resp.motion = &motion_proto;
     config_resp.led = &led_proto;

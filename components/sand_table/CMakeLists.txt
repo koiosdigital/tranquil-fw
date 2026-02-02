@@ -10,7 +10,8 @@ idf_component_register(
     PRIV_INCLUDE_DIRS
         "src"
     REQUIRES
-        driver
+        esp_driver_gpio
+        esp_driver_rmt
         esp_timer
         freertos
         esp_system
@@ -19,4 +20,5 @@ idf_component_register(
         nvs_flash
         kd_common
         console
+    
 )

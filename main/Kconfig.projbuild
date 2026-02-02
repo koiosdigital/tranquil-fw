@@ -2,6 +2,7 @@ menu "LED Configuration"
 
 config LED_PIN
     int "LED Pin"
+    default 18
     help
         GPIO pin number for the LED strip data line.
 
