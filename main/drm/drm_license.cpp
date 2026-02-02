@@ -1,6 +1,7 @@
 #include "drm_license.h"
 
 #include <kd_common.h>
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <mbedtls/pk.h>
 #include <mbedtls/sha256.h>
@@ -304,8 +305,10 @@ static esp_err_t load_license_file(void) {
         return ESP_ERR_NOT_SUPPORTED;
     }
 
-    // Allocate and read payload
-    license_state.payload = static_cast<uint8_t*>(malloc(header.payload_len));
+    // Allocate and read payload (use SPIRAM - persistent, cold path)
+    license_state.payload = static_cast<uint8_t*>(
+        heap_caps_malloc(header.payload_len, MALLOC_CAP_SPIRAM)
+    );
     if (license_state.payload == nullptr) {
         fclose(f);
         license_state.loaded = false;
@@ -321,8 +324,10 @@ static esp_err_t load_license_file(void) {
         return ESP_FAIL;
     }
 
-    // Allocate and read signature
-    license_state.signature = static_cast<uint8_t*>(malloc(header.signature_len));
+    // Allocate and read signature (use SPIRAM - persistent, cold path)
+    license_state.signature = static_cast<uint8_t*>(
+        heap_caps_malloc(header.signature_len, MALLOC_CAP_SPIRAM)
+    );
     if (license_state.signature == nullptr) {
         free_license_data();
         fclose(f);
@@ -375,6 +380,10 @@ static esp_err_t parse_license_payload(void) {
             sizeof(license_state.info.license_id) - 1);
     }
     license_state.info.issued_at = pb->issued_at;
+    if (pb->store_token) {
+        strncpy(license_state.info.store_token, pb->store_token,
+            sizeof(license_state.info.store_token) - 1);
+    }
 
     kd__v1__license_payload__free_unpacked(pb, nullptr);
 
@@ -398,8 +407,15 @@ static drm_license_status_t validate_license(void) {
     // Check device binding
     size_t cert_len = 0;
     if (kd_common_get_device_cert(nullptr, &cert_len) == ESP_OK && cert_len > 0) {
-        char* cert_pem = static_cast<char*>(malloc(cert_len + 1));
-        if (cert_pem && kd_common_get_device_cert(cert_pem, &cert_len) == ESP_OK) {
+        // Use stack buffer for certificate (cold path, ~2KB typical)
+        constexpr size_t MAX_CERT_SIZE = 2048;
+        if (cert_len >= MAX_CERT_SIZE) {
+            ESP_LOGE(TAG, "Certificate too large: %zu", cert_len);
+            return DRM_LICENSE_INVALID_FORMAT;
+        }
+        char cert_pem[MAX_CERT_SIZE];
+
+        if (kd_common_get_device_cert(cert_pem, &cert_len) == ESP_OK) {
             // Parse certificate to extract CN
             mbedtls_x509_crt crt;
             mbedtls_x509_crt_init(&crt);
@@ -422,7 +438,6 @@ static drm_license_status_t validate_license(void) {
                             ESP_LOGE(TAG, "Device mismatch: cert='%s', license='%s'",
                                 cn_start, license_state.info.for_device);
                             mbedtls_x509_crt_free(&crt);
-                            free(cert_pem);
                             return DRM_LICENSE_DEVICE_MISMATCH;
                         }
                     }
@@ -430,7 +445,6 @@ static drm_license_status_t validate_license(void) {
             }
             mbedtls_x509_crt_free(&crt);
         }
-        free(cert_pem);
     }
 
     // Check time validity
@@ -458,17 +472,58 @@ static drm_license_status_t validate_license(void) {
 static void free_license_data(void) {
     if (license_state.payload) {
         mbedtls_platform_zeroize(license_state.payload, license_state.payload_len);
-        free(license_state.payload);
+        heap_caps_free(license_state.payload);
         license_state.payload = nullptr;
     }
     license_state.payload_len = 0;
 
     if (license_state.signature) {
-        free(license_state.signature);
+        heap_caps_free(license_state.signature);
         license_state.signature = nullptr;
     }
     license_state.signature_len = 0;
 
     memset(&license_state.info, 0, sizeof(license_state.info));
     license_state.loaded = false;
+}
+
+esp_err_t drm_license_get_store_token(char* token, size_t* token_len) {
+    if (!license_state.initialized || !license_state.loaded) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    if (license_state.status != DRM_LICENSE_VALID) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    xSemaphoreTake(license_state.mutex, portMAX_DELAY);
+
+    size_t len = strlen(license_state.info.store_token);
+    if (len == 0) {
+        xSemaphoreGive(license_state.mutex);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    if (token != nullptr) {
+        strncpy(token, license_state.info.store_token, DRM_STORE_TOKEN_MAX_SIZE);
+        token[DRM_STORE_TOKEN_MAX_SIZE] = '\0';
+    }
+    if (token_len != nullptr) {
+        *token_len = len;
+    }
+
+    xSemaphoreGive(license_state.mutex);
+    return ESP_OK;
+}
+
+bool drm_license_has_store_token(void) {
+    if (!drm_license_is_valid()) {
+        return false;
+    }
+
+    xSemaphoreTake(license_state.mutex, portMAX_DELAY);
+    bool has_token = (strlen(license_state.info.store_token) > 0);
+    xSemaphoreGive(license_state.mutex);
+
+    return has_token;
 }

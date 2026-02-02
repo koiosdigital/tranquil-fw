@@ -68,11 +68,14 @@ public:
 
     // Playlist playback
     static esp_err_t playPlaylist(const char* playlist_uuid, bool shuffle = false, bool loop = false);
+    // Start playlist from a specific pattern (even if shuffled, starts at this pattern)
+    static esp_err_t playPlaylistFromPattern(const char* playlist_uuid, const char* pattern_uuid, bool shuffle = false, bool loop = false);
 
     // Playback control
     static esp_err_t pause();
     static esp_err_t resume();
     static esp_err_t stop();
+    static esp_err_t emergencyStop();  // Immediate halt without state cleanup
     static esp_err_t skip();  // Playlist only: skip to next pattern
 
     // Configuration
@@ -90,6 +93,7 @@ public:
     static cJSON* getStateJSON();
     static int getTotalProgress();
     static bool isHomed();
+    static sand_table::MotionController* getMotionController();
 
     // Pattern info
     static const Pattern* getCurrentPattern();

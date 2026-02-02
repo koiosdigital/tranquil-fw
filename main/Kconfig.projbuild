@@ -7,5 +7,8 @@ config LED_PIN
 
 # Note: LED count and type (RGB/RGBW) are now stored in NVS and configured
 # via the ConfigManager preset system. See config_manager.h and presets.h.
+config MBEDTLS_PK_RSA_ALT_SUPPORT
+    bool
+    default y
 
 endmenu

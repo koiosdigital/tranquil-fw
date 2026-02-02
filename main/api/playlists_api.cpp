@@ -105,28 +105,23 @@ static esp_err_t playlists_detail_handler(httpd_req_t* req) {
 
 // POST /api/playlists - create playlist
 static esp_err_t playlists_create_handler(httpd_req_t* req) {
+    // Use stack buffer for JSON (cold path, small payloads)
+    static constexpr size_t MAX_PLAYLIST_JSON = 4096;
     int len = req->content_len;
-    if (len <= 0 || len > 64 * 1024) {
+    if (len <= 0 || static_cast<size_t>(len) >= MAX_PLAYLIST_JSON) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid content length");
         return ESP_FAIL;
     }
 
-    char* buf = static_cast<char*>(malloc(len + 1));
-    if (!buf) {
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
-
+    char buf[MAX_PLAYLIST_JSON];
     int received = httpd_req_recv(req, buf, len);
     if (received <= 0) {
-        free(buf);
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
     buf[len] = '\0';
 
     cJSON* json = cJSON_Parse(buf);
-    free(buf);
     if (!json) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
         return ESP_FAIL;
@@ -173,28 +168,23 @@ static esp_err_t playlists_modify_handler(httpd_req_t* req) {
         return ESP_FAIL;
     }
 
+    // Use stack buffer for JSON (cold path, small payloads)
+    static constexpr size_t MAX_PLAYLIST_JSON = 4096;
     int len = req->content_len;
-    if (len <= 0) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty request");
+    if (len <= 0 || static_cast<size_t>(len) >= MAX_PLAYLIST_JSON) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid request size");
         return ESP_FAIL;
     }
 
-    char* buf = static_cast<char*>(malloc(len + 1));
-    if (!buf) {
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
-
+    char buf[MAX_PLAYLIST_JSON];
     int received = httpd_req_recv(req, buf, len);
     if (received <= 0) {
-        free(buf);
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
     buf[len] = '\0';
 
     cJSON* json = cJSON_Parse(buf);
-    free(buf);
     if (!json) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
         return ESP_FAIL;
@@ -253,28 +243,23 @@ static esp_err_t playlists_order_handler(httpd_req_t* req) {
         return ESP_FAIL;
     }
 
+    // Use stack buffer for JSON (cold path, small payloads)
+    static constexpr size_t MAX_PLAYLIST_JSON = 4096;
     int len = req->content_len;
-    if (len <= 0) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty request");
+    if (len <= 0 || static_cast<size_t>(len) >= MAX_PLAYLIST_JSON) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid request size");
         return ESP_FAIL;
     }
 
-    char* buf = static_cast<char*>(malloc(len + 1));
-    if (!buf) {
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
-
+    char buf[MAX_PLAYLIST_JSON];
     int received = httpd_req_recv(req, buf, len);
     if (received <= 0) {
-        free(buf);
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
     buf[len] = '\0';
 
     cJSON* json = cJSON_Parse(buf);
-    free(buf);
 
     if (!json || !cJSON_IsArray(json)) {
         if (json) cJSON_Delete(json);

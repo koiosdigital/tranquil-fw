@@ -206,6 +206,91 @@ esp_err_t SandTablePlayer::playPlaylist(const char* playlist_uuid, bool shuffle,
     return ESP_OK;
 }
 
+esp_err_t SandTablePlayer::playPlaylistFromPattern(const char* playlist_uuid, const char* pattern_uuid, bool shuffle, bool loop) {
+    if (!initialized_) return ESP_ERR_INVALID_STATE;
+    if (!motion_controller_->is_homed()) return ESP_ERR_INVALID_STATE;
+
+    if (xSemaphoreTake(state_mutex_, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    // Stop current playback
+    if (playback_state_ != PlaybackState::STOPPED) {
+        playback_state_ = PlaybackState::STOPPED;
+        unloadPatternFile();
+    }
+
+    // Load the playlist
+    loadPlaylist(playlist_uuid);
+    if (playlist_patterns_.empty()) {
+        ESP_LOGE(TAG, "Playlist is empty or not found: %s", playlist_uuid);
+        xSemaphoreGive(state_mutex_);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    strncpy(current_playlist_uuid_, playlist_uuid, MAX_UUID_LEN - 1);
+    current_playlist_uuid_[MAX_UUID_LEN - 1] = '\0';
+
+    is_shuffle_ = shuffle;
+    is_loop_ = loop;
+
+    // Find the pattern index in the original list
+    size_t start_index = 0;
+    bool found = false;
+    for (size_t i = 0; i < playlist_patterns_.size(); ++i) {
+        if (playlist_patterns_[i] == pattern_uuid) {
+            start_index = i;
+            found = true;
+            break;
+        }
+    }
+
+    if (!found) {
+        ESP_LOGE(TAG, "Pattern %s not found in playlist %s", pattern_uuid, playlist_uuid);
+        xSemaphoreGive(state_mutex_);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    // Even if shuffle is enabled, we start at the specified pattern
+    // Build order starting from that pattern
+    playlist_order_.clear();
+    playlist_order_.push_back(start_index);
+
+    if (is_shuffle_) {
+        // Add remaining patterns in shuffled order
+        std::vector<size_t> remaining;
+        for (size_t i = 0; i < playlist_patterns_.size(); ++i) {
+            if (i != start_index) {
+                remaining.push_back(i);
+            }
+        }
+        std::random_device rd;
+        std::mt19937 g(rd());
+        std::shuffle(remaining.begin(), remaining.end(), g);
+        for (size_t idx : remaining) {
+            playlist_order_.push_back(idx);
+        }
+    } else {
+        // Sequential from start pattern
+        for (size_t i = 1; i < playlist_patterns_.size(); ++i) {
+            playlist_order_.push_back((start_index + i) % playlist_patterns_.size());
+        }
+    }
+
+    playlist_index_ = 0;
+    play_mode_ = is_loop_ ? PlayMode::PLAYLIST_LOOP :
+                 (is_shuffle_ ? PlayMode::PLAYLIST_SHUFFLE : PlayMode::PLAYLIST);
+    playback_state_ = PlaybackState::PLAYING;
+
+    startCurrentPattern();
+
+    xSemaphoreGive(state_mutex_);
+
+    ESP_LOGI(TAG, "Started playlist: %s from pattern %s (shuffle=%d, loop=%d)",
+             playlist_uuid, pattern_uuid, (int)shuffle, (int)loop);
+    return ESP_OK;
+}
+
 // =============================================================================
 // Playback Control
 // =============================================================================
@@ -273,6 +358,33 @@ esp_err_t SandTablePlayer::stop() {
 
     motion_controller_->emergency_stop();
     motion_controller_->clear_emergency_stop();
+    return ESP_OK;
+}
+
+esp_err_t SandTablePlayer::emergencyStop() {
+    if (!initialized_) return ESP_ERR_INVALID_STATE;
+
+    // Immediate halt - don't wait for mutex, just stop motion
+    motion_controller_->emergency_stop();
+
+    // Now acquire mutex to update state
+    if (xSemaphoreTake(state_mutex_, pdMS_TO_TICKS(100)) == pdTRUE) {
+        playback_state_ = PlaybackState::STOPPED;
+        play_mode_ = PlayMode::SINGLE_PATTERN;
+        unloadPatternFile();
+        memset(current_pattern_uuid_, 0, sizeof(current_pattern_uuid_));
+        current_pattern_ = std::nullopt;
+        memset(current_playlist_uuid_, 0, sizeof(current_playlist_uuid_));
+        playlist_patterns_.clear();
+        playlist_order_.clear();
+        playlist_index_ = 0;
+        is_shuffle_ = false;
+        is_loop_ = false;
+        xSemaphoreGive(state_mutex_);
+    }
+
+    motion_controller_->clear_emergency_stop();
+    ESP_LOGW(TAG, "Emergency stop executed");
     return ESP_OK;
 }
 
@@ -449,6 +561,10 @@ int SandTablePlayer::getTotalProgress() {
 
 bool SandTablePlayer::isHomed() {
     return motion_controller_ && motion_controller_->is_homed();
+}
+
+sand_table::MotionController* SandTablePlayer::getMotionController() {
+    return motion_controller_;
 }
 
 const Pattern* SandTablePlayer::getCurrentPattern() {

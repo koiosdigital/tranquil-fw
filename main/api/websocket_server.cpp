@@ -1,5 +1,5 @@
 #include "websocket_server.h"
-#include "proto_handler.h"
+#include "message_dispatcher.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -11,8 +11,8 @@ static const char* TAG = "ws_server";
 // Maximum concurrent WebSocket clients (memory constrained)
 static constexpr size_t MAX_CLIENTS = 4;
 
-// Maximum incoming frame size
-static constexpr size_t MAX_FRAME_SIZE = 65536;
+// Maximum incoming frame size (8KB sufficient for local API)
+static constexpr size_t MAX_FRAME_SIZE = 8192;
 
 // Connected client socket file descriptors
 static int connected_clients[MAX_CLIENTS] = { -1, -1, -1, -1 };
@@ -127,35 +127,16 @@ static esp_err_t ws_handler(httpd_req_t* req) {
         return ret;
     }
 
-    // Process protobuf message
-    uint8_t* response = nullptr;
-    size_t response_len = 0;
-    ret = proto_handle_message(buf, ws_pkt.len, &response, &response_len);
+    // Dispatch message through unified dispatcher
+    // The dispatcher handles response routing via ResponseRouter
+    int fd = httpd_req_to_sockfd(req);
+    MessageContext ctx = MessageContext::localWS(fd);
+
+    ret = MessageDispatcher::instance().dispatch(buf, ws_pkt.len, ctx);
     free(buf);
 
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to handle message");
-        if (response) free(response);
-        return ret;
-    }
-
-    // Send response if generated
-    if (response && response_len > 0) {
-        httpd_ws_frame_t response_pkt = {
-            .final = true,
-            .fragmented = false,
-            .type = HTTPD_WS_TYPE_BINARY,
-            .payload = response,
-            .len = response_len
-        };
-
-        ret = httpd_ws_send_frame(req, &response_pkt);
-        free(response);
-
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to send response: %s", esp_err_to_name(ret));
-            return ret;
-        }
+    if (ret != ESP_OK && ret != ESP_ERR_NOT_FOUND) {
+        ESP_LOGW(TAG, "Message dispatch failed: %s", esp_err_to_name(ret));
     }
 
     return ESP_OK;
@@ -168,6 +149,32 @@ struct async_send_arg {
     uint8_t* data;
     size_t len;
 };
+
+// Pool for async send args (avoids heap fragmentation in hot path)
+static constexpr size_t ASYNC_ARG_POOL_SIZE = 8;
+static async_send_arg async_arg_pool[ASYNC_ARG_POOL_SIZE];
+static uint8_t async_arg_used = 0;  // Bitmap
+
+static async_send_arg* pool_alloc_arg() {
+    for (size_t i = 0; i < ASYNC_ARG_POOL_SIZE; i++) {
+        if (!(async_arg_used & (1 << i))) {
+            async_arg_used |= (1 << i);
+            return &async_arg_pool[i];
+        }
+    }
+    // Pool exhausted, fall back to malloc
+    return static_cast<async_send_arg*>(malloc(sizeof(async_send_arg)));
+}
+
+static void pool_free_arg(async_send_arg* arg) {
+    for (size_t i = 0; i < ASYNC_ARG_POOL_SIZE; i++) {
+        if (&async_arg_pool[i] == arg) {
+            async_arg_used &= ~(1 << i);
+            return;
+        }
+    }
+    free(arg);  // Was from fallback malloc
+}
 
 static void async_send_worker(void* arg) {
     async_send_arg* a = static_cast<async_send_arg*>(arg);
@@ -186,7 +193,7 @@ static void async_send_worker(void* arg) {
     }
 
     free(a->data);
-    free(a);
+    pool_free_arg(a);
 }
 
 esp_err_t websocket_server_init(httpd_handle_t server) {
@@ -227,7 +234,7 @@ esp_err_t websocket_send(int fd, const uint8_t* data, size_t len) {
     if (!data_copy) return ESP_ERR_NO_MEM;
     memcpy(data_copy, data, len);
 
-    async_send_arg* arg = static_cast<async_send_arg*>(malloc(sizeof(async_send_arg)));
+    async_send_arg* arg = pool_alloc_arg();
     if (!arg) {
         free(data_copy);
         return ESP_ERR_NO_MEM;
@@ -241,7 +248,7 @@ esp_err_t websocket_send(int fd, const uint8_t* data, size_t len) {
     esp_err_t ret = httpd_queue_work(ws_server, async_send_worker, arg);
     if (ret != ESP_OK) {
         free(data_copy);
-        free(arg);
+        pool_free_arg(arg);
     }
 
     return ret;

@@ -1,4 +1,5 @@
 #include "ManifestDatabase.h"
+#include "jobs/job_types.h"
 #include "sd.h"
 #include "sqlite3.h"
 #include "esp_log.h"
@@ -209,6 +210,26 @@ public:
 
             CREATE INDEX IF NOT EXISTS idx_pp_playlist ON playlist_patterns(playlist_id, position);
 
+            CREATE TABLE IF NOT EXISTS jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uuid TEXT NOT NULL UNIQUE,
+                job_type TEXT NOT NULL,
+                pattern_uuid TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                priority INTEGER DEFAULT 0,
+                retry_count INTEGER DEFAULT 0,
+                max_retries INTEGER DEFAULT 3,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT,
+                error_message TEXT,
+                job_data TEXT,
+                FOREIGN KEY (pattern_uuid) REFERENCES patterns(uuid) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_jobs_status_priority ON jobs(status, priority DESC, created_at);
+            CREATE INDEX IF NOT EXISTS idx_jobs_pattern ON jobs(pattern_uuid);
+
             PRAGMA foreign_keys = ON;
         )";
 
@@ -281,6 +302,23 @@ public:
         }
         return uuids;
     }
+
+    jobs::Job rowToJob(Statement& stmt) {
+        jobs::Job j;
+        j.uuid = stmt.columnText(0);
+        j.type = jobs::jobTypeFromString(stmt.columnText(1));
+        j.pattern_uuid = stmt.columnText(2);
+        j.status = jobs::jobStatusFromString(stmt.columnText(3));
+        j.priority = stmt.columnInt(4);
+        j.retry_count = stmt.columnInt(5);
+        j.max_retries = stmt.columnInt(6);
+        j.created_at = stmt.columnText(7);
+        j.started_at = stmt.columnText(8);
+        j.completed_at = stmt.columnText(9);
+        j.error_message = stmt.columnText(10);
+        j.job_data = stmt.columnText(11);
+        return j;
+    }
 };
 
 // ManifestDatabase implementation
@@ -302,6 +340,7 @@ esp_err_t ManifestDatabase::initialize() {
 
     // Initialize SD card (can run on main task - not SQLite)
     init_sd();
+    format_sd();
 
     // Ensure patterns directory exists
     struct stat st = { 0 };
@@ -543,6 +582,9 @@ esp_err_t ManifestDatabase::deletePattern(const std::string& uuid) {
         unlink(path);  // Unencrypted
         snprintf(path, sizeof(path), "/sd/patterns/%s.dat", uuid.c_str());
         unlink(path);  // Encrypted
+        // Delete thumbnail if exists
+        snprintf(path, sizeof(path), "/sd/previews/%s.png", uuid.c_str());
+        unlink(path);
         ESP_LOGI(TAG, "Pattern deleted: %s", uuid.c_str());
     }
     return result;
@@ -1250,4 +1292,256 @@ Playlist ManifestDatabase::jsonToPlaylist(const cJSON* json) {
     }
 
     return pl;
+}
+
+// Job queue operations
+
+esp_err_t ManifestDatabase::enqueueJob(const jobs::Job& job) {
+    Impl::Lock lock(impl_->mutex);
+    if (!lock.acquired()) return ESP_ERR_TIMEOUT;
+
+    return impl_->executeOnSqliteTask([this, &job]() -> esp_err_t {
+        Impl::Statement stmt(impl_->db,
+            "INSERT INTO jobs (uuid, job_type, pattern_uuid, status, priority, retry_count, "
+            "max_retries, created_at, job_data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+
+        stmt.bindText(1, job.uuid);
+        stmt.bindText(2, jobs::jobTypeToString(job.type));
+        stmt.bindText(3, job.pattern_uuid);
+        stmt.bindText(4, jobs::jobStatusToString(job.status));
+        stmt.bindInt(5, job.priority);
+        stmt.bindInt(6, job.retry_count);
+        stmt.bindInt(7, job.max_retries);
+        stmt.bindText(8, job.created_at.empty() ? currentTimestamp() : job.created_at);
+        stmt.bindText(9, job.job_data);
+
+        if (stmt.step() != SQLITE_DONE) {
+            ESP_LOGE(TAG, "Failed to enqueue job: %s", sqlite3_errmsg(impl_->db));
+            return ESP_FAIL;
+        }
+
+        ESP_LOGI(TAG, "Job enqueued: %s (type=%s, pattern=%s)",
+            job.uuid.c_str(), jobs::jobTypeToString(job.type), job.pattern_uuid.c_str());
+        return ESP_OK;
+    });
+}
+
+std::optional<jobs::Job> ManifestDatabase::claimNextPendingJob() {
+    Impl::Lock lock(impl_->mutex);
+    if (!lock.acquired()) return std::nullopt;
+
+    return impl_->executeOnSqliteTask([this]() -> std::optional<jobs::Job> {
+        Impl::Transaction txn(impl_->db);
+
+        // Find oldest pending job with highest priority
+        Impl::Statement selectStmt(impl_->db,
+            "SELECT uuid, job_type, pattern_uuid, status, priority, retry_count, max_retries, "
+            "created_at, started_at, completed_at, error_message, job_data "
+            "FROM jobs WHERE status = 'pending' ORDER BY priority DESC, created_at ASC LIMIT 1");
+
+        if (selectStmt.step() != SQLITE_ROW) {
+            return std::nullopt;
+        }
+
+        jobs::Job job = impl_->rowToJob(selectStmt);
+
+        // Atomically mark as in_progress
+        Impl::Statement updateStmt(impl_->db,
+            "UPDATE jobs SET status = 'in_progress', started_at = ? WHERE uuid = ?");
+        updateStmt.bindText(1, currentTimestamp());
+        updateStmt.bindText(2, job.uuid);
+
+        if (updateStmt.step() != SQLITE_DONE) {
+            ESP_LOGE(TAG, "Failed to claim job: %s", sqlite3_errmsg(impl_->db));
+            return std::nullopt;
+        }
+
+        txn.commit();
+        job.status = jobs::JobStatus::InProgress;
+        job.started_at = currentTimestamp();
+
+        ESP_LOGI(TAG, "Job claimed: %s", job.uuid.c_str());
+        return job;
+    });
+}
+
+std::optional<jobs::Job> ManifestDatabase::getJob(const std::string& uuid) {
+    Impl::Lock lock(impl_->mutex);
+    if (!lock.acquired()) return std::nullopt;
+
+    return impl_->executeOnSqliteTask([this, &uuid]() -> std::optional<jobs::Job> {
+        Impl::Statement stmt(impl_->db,
+            "SELECT uuid, job_type, pattern_uuid, status, priority, retry_count, max_retries, "
+            "created_at, started_at, completed_at, error_message, job_data "
+            "FROM jobs WHERE uuid = ?");
+        stmt.bindText(1, uuid);
+
+        if (stmt.step() == SQLITE_ROW) {
+            return impl_->rowToJob(stmt);
+        }
+        return std::nullopt;
+    });
+}
+
+std::optional<jobs::Job> ManifestDatabase::getJobByPattern(const std::string& pattern_uuid, jobs::JobType type) {
+    Impl::Lock lock(impl_->mutex);
+    if (!lock.acquired()) return std::nullopt;
+
+    return impl_->executeOnSqliteTask([this, &pattern_uuid, type]() -> std::optional<jobs::Job> {
+        Impl::Statement stmt(impl_->db,
+            "SELECT uuid, job_type, pattern_uuid, status, priority, retry_count, max_retries, "
+            "created_at, started_at, completed_at, error_message, job_data "
+            "FROM jobs WHERE pattern_uuid = ? AND job_type = ? AND status IN ('pending', 'in_progress')");
+        stmt.bindText(1, pattern_uuid);
+        stmt.bindText(2, jobs::jobTypeToString(type));
+
+        if (stmt.step() == SQLITE_ROW) {
+            return impl_->rowToJob(stmt);
+        }
+        return std::nullopt;
+    });
+}
+
+bool ManifestDatabase::hasJob(const std::string& pattern_uuid, jobs::JobType type) {
+    Impl::Lock lock(impl_->mutex);
+    if (!lock.acquired()) return false;
+
+    return impl_->executeOnSqliteTask([this, &pattern_uuid, type]() -> bool {
+        Impl::Statement stmt(impl_->db,
+            "SELECT 1 FROM jobs WHERE pattern_uuid = ? AND job_type = ? "
+            "AND status IN ('pending', 'in_progress') LIMIT 1");
+        stmt.bindText(1, pattern_uuid);
+        stmt.bindText(2, jobs::jobTypeToString(type));
+        return stmt.step() == SQLITE_ROW;
+    });
+}
+
+esp_err_t ManifestDatabase::markJobCompleted(const std::string& uuid) {
+    Impl::Lock lock(impl_->mutex);
+    if (!lock.acquired()) return ESP_ERR_TIMEOUT;
+
+    return impl_->executeOnSqliteTask([this, &uuid]() -> esp_err_t {
+        Impl::Statement stmt(impl_->db,
+            "UPDATE jobs SET status = 'completed', completed_at = ? WHERE uuid = ?");
+        stmt.bindText(1, currentTimestamp());
+        stmt.bindText(2, uuid);
+
+        if (stmt.step() != SQLITE_DONE || sqlite3_changes(impl_->db) == 0) {
+            return ESP_ERR_NOT_FOUND;
+        }
+
+        ESP_LOGI(TAG, "Job completed: %s", uuid.c_str());
+        return ESP_OK;
+    });
+}
+
+esp_err_t ManifestDatabase::markJobFailed(const std::string& uuid, const std::string& error) {
+    Impl::Lock lock(impl_->mutex);
+    if (!lock.acquired()) return ESP_ERR_TIMEOUT;
+
+    return impl_->executeOnSqliteTask([this, &uuid, &error]() -> esp_err_t {
+        // First get the job to check retry count
+        Impl::Statement selectStmt(impl_->db,
+            "SELECT retry_count, max_retries FROM jobs WHERE uuid = ?");
+        selectStmt.bindText(1, uuid);
+
+        if (selectStmt.step() != SQLITE_ROW) {
+            return ESP_ERR_NOT_FOUND;
+        }
+
+        int retry_count = selectStmt.columnInt(0);
+        int max_retries = selectStmt.columnInt(1);
+
+        if (retry_count < max_retries) {
+            // Re-queue for retry
+            Impl::Statement retryStmt(impl_->db,
+                "UPDATE jobs SET status = 'pending', retry_count = retry_count + 1, "
+                "error_message = ?, started_at = NULL WHERE uuid = ?");
+            retryStmt.bindText(1, error);
+            retryStmt.bindText(2, uuid);
+
+            if (retryStmt.step() != SQLITE_DONE) {
+                return ESP_FAIL;
+            }
+
+            ESP_LOGW(TAG, "Job retry queued: %s (attempt %d/%d) - %s",
+                uuid.c_str(), retry_count + 1, max_retries, error.c_str());
+        } else {
+            // Mark as permanently failed
+            Impl::Statement failStmt(impl_->db,
+                "UPDATE jobs SET status = 'failed', error_message = ?, completed_at = ? WHERE uuid = ?");
+            failStmt.bindText(1, error);
+            failStmt.bindText(2, currentTimestamp());
+            failStmt.bindText(3, uuid);
+
+            if (failStmt.step() != SQLITE_DONE) {
+                return ESP_FAIL;
+            }
+
+            ESP_LOGE(TAG, "Job failed permanently: %s - %s", uuid.c_str(), error.c_str());
+        }
+
+        return ESP_OK;
+    });
+}
+
+esp_err_t ManifestDatabase::deleteJob(const std::string& uuid) {
+    Impl::Lock lock(impl_->mutex);
+    if (!lock.acquired()) return ESP_ERR_TIMEOUT;
+
+    return impl_->executeOnSqliteTask([this, &uuid]() -> esp_err_t {
+        Impl::Statement stmt(impl_->db, "DELETE FROM jobs WHERE uuid = ?");
+        stmt.bindText(1, uuid);
+
+        if (stmt.step() != SQLITE_DONE || sqlite3_changes(impl_->db) == 0) {
+            return ESP_ERR_NOT_FOUND;
+        }
+
+        ESP_LOGI(TAG, "Job deleted: %s", uuid.c_str());
+        return ESP_OK;
+    });
+}
+
+esp_err_t ManifestDatabase::cancelJobsForPattern(const std::string& pattern_uuid) {
+    Impl::Lock lock(impl_->mutex);
+    if (!lock.acquired()) return ESP_ERR_TIMEOUT;
+
+    return impl_->executeOnSqliteTask([this, &pattern_uuid]() -> esp_err_t {
+        Impl::Statement stmt(impl_->db,
+            "DELETE FROM jobs WHERE pattern_uuid = ? AND status = 'pending'");
+        stmt.bindText(1, pattern_uuid);
+
+        stmt.step();
+        int deleted = sqlite3_changes(impl_->db);
+        if (deleted > 0) {
+            ESP_LOGI(TAG, "Cancelled %d pending jobs for pattern: %s", deleted, pattern_uuid.c_str());
+        }
+        return ESP_OK;
+    });
+}
+
+size_t ManifestDatabase::getPendingJobCount() {
+    Impl::Lock lock(impl_->mutex);
+    if (!lock.acquired()) return 0;
+
+    return impl_->executeOnSqliteTask([this]() -> size_t {
+        Impl::Statement stmt(impl_->db, "SELECT COUNT(*) FROM jobs WHERE status = 'pending'");
+        if (stmt.step() == SQLITE_ROW) {
+            return stmt.columnInt(0);
+        }
+        return 0;
+    });
+}
+
+size_t ManifestDatabase::getInProgressJobCount() {
+    Impl::Lock lock(impl_->mutex);
+    if (!lock.acquired()) return 0;
+
+    return impl_->executeOnSqliteTask([this]() -> size_t {
+        Impl::Statement stmt(impl_->db, "SELECT COUNT(*) FROM jobs WHERE status = 'in_progress'");
+        if (stmt.step() == SQLITE_ROW) {
+            return stmt.columnInt(0);
+        }
+        return 0;
+    });
 }

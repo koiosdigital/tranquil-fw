@@ -5,8 +5,12 @@
 #include "patterns_api.h"
 #include "playlists_api.h"
 #include "api_player.h"
-#include "led_api.h"
+#include "kd_pixdriver.h"
+#include "license_api.h"
 #include "websocket_server.h"
+#include "message_dispatcher.h"
+#include "player_state_broadcaster.h"
+#include "schedule_manager.h"
 
 #include "static_files.h"
 
@@ -48,8 +52,18 @@ void tranquil_api_init() {
     patterns_api_register_handlers(server);
     playlists_api_register_handlers(server);
     api_player_register_endpoints(server);
-    led_api_register_handlers(server);
+    PixelDriver::attach_api(server);
+    license_api_register_handlers(server);
+
+    // Initialize unified message dispatcher with standard handlers
+    dispatcher_register_standard_handlers();
     websocket_server_init(server);
+
+    // Initialize player state broadcaster for rate-limited state updates
+    PlayerStateBroadcaster::instance().init();
+
+    // Initialize schedule manager for scheduled actions
+    ScheduleManager::instance().init();
 
     // Create an array of httpd_uri_t to keep them alive after the loop
     static httpd_uri_t static_file_uris[static_files::num_of_files + 1]; // +1 for root '/' override

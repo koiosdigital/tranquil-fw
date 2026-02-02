@@ -72,25 +72,18 @@ esp_err_t drm_remove_oaep_sha256(const uint8_t* decrypted, size_t decrypted_len,
         return ESP_ERR_INVALID_ARG;
     }
 
-    const size_t hash_len = DRM_SHA256_BYTES;  // 32 for SHA-256
+    constexpr size_t hash_len = DRM_SHA256_BYTES;  // 32 for SHA-256
     const size_t db_len = decrypted_len - 1 - hash_len;  // 479 for RSA-4096
 
     const uint8_t* masked_seed = &decrypted[1];
     const uint8_t* masked_db = &decrypted[1 + hash_len];
 
-    // Allocate working buffers
-    uint8_t* seed_mask = static_cast<uint8_t*>(heap_caps_calloc(hash_len, 1, MALLOC_CAP_DEFAULT));
-    uint8_t* seed = static_cast<uint8_t*>(heap_caps_calloc(hash_len, 1, MALLOC_CAP_DEFAULT));
-    uint8_t* db_mask = static_cast<uint8_t*>(heap_caps_calloc(db_len, 1, MALLOC_CAP_DEFAULT));
-    uint8_t* db = static_cast<uint8_t*>(heap_caps_calloc(db_len, 1, MALLOC_CAP_DEFAULT));
-
-    if (!seed_mask || !seed || !db_mask || !db) {
-        heap_caps_free(seed_mask);
-        heap_caps_free(seed);
-        heap_caps_free(db_mask);
-        heap_caps_free(db);
-        return ESP_ERR_NO_MEM;
-    }
+    // Use stack buffers for OAEP working arrays (small, cold-path)
+    constexpr size_t MAX_DB_LEN = DRM_RSA_KEY_BYTES - 1 - DRM_SHA256_BYTES;  // 479 for RSA-4096
+    uint8_t seed_mask[hash_len] = {0};
+    uint8_t seed[hash_len] = {0};
+    uint8_t db_mask[MAX_DB_LEN] = {0};
+    uint8_t db[MAX_DB_LEN] = {0};
 
     esp_err_t ret = ESP_OK;
 
@@ -155,11 +148,6 @@ cleanup:
     mbedtls_platform_zeroize(seed, hash_len);
     mbedtls_platform_zeroize(db_mask, db_len);
     mbedtls_platform_zeroize(db, db_len);
-
-    heap_caps_free(seed_mask);
-    heap_caps_free(seed);
-    heap_caps_free(db_mask);
-    heap_caps_free(db);
 
     return ret;
 }
@@ -231,16 +219,13 @@ cleanup:
 }
 
 esp_err_t drm_recover_aes_key(const uint8_t* encrypted_key, uint8_t aes_key[DRM_AES_KEY_BYTES]) {
-    // Step 1: RSA decrypt the encrypted key
-    uint8_t* decrypted = static_cast<uint8_t*>(heap_caps_calloc(DRM_RSA_KEY_BYTES, 1, MALLOC_CAP_DEFAULT));
-    if (!decrypted) {
-        return ESP_ERR_NO_MEM;
-    }
+    // Step 1: RSA decrypt the encrypted key (use stack buffer - 512 bytes, cold path)
+    uint8_t decrypted[DRM_RSA_KEY_BYTES] = {0};
 
     esp_err_t ret = drm_rsa_decrypt(encrypted_key, decrypted);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "RSA decryption failed: %s", esp_err_to_name(ret));
-        heap_caps_free(decrypted);
+        mbedtls_platform_zeroize(decrypted, DRM_RSA_KEY_BYTES);
         return ret;
     }
 
@@ -250,7 +235,6 @@ esp_err_t drm_recover_aes_key(const uint8_t* encrypted_key, uint8_t aes_key[DRM_
 
     // Zeroize decrypted data immediately
     mbedtls_platform_zeroize(decrypted, DRM_RSA_KEY_BYTES);
-    heap_caps_free(decrypted);
 
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "OAEP unpadding failed: %s", esp_err_to_name(ret));

@@ -24,6 +24,11 @@ extern "C" {
 #define DRM_LICENSE_PATH "/sd/license.dat"
 
 /**
+ * @brief Maximum size for store token (JWT)
+ */
+#define DRM_STORE_TOKEN_MAX_SIZE 384
+
+/**
  * @brief License validation result
  */
 typedef enum {
@@ -47,6 +52,7 @@ typedef struct {
     int64_t valid_to;           // Unix timestamp UTC
     char license_id[64];        // Unique license ID
     int64_t issued_at;          // Issue timestamp
+    char store_token[DRM_STORE_TOKEN_MAX_SIZE + 1];  // JWT store token
 } drm_license_info_t;
 
 /**
@@ -131,6 +137,22 @@ esp_err_t drm_license_verify_signature(const uint8_t* payload, size_t payload_le
  * @return ESP_OK on success
  */
 esp_err_t drm_license_reload(void);
+
+/**
+ * @brief Get the current store token from license
+ *
+ * @param token Output buffer for token (must be at least DRM_STORE_TOKEN_MAX_SIZE+1 bytes)
+ * @param token_len Output length of token (may be NULL)
+ * @return ESP_OK if token available, ESP_ERR_NOT_FOUND if no token in license
+ */
+esp_err_t drm_license_get_store_token(char* token, size_t* token_len);
+
+/**
+ * @brief Check if a valid store token is available in the license
+ *
+ * @return true if store token exists and license is valid
+ */
+bool drm_license_has_store_token(void);
 
 #ifdef __cplusplus
 }

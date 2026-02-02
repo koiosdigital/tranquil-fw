@@ -1,0 +1,120 @@
+#include "thumbnail_executor.h"
+#include "job_queue.h"
+#include "PatternReader.h"
+#include "thumbnail/framebuffer.h"
+#include "thumbnail/bezier_renderer.h"
+#include "thumbnail/png_encoder.h"
+#include "esp_log.h"
+#include <sys/stat.h>
+#include <unistd.h>
+#include <memory>
+
+static const char* TAG = "ThumbnailExecutor";
+
+namespace jobs {
+
+JobResult ThumbnailExecutor::execute(const Job& job) {
+    // Parse job data
+    ThumbnailJobData data = ThumbnailJobData::fromJson(job.job_data);
+
+    if (data.output_path.empty()) {
+        // Default output path
+        data.output_path = "/sd/previews/" + job.pattern_uuid + ".png";
+    }
+
+    // Ensure previews directory exists
+    struct stat st = {0};
+    if (stat("/sd/previews", &st) == -1) {
+        if (mkdir("/sd/previews", 0775) != 0) {
+            return JobResult::fail("Failed to create previews directory");
+        }
+    }
+
+    // Render the pattern
+    return renderPattern(job.pattern_uuid, data.encrypted, data.output_path);
+}
+
+JobResult ThumbnailExecutor::renderPattern(const std::string& pattern_uuid,
+                                            bool encrypted,
+                                            const std::string& output_path) {
+    ESP_LOGI(TAG, "Rendering thumbnail for pattern: %s (encrypted=%d)",
+        pattern_uuid.c_str(), encrypted);
+
+    // Create pattern reader
+    auto reader = createPatternReader(encrypted);
+    if (!reader) {
+        return JobResult::fail("Failed to create pattern reader");
+    }
+
+    // Open pattern file
+    esp_err_t err = reader->open(pattern_uuid.c_str());
+    if (err != ESP_OK) {
+        return JobResult::fail("Failed to open pattern file");
+    }
+
+    size_t total_points = reader->getTotalLines();
+    if (total_points == 0) {
+        reader->close();
+        return JobResult::fail("Pattern has no points");
+    }
+
+    ESP_LOGI(TAG, "Pattern has %zu points", total_points);
+
+    // Allocate framebuffer in SPIRAM
+    auto fb = std::make_unique<thumbnail::Framebuffer>();
+    if (!fb->isValid()) {
+        reader->close();
+        return JobResult::fail("Failed to allocate framebuffer (SPIRAM)");
+    }
+
+    // Create renderer
+    thumbnail::BezierRenderer renderer(*fb);
+    renderer.beginPath();
+
+    // Stream all points through renderer
+    // Use subsampling for very large patterns to keep memory/time reasonable
+    size_t step = 1;
+    if (total_points > 100000) {
+        step = total_points / 100000;  // Limit to ~100K points
+    }
+
+    size_t rendered_count = 0;
+    size_t point_index = 0;
+
+    while (reader->hasMore()) {
+        PatternPoint pt = reader->readNext();
+        if (!pt.valid) break;
+
+        // Only render every 'step' points for large patterns
+        if (point_index % step == 0) {
+            thumbnail::PolarPoint polar;
+            polar.theta = static_cast<float>(pt.theta);
+            polar.rho = static_cast<float>(pt.rho);
+            renderer.addPolarPoint(polar);
+            rendered_count++;
+        }
+        point_index++;
+    }
+
+    renderer.endPath();
+    reader->close();
+
+    ESP_LOGI(TAG, "Rendered %zu points (total %zu, step %zu)",
+        rendered_count, total_points, step);
+
+    // Encode to PNG
+    thumbnail::ThumbnailError png_err = thumbnail::PngEncoder::encodeToFile(*fb, output_path.c_str());
+    if (png_err != thumbnail::ThumbnailError::OK) {
+        return JobResult::fail("Failed to encode PNG");
+    }
+
+    // Get output file size for logging
+    struct stat st;
+    if (stat(output_path.c_str(), &st) == 0) {
+        ESP_LOGI(TAG, "Thumbnail saved: %s (%ld bytes)", output_path.c_str(), (long)st.st_size);
+    }
+
+    return JobResult::ok();
+}
+
+} // namespace jobs

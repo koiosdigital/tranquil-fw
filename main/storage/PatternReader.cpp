@@ -2,7 +2,6 @@
 #include "EncryptedPatternReader.h"
 #include "esp_log.h"
 #include <cstring>
-#include <cstdlib>
 
 static const char* TAG = "PatternReader";
 
@@ -11,26 +10,26 @@ std::unique_ptr<IPatternReader> createPatternReader(bool is_encrypted) {
     if (is_encrypted) {
         return std::make_unique<EncryptedPatternReader>();
     }
-    return std::make_unique<PlainTextPatternReader>();
+    return std::make_unique<BinaryPatternReader>();
 }
 
 // =============================================================================
-// PlainTextPatternReader Implementation
+// BinaryPatternReader Implementation
 // =============================================================================
 
-PlainTextPatternReader::PlainTextPatternReader() {
-    memset(line_buffer_, 0, sizeof(line_buffer_));
+BinaryPatternReader::BinaryPatternReader() {
+    memset(&header_, 0, sizeof(header_));
 }
 
-PlainTextPatternReader::~PlainTextPatternReader() {
+BinaryPatternReader::~BinaryPatternReader() {
     close();
 }
 
-void PlainTextPatternReader::getFilePath(const char* uuid, char* path, size_t path_size) {
-    snprintf(path, path_size, "%s/%s.thr", PATTERNS_PATH, uuid);
+void BinaryPatternReader::getFilePath(const char* uuid, char* path, size_t path_size) {
+    snprintf(path, path_size, "%s/%s.dat", PATTERNS_PATH, uuid);
 }
 
-esp_err_t PlainTextPatternReader::open(const char* uuid) {
+esp_err_t BinaryPatternReader::open(const char* uuid) {
     if (file_) {
         close();
     }
@@ -38,126 +37,94 @@ esp_err_t PlainTextPatternReader::open(const char* uuid) {
     char path[256];
     getFilePath(uuid, path, sizeof(path));
 
-    file_ = fopen(path, "r");
+    file_ = fopen(path, "rb");
     if (!file_) {
         ESP_LOGE(TAG, "Failed to open pattern file: %s", path);
         return ESP_ERR_NOT_FOUND;
     }
 
-    total_lines_ = 0;
-    current_line_ = 0;
-    lines_counted_ = false;
+    // Read header
+    if (fread(&header_, sizeof(header_), 1, file_) != 1) {
+        ESP_LOGE(TAG, "Failed to read pattern header");
+        fclose(file_);
+        file_ = nullptr;
+        return ESP_FAIL;
+    }
+
+    // Validate magic
+    if (header_.magic != BINARY_PATTERN_MAGIC) {
+        ESP_LOGE(TAG, "Invalid pattern magic: 0x%08lX (expected THRB)",
+                 (unsigned long)header_.magic);
+        fclose(file_);
+        file_ = nullptr;
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    current_point_ = 0;
     has_peeked_ = false;
 
-    ESP_LOGI(TAG, "Opened pattern file: %s", path);
+    ESP_LOGI(TAG, "Opened binary pattern: %s (%lu points)",
+             path, (unsigned long)header_.point_count);
     return ESP_OK;
 }
 
-void PlainTextPatternReader::close() {
+void BinaryPatternReader::close() {
     if (file_) {
         fclose(file_);
         file_ = nullptr;
     }
-    total_lines_ = 0;
-    current_line_ = 0;
-    lines_counted_ = false;
+    memset(&header_, 0, sizeof(header_));
+    current_point_ = 0;
     has_peeked_ = false;
 }
 
-bool PlainTextPatternReader::isOpen() const {
+bool BinaryPatternReader::isOpen() const {
     return file_ != nullptr;
 }
 
-size_t PlainTextPatternReader::getTotalLines() {
-    if (!file_) return 0;
-
-    if (!lines_counted_) {
-        // Save current position
-        long prev_pos = ftell(file_);
-
-        // Count lines from beginning
-        ::rewind(file_);
-        total_lines_ = 0;
-        while (fgets(line_buffer_, sizeof(line_buffer_), file_)) {
-            total_lines_++;
-        }
-
-        // Restore position
-        fseek(file_, prev_pos, SEEK_SET);
-        lines_counted_ = true;
-
-        ESP_LOGI(TAG, "Pattern has %zu lines", total_lines_);
-    }
-
-    return total_lines_;
+size_t BinaryPatternReader::getTotalLines() {
+    return header_.point_count;
 }
 
-size_t PlainTextPatternReader::getCurrentLine() const {
-    return current_line_;
+size_t BinaryPatternReader::getCurrentLine() const {
+    return current_point_;
 }
 
-PatternPoint PlainTextPatternReader::parseLine(const char* line) {
-    if (!line || strlen(line) == 0) {
+PatternPoint BinaryPatternReader::readBinaryPoint() {
+    if (!file_ || current_point_ >= header_.point_count) {
         return PatternPoint();
     }
 
-    // Skip empty lines and comments
-    while (*line == ' ' || *line == '\t') line++;
-    if (*line == '\0' || *line == '#' || *line == '\n' || *line == '\r') {
+    BinaryPoint bp;
+    if (fread(&bp, sizeof(bp), 1, file_) != 1) {
+        ESP_LOGE(TAG, "Failed to read binary point at index %zu", current_point_);
         return PatternPoint();
     }
 
-    // Parse space-separated theta and rho values
-    char theta_str[64], rho_str[64];
-    int parsed = sscanf(line, "%63s %63s", theta_str, rho_str);
+    // Convert uint16 rho to float 0.0-1.0
+    double rho = static_cast<double>(bp.rho) / 65535.0;
 
-    if (parsed != 2) {
-        ESP_LOGW(TAG, "Failed to parse line: %.50s...", line);
-        return PatternPoint();
-    }
-
-    char* endptr;
-    double theta = strtod(theta_str, &endptr);
-    if (*endptr != '\0') {
-        ESP_LOGW(TAG, "Invalid theta value: %s", theta_str);
-        return PatternPoint();
-    }
-
-    double rho = strtod(rho_str, &endptr);
-    if (*endptr != '\0') {
-        ESP_LOGW(TAG, "Invalid rho value: %s", rho_str);
-        return PatternPoint();
-    }
-
-    return PatternPoint(theta, rho);
+    return PatternPoint(static_cast<double>(bp.theta), rho);
 }
 
-PatternPoint PlainTextPatternReader::readNext() {
+PatternPoint BinaryPatternReader::readNext() {
     if (!file_) return PatternPoint();
 
     // If we have a peeked value, return it and clear
     if (has_peeked_) {
         has_peeked_ = false;
-        current_line_++;
+        current_point_++;
         return peeked_point_;
     }
 
-    // Read next line
-    if (!fgets(line_buffer_, sizeof(line_buffer_), file_)) {
-        return PatternPoint();
+    PatternPoint point = readBinaryPoint();
+    if (point.valid) {
+        current_point_++;
     }
-
-    // Remove trailing newline
-    size_t len = strlen(line_buffer_);
-    while (len > 0 && (line_buffer_[len - 1] == '\n' || line_buffer_[len - 1] == '\r')) {
-        line_buffer_[--len] = '\0';
-    }
-
-    current_line_++;
-    return parseLine(line_buffer_);
+    return point;
 }
 
-PatternPoint PlainTextPatternReader::peekNext() {
+PatternPoint BinaryPatternReader::peekNext() {
     if (!file_) return PatternPoint();
 
     // If we already peeked, return cached value
@@ -168,46 +135,33 @@ PatternPoint PlainTextPatternReader::peekNext() {
     // Save position
     long prev_pos = ftell(file_);
 
-    // Read next line
-    if (!fgets(line_buffer_, sizeof(line_buffer_), file_)) {
-        fseek(file_, prev_pos, SEEK_SET);
-        return PatternPoint();
-    }
+    // Read next point
+    peeked_point_ = readBinaryPoint();
 
-    // Remove trailing newline
-    size_t len = strlen(line_buffer_);
-    while (len > 0 && (line_buffer_[len - 1] == '\n' || line_buffer_[len - 1] == '\r')) {
-        line_buffer_[--len] = '\0';
-    }
-
-    // Parse and cache
-    peeked_point_ = parseLine(line_buffer_);
-    has_peeked_ = true;
-
-    // Don't restore position - we'll consume this line on readNext
-    // Actually, for peek we should restore
+    // Restore position
     fseek(file_, prev_pos, SEEK_SET);
+
+    if (peeked_point_.valid) {
+        has_peeked_ = true;
+    }
 
     return peeked_point_;
 }
 
-bool PlainTextPatternReader::hasMore() const {
+bool BinaryPatternReader::hasMore() const {
     if (!file_) return false;
 
     if (has_peeked_) return peeked_point_.valid;
 
-    // Check if we're at EOF
-    int c = fgetc(const_cast<FILE*>(file_));
-    if (c == EOF) return false;
-    ungetc(c, const_cast<FILE*>(file_));
-    return true;
+    return current_point_ < header_.point_count;
 }
 
-esp_err_t PlainTextPatternReader::rewind() {
+esp_err_t BinaryPatternReader::rewind() {
     if (!file_) return ESP_ERR_INVALID_STATE;
 
-    ::rewind(file_);
-    current_line_ = 0;
+    // Seek to start of points (after header)
+    fseek(file_, sizeof(UnencryptedPatternHeader), SEEK_SET);
+    current_point_ = 0;
     has_peeked_ = false;
 
     return ESP_OK;

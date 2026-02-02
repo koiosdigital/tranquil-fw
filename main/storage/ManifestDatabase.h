@@ -8,6 +8,13 @@
 #include "esp_err.h"
 #include "cJSON.h"
 
+// Forward declarations for job types
+namespace jobs {
+    enum class JobType : uint8_t;
+    enum class JobStatus : uint8_t;
+    struct Job;
+}
+
 // Pattern metadata
 struct Pattern {
     std::string uuid;
@@ -114,6 +121,19 @@ public:
     // Memory management
     void releaseMemory();   // Release SQLite page cache
     esp_err_t vacuum();     // Compact database file (reclaim deleted space)
+
+    // Job queue operations
+    esp_err_t enqueueJob(const jobs::Job& job);
+    std::optional<jobs::Job> claimNextPendingJob();
+    std::optional<jobs::Job> getJob(const std::string& uuid);
+    std::optional<jobs::Job> getJobByPattern(const std::string& pattern_uuid, jobs::JobType type);
+    bool hasJob(const std::string& pattern_uuid, jobs::JobType type);
+    esp_err_t markJobCompleted(const std::string& uuid);
+    esp_err_t markJobFailed(const std::string& uuid, const std::string& error);
+    esp_err_t deleteJob(const std::string& uuid);
+    esp_err_t cancelJobsForPattern(const std::string& pattern_uuid);
+    size_t getPendingJobCount();
+    size_t getInProgressJobCount();
 
 private:
     ManifestDatabase();

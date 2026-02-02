@@ -1,19 +1,28 @@
 #include "patterns_api.h"
 #include "esp_http_server.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "cJSON.h"
 #include "ManifestDatabase.h"
+#include "PatternReader.h"
+#include "jobs/job_queue.h"
+#include "jobs/job_types.h"
+#include "jobs/job_processor.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <string.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <vector>
 #include <unistd.h>
 #include <cstdio>
+#include <cmath>
+#include <algorithm>
 
 static const char* TAG = "patterns_api";
 
 // Upload constants
-static constexpr size_t UPLOAD_CHUNK_SIZE = 16 * 1024;
+static constexpr size_t UPLOAD_CHUNK_SIZE = 4 * 1024;
 static constexpr size_t MAX_BOUNDARY_SIZE = 128;
 static constexpr size_t MAX_FILENAME_SIZE = 256;
 static constexpr size_t MAX_HEADER_SIZE = 1024;
@@ -34,9 +43,10 @@ struct UploadContext {
 namespace {
 
     // Helper: get pattern file path with correct extension
+    // Both encrypted (KDEP) and unencrypted (THRB) patterns use .dat
     void getPatternFilePath(const std::string& uuid, bool encrypted, char* path, size_t path_size) {
-        const char* extension = encrypted ? "dat" : "thr";
-        snprintf(path, path_size, "/sd/patterns/%s.%s", uuid.c_str(), extension);
+        (void)encrypted;  // Now unused - all patterns are .dat
+        snprintf(path, path_size, "/sd/patterns/%s.dat", uuid.c_str());
     }
 
     // Helper: get pattern file size on disk
@@ -109,7 +119,7 @@ namespace {
         else {
             // Unquoted - copy until space or semicolon
             size_t i = 0;
-            while (*boundary_start && *boundary_start != ' ' && *boundary_start != ';' && i < max_len - 1) {
+            while (*boundary_start&&* boundary_start != ' ' && *boundary_start != ';' && i < max_len - 1) {
                 boundary[i++] = *boundary_start++;
             }
             boundary[i] = '\0';
@@ -131,7 +141,7 @@ namespace {
         }
 
         size_t i = 0;
-        while (*fname_start && *fname_start != '"' && *fname_start != '\r' && *fname_start != '\n' && i < max_len - 1) {
+        while (*fname_start&&* fname_start != '"' && *fname_start != '\r' && *fname_start != '\n' && i < max_len - 1) {
             filename[i++] = *fname_start++;
         }
         filename[i] = '\0';
@@ -189,25 +199,14 @@ static esp_err_t patterns_list_handler(httpd_req_t* req) {
 static esp_err_t patterns_upload_handler(httpd_req_t* req) {
     esp_err_t ret = ESP_OK;
 
-    // Heap-allocate large structures to avoid stack overflow
-    UploadContext* ctx = static_cast<UploadContext*>(calloc(1, sizeof(UploadContext)));
-    char* header_buf = static_cast<char*>(calloc(MAX_HEADER_SIZE, 1));
-    char* buffer = static_cast<char*>(malloc(UPLOAD_CHUNK_SIZE));
-
-    if (!ctx || !header_buf || !buffer) {
-        ESP_LOGE(TAG, "Failed to allocate upload buffers");
-        free(ctx);
-        free(header_buf);
-        free(buffer);
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
+    // Stack-allocate buffers (total ~5KB - safe for HTTP server task)
+    UploadContext ctx_storage = {};
+    UploadContext* ctx = &ctx_storage;
+    char header_buf[MAX_HEADER_SIZE] = {0};
+    char buffer[UPLOAD_CHUNK_SIZE];
 
     // Extract multipart boundary
     if (!extract_boundary(req, ctx->boundary, sizeof(ctx->boundary))) {
-        free(ctx);
-        free(header_buf);
-        free(buffer);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid Content-Type: missing boundary");
         return ESP_FAIL;
     }
@@ -218,9 +217,9 @@ static esp_err_t patterns_upload_handler(httpd_req_t* req) {
     std::string uuid = ManifestDatabase::generateUUID();
     strncpy(ctx->uuid, uuid.c_str(), sizeof(ctx->uuid) - 1);
 
-    // Prepare file paths
-    snprintf(ctx->temp_path, sizeof(ctx->temp_path), "/sd/patterns/%s.tmp", ctx->uuid);
-    snprintf(ctx->final_path, sizeof(ctx->final_path), "/sd/patterns/%s.thr", ctx->uuid);
+    // Prepare file paths (%.36s limits UUID to 36 chars - standard UUID length)
+    snprintf(ctx->temp_path, sizeof(ctx->temp_path), "/sd/patterns/%.36s.tmp", ctx->uuid);
+    snprintf(ctx->final_path, sizeof(ctx->final_path), "/sd/patterns/%.36s.thr", ctx->uuid);
 
     // Pre-build boundary strings (avoid repeated stack allocation in loop)
     char first_boundary[MAX_BOUNDARY_SIZE + 4];
@@ -374,9 +373,6 @@ static esp_err_t patterns_upload_handler(httpd_req_t* req) {
     if (ret != ESP_OK || ctx->bytes_written == 0) {
         // Cleanup on error
         unlink(ctx->temp_path);
-        free(ctx);
-        free(header_buf);
-        free(buffer);
         if (ret == ESP_OK) {
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No file data received");
             return ESP_FAIL;
@@ -385,60 +381,40 @@ static esp_err_t patterns_upload_handler(httpd_req_t* req) {
         return ESP_FAIL;
     }
 
-    // Atomic rename: .tmp -> .thr
-    if (rename(ctx->temp_path, ctx->final_path) != 0) {
-        ESP_LOGE(TAG, "Failed to rename temp file");
+    // Enqueue conversion job via job queue
+    jobs::ConversionJobData conv_data;
+    conv_data.temp_path = ctx->temp_path;
+    conv_data.name = strlen(ctx->filename) > 0 ? ctx->filename : ctx->uuid;
+    conv_data.encrypted = false;
+
+    esp_err_t enqueue_result = jobs::JobQueue::instance().enqueueConversion(ctx->uuid, conv_data);
+    if (enqueue_result != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to enqueue conversion job");
         unlink(ctx->temp_path);
-        free(ctx);
-        free(header_buf);
-        free(buffer);
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
 
-    // Get final file size
-    struct stat st;
-    size_t file_size = 0;
-    if (stat(ctx->final_path, &st) == 0) {
-        file_size = st.st_size;
-    }
+    // Trigger job processor to start immediately
+    jobs::JobProcessor::instance().triggerProcessing();
 
-    // Create pattern record
-    Pattern pattern;
-    pattern.uuid = ctx->uuid;
-    pattern.name = strlen(ctx->filename) > 0 ? ctx->filename : ctx->uuid;
-    pattern.creator = "Uploaded";
-    pattern.encrypted = false;  // Uploaded patterns are always unencrypted
-    pattern.size_bytes = file_size;
-    pattern.created_at = ManifestDatabase::currentTimestamp();
+    ESP_LOGI(TAG, "Pattern uploaded, conversion queued: %s (%zu bytes)", ctx->uuid, ctx->bytes_written);
 
-    // Transactional database update
-    esp_err_t db_result = ManifestDatabase::instance().addPattern(pattern);
-    if (db_result != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to add pattern to database");
-        unlink(ctx->final_path);
-        free(ctx);
-        free(header_buf);
-        free(buffer);
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
+    // Return 200 OK with processing status
+    cJSON* response = cJSON_CreateObject();
+    cJSON_AddStringToObject(response, "uuid", ctx->uuid);
+    cJSON_AddStringToObject(response, "name", conv_data.name.c_str());
+    cJSON_AddStringToObject(response, "status", "processing");
+    cJSON_AddStringToObject(response, "message", "Pattern uploaded, conversion in progress");
 
-    ESP_LOGI(TAG, "Pattern uploaded: %s (%zu bytes)", ctx->uuid, file_size);
-
-    // Return success with pattern JSON
-    cJSON* response = ManifestDatabase::patternToJson(pattern);
     char* json_str = cJSON_PrintUnformatted(response);
 
-    httpd_resp_set_status(req, "201 Created");
+    httpd_resp_set_status(req, "200 OK");
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json_str, strlen(json_str));
 
     free(json_str);
     cJSON_Delete(response);
-    free(ctx);
-    free(header_buf);
-    free(buffer);
 
     return ESP_OK;
 }
@@ -512,6 +488,191 @@ static esp_err_t patterns_delete_handler(httpd_req_t* req) {
     return ESP_OK;
 }
 
+// GET /api/pattern_download/{uuid} - download pattern file
+static esp_err_t patterns_download_handler(httpd_req_t* req) {
+    const char* uri = req->uri;
+    const char* base = "/api/pattern_download/";
+
+    if (strncmp(uri, base, strlen(base)) != 0) {
+        httpd_resp_send_404(req);
+        return ESP_FAIL;
+    }
+
+    const char* uuid = uri + strlen(base);
+    if (!uuid || strlen(uuid) == 0 || strlen(uuid) >= 64) {
+        httpd_resp_send_404(req);
+        return ESP_FAIL;
+    }
+
+    // Look up pattern
+    auto pattern = ManifestDatabase::instance().getPattern(uuid);
+    if (!pattern) {
+        httpd_resp_send_404(req);
+        return ESP_FAIL;
+    }
+
+    // Deny download of encrypted patterns
+    if (pattern->encrypted) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Cannot download encrypted patterns");
+        return ESP_FAIL;
+    }
+
+    // Get file path
+    char file_path[128];
+    getPatternFilePath(pattern->uuid, pattern->encrypted, file_path, sizeof(file_path));
+
+    FILE* f = fopen(file_path, "rb");
+    if (!f) {
+        ESP_LOGE(TAG, "Failed to open pattern file: %s", file_path);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    // Get file size
+    fseek(f, 0, SEEK_END);
+    size_t file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    // Set response headers
+    httpd_resp_set_type(req, "application/octet-stream");
+
+    char content_disp[256];
+    snprintf(content_disp, sizeof(content_disp), "attachment; filename=\"%s.thrb\"",
+        pattern->name.empty() ? uuid : pattern->name.c_str());
+    httpd_resp_set_hdr(req, "Content-Disposition", content_disp);
+
+    char content_len[32];
+    snprintf(content_len, sizeof(content_len), "%zu", file_size);
+    httpd_resp_set_hdr(req, "Content-Length", content_len);
+
+    // Stream file in chunks (use SPIRAM for cold-path download)
+    constexpr size_t CHUNK_SIZE = 4096;
+    char* chunk = static_cast<char*>(
+        heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+    );
+    if (!chunk) {
+        fclose(f);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    size_t bytes_sent = 0;
+    while (bytes_sent < file_size) {
+        size_t to_read = std::min(CHUNK_SIZE, file_size - bytes_sent);
+        size_t read = fread(chunk, 1, to_read, f);
+        if (read == 0) {
+            break;
+        }
+
+        if (httpd_resp_send_chunk(req, chunk, read) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to send chunk");
+            break;
+        }
+        bytes_sent += read;
+    }
+
+    // End chunked response
+    httpd_resp_send_chunk(req, nullptr, 0);
+
+    heap_caps_free(chunk);
+    fclose(f);
+
+    ESP_LOGI(TAG, "Pattern downloaded: %s (%zu bytes)", uuid, bytes_sent);
+    return ESP_OK;
+}
+
+// GET /api/pattern_thumbs/{uuid}.png - serve thumbnail with long cache
+static esp_err_t pattern_thumb_handler(httpd_req_t* req) {
+    const char* uri = req->uri;
+    const char* base = "/api/pattern_thumbs/";
+
+    if (strncmp(uri, base, strlen(base)) != 0) {
+        httpd_resp_send_404(req);
+        return ESP_FAIL;
+    }
+
+    // Extract UUID (strip .png extension)
+    const char* uuid_start = uri + strlen(base);
+    char uuid[64] = {0};
+    size_t uuid_len = 0;
+
+    // Copy until '.' or end
+    while (*uuid_start && *uuid_start != '.' && uuid_len < sizeof(uuid) - 1) {
+        uuid[uuid_len++] = *uuid_start++;
+    }
+
+    if (uuid_len == 0) {
+        httpd_resp_send_404(req);
+        return ESP_FAIL;
+    }
+
+    // Build thumbnail path
+    char thumb_path[128];
+    snprintf(thumb_path, sizeof(thumb_path), "/sd/previews/%s.png", uuid);
+
+    // Check if thumbnail exists
+    struct stat st;
+    if (stat(thumb_path, &st) != 0) {
+        // Thumbnail not found - check if pattern exists and enqueue generation
+        if (ManifestDatabase::instance().patternExists(uuid)) {
+            auto pattern = ManifestDatabase::instance().getPattern(uuid);
+            if (pattern && !jobs::JobQueue::instance().hasJob(uuid, jobs::JobType::Thumbnail)) {
+                jobs::ThumbnailJobData data;
+                data.encrypted = pattern->encrypted;
+                data.output_path = thumb_path;
+                jobs::JobQueue::instance().enqueueThumbnail(uuid, data, 0);
+            }
+        }
+        httpd_resp_send_404(req);
+        return ESP_FAIL;
+    }
+
+    // Open thumbnail file
+    FILE* f = fopen(thumb_path, "rb");
+    if (!f) {
+        ESP_LOGE(TAG, "Failed to open thumbnail: %s", thumb_path);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    // Get file size
+    size_t file_size = st.st_size;
+
+    // Set response headers
+    httpd_resp_set_type(req, "image/png");
+    httpd_resp_set_hdr(req, "Cache-Control", "public, max-age=31536000");  // 1 year
+
+    // Stream file in chunks (use SPIRAM for cold-path download)
+    constexpr size_t CHUNK_SIZE = 4096;
+    char* chunk = static_cast<char*>(
+        heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+    );
+    if (!chunk) {
+        fclose(f);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    size_t bytes_sent = 0;
+    while (bytes_sent < file_size) {
+        size_t to_read = std::min(CHUNK_SIZE, file_size - bytes_sent);
+        size_t read = fread(chunk, 1, to_read, f);
+        if (read == 0) break;
+
+        if (httpd_resp_send_chunk(req, chunk, read) != ESP_OK) {
+            break;
+        }
+        bytes_sent += read;
+    }
+
+    // End chunked response
+    httpd_resp_send_chunk(req, nullptr, 0);
+
+    heap_caps_free(chunk);
+    fclose(f);
+    return ESP_OK;
+}
+
 void patterns_api_register_handlers(httpd_handle_t server) {
     static httpd_uri_t patterns_list_uri = {
         .uri = "/api/patterns",
@@ -528,6 +689,22 @@ void patterns_api_register_handlers(httpd_handle_t server) {
         .user_ctx = nullptr
     };
     httpd_register_uri_handler(server, &patterns_upload_uri);
+
+    static httpd_uri_t patterns_download_uri = {
+        .uri = "/api/pattern_download/*",
+        .method = HTTP_GET,
+        .handler = patterns_download_handler,
+        .user_ctx = nullptr
+    };
+    httpd_register_uri_handler(server, &patterns_download_uri);
+
+    static httpd_uri_t pattern_thumbs_uri = {
+        .uri = "/api/pattern_thumbs/*",
+        .method = HTTP_GET,
+        .handler = pattern_thumb_handler,
+        .user_ctx = nullptr
+    };
+    httpd_register_uri_handler(server, &pattern_thumbs_uri);
 
     static httpd_uri_t patterns_detail_uri = {
         .uri = "/api/patterns/*",

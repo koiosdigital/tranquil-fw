@@ -24,6 +24,13 @@
 
 #include "api.h"
 #include "usb_pd.h"
+#include "drm/drm_license.h"
+#include "sockets.h"
+#include "storage/jobs/job_queue.h"
+#include "storage/jobs/job_processor.h"
+#include "storage/jobs/conversion_executor.h"
+#include "storage/jobs/thumbnail_executor.h"
+#include "storage/jobs/download_executor.h"
 
 static const char* TAG = "main";
 
@@ -45,6 +52,15 @@ extern "C" void app_main(void)
     }
 
     ManifestDatabase::instance().initialize();
+
+    // Initialize job processing system
+    jobs::JobQueue::instance().initialize();
+    std::unordered_map<jobs::JobType, std::unique_ptr<jobs::IJobExecutor>> executors;
+    executors[jobs::JobType::Conversion] = std::make_unique<jobs::ConversionExecutor>();
+    executors[jobs::JobType::Thumbnail] = std::make_unique<jobs::ThumbnailExecutor>();
+    executors[jobs::JobType::Download] = std::make_unique<jobs::DownloadExecutor>();
+    jobs::JobProcessor::instance().init(std::move(executors));
+    ESP_LOGI(TAG, "Job processing system initialized");
 
     // Initialize motion controller
     g_motion_controller = new sand_table::MotionController();
@@ -84,6 +100,7 @@ extern "C" void app_main(void)
     }
 
     tranquil_api_init();
+    //cloud_sockets_init();
 
     auto ret = g_motion_controller->home();
     if (ret.is_err()) {
