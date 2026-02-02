@@ -54,7 +54,7 @@ esp_err_t EncryptedPatternReader::open(const char* uuid) {
     }
 
     // Check authorization: purchase receipt OR valid subscription
-    bool authorized = false;
+    bool authorized = false; //RESET TO FALSE
 
     // First, check for purchase receipt (permanent ownership)
     if (drm_purchase_is_valid(uuid)) {
@@ -123,9 +123,6 @@ esp_err_t EncryptedPatternReader::openFile(const char* path) {
         file_ = nullptr;
         return ESP_ERR_NOT_SUPPORTED;
     }
-
-    ESP_LOGI(TAG, "Opening encrypted pattern, %lu points",
-             (unsigned long)header_.point_count);
 
     // Recover AES key using DS peripheral
     esp_err_t ret = drm_recover_aes_key(header_.encrypted_key, aes_key_);
@@ -226,12 +223,12 @@ PatternPoint EncryptedPatternReader::readBinaryPoint() {
 
     // Decrypt in place using AES-CTR (handles partial blocks via nc_off_/stream_block_)
     int ret = mbedtls_aes_crypt_ctr(&aes_,
-                                     sizeof(bp),
-                                     &nc_off_,
-                                     nonce_counter_,
-                                     stream_block_,
-                                     reinterpret_cast<uint8_t*>(&bp),
-                                     reinterpret_cast<uint8_t*>(&bp));
+        sizeof(bp),
+        &nc_off_,
+        nonce_counter_,
+        stream_block_,
+        reinterpret_cast<uint8_t*>(&bp),
+        reinterpret_cast<uint8_t*>(&bp));
     if (ret != 0) {
         ESP_LOGE(TAG, "AES-CTR decryption failed: -0x%04X", -ret);
         return PatternPoint();

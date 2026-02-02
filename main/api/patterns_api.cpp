@@ -22,7 +22,7 @@
 static const char* TAG = "patterns_api";
 
 // Upload constants
-static constexpr size_t UPLOAD_CHUNK_SIZE = 4 * 1024;
+static constexpr size_t UPLOAD_CHUNK_SIZE = 4 * 1024;  // HTTP server stack is 8KB (set in kd_common)
 static constexpr size_t MAX_BOUNDARY_SIZE = 128;
 static constexpr size_t MAX_FILENAME_SIZE = 256;
 static constexpr size_t MAX_HEADER_SIZE = 1024;
@@ -199,7 +199,7 @@ static esp_err_t patterns_list_handler(httpd_req_t* req) {
 static esp_err_t patterns_upload_handler(httpd_req_t* req) {
     esp_err_t ret = ESP_OK;
 
-    // Stack-allocate buffers (total ~5KB - safe for HTTP server task)
+    // Stack-allocate buffers (total ~5.7KB - fits HTTP server 8KB stack)
     UploadContext ctx_storage = {};
     UploadContext* ctx = &ctx_storage;
     char header_buf[MAX_HEADER_SIZE] = {0};
