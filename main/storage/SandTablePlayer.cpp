@@ -1,4 +1,6 @@
 #include "SandTablePlayer.h"
+#include "drm/drm_license.h"
+#include "drm/drm_purchase.h"
 #include "esp_log.h"
 #include <cstdio>
 #include <cstdlib>
@@ -9,7 +11,6 @@
 
 // Static member definitions
 const char* SandTablePlayer::TAG = "SandTablePlayer";
-const char* SandTablePlayer::PATTERNS_PATH = "/sd/patterns";
 
 sand_table::MotionController* SandTablePlayer::motion_controller_ = nullptr;
 bool SandTablePlayer::initialized_ = false;
@@ -22,7 +23,7 @@ PlayMode SandTablePlayer::play_mode_ = PlayMode::SINGLE_PATTERN;
 
 char SandTablePlayer::current_pattern_uuid_[MAX_UUID_LEN] = {0};
 std::optional<Pattern> SandTablePlayer::current_pattern_ = std::nullopt;
-FILE* SandTablePlayer::pattern_file_ = nullptr;
+std::unique_ptr<IPatternReader> SandTablePlayer::pattern_reader_;
 size_t SandTablePlayer::current_line_index_ = 0;
 size_t SandTablePlayer::total_lines_ = 0;
 bool SandTablePlayer::file_loaded_ = false;
@@ -112,6 +113,16 @@ void SandTablePlayer::shutdown() {
 esp_err_t SandTablePlayer::playPattern(const char* pattern_uuid) {
     if (!initialized_) return ESP_ERR_INVALID_STATE;
     if (!motion_controller_->is_homed()) return ESP_ERR_INVALID_STATE;
+
+    // Check authorization for encrypted patterns before acquiring mutex
+    auto pattern_info = ManifestDatabase::instance().getPattern(pattern_uuid);
+    if (pattern_info.has_value() && pattern_info->encrypted) {
+        // Check purchase receipt OR subscription license
+        if (!drm_purchase_is_valid(pattern_uuid) && !drm_license_is_valid()) {
+            ESP_LOGW(TAG, "Cannot play encrypted pattern: no valid authorization");
+            return ESP_ERR_NOT_ALLOWED;
+        }
+    }
 
     if (xSemaphoreTake(state_mutex_, pdMS_TO_TICKS(1000)) != pdTRUE) {
         ESP_LOGE(TAG, "Failed to acquire state mutex");
@@ -640,10 +651,10 @@ esp_err_t SandTablePlayer::loadPatternFile(const char* pattern_uuid) {
         return ESP_ERR_TIMEOUT;
     }
 
-    // Unload any existing file first (without mutex, we already hold it)
-    if (pattern_file_) {
-        fclose(pattern_file_);
-        pattern_file_ = nullptr;
+    // Unload any existing reader first (without mutex, we already hold it)
+    if (pattern_reader_) {
+        pattern_reader_->close();
+        pattern_reader_.reset();
     }
     current_line_index_ = 0;
     total_lines_ = 0;
@@ -653,34 +664,24 @@ esp_err_t SandTablePlayer::loadPatternFile(const char* pattern_uuid) {
     auto pattern = ManifestDatabase::instance().getPattern(pattern_uuid);
     bool is_encrypted = pattern.has_value() ? pattern->encrypted : false;
 
-    char file_path[256];
-    getPatternFilePath(pattern_uuid, is_encrypted, file_path, sizeof(file_path));
+    // Create the appropriate reader via factory function
+    pattern_reader_ = createPatternReader(is_encrypted);
 
-    // TODO: For encrypted patterns, use EncryptedPatternReader instead
-    if (is_encrypted) {
-        ESP_LOGE(TAG, "Encrypted pattern playback not yet implemented: %s", pattern_uuid);
+    // Open the pattern by UUID (reader handles path internally)
+    esp_err_t ret = pattern_reader_->open(pattern_uuid);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open pattern: %s (err=%s)", pattern_uuid, esp_err_to_name(ret));
+        pattern_reader_.reset();
         xSemaphoreGive(file_mutex_);
-        return ESP_ERR_NOT_SUPPORTED;
+        return ret;  // Propagates ESP_ERR_NOT_ALLOWED for license issues
     }
 
-    pattern_file_ = fopen(file_path, "r");
-    if (!pattern_file_) {
-        ESP_LOGE(TAG, "Failed to open pattern file: %s", file_path);
-        xSemaphoreGive(file_mutex_);
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    // Count total lines
-    char line_buffer[MAX_LINE_BUFFER_SIZE];
-    while (fgets(line_buffer, sizeof(line_buffer), pattern_file_)) {
-        total_lines_++;
-    }
-    rewind(pattern_file_);
-
+    total_lines_ = pattern_reader_->getTotalLines();
     current_line_index_ = 0;
     file_loaded_ = true;
 
-    ESP_LOGI(TAG, "Loaded pattern file: %s (%zu lines)", file_path, total_lines_);
+    ESP_LOGI(TAG, "Loaded pattern: %s (%zu points, encrypted=%d)",
+             pattern_uuid, total_lines_, is_encrypted);
 
     xSemaphoreGive(file_mutex_);
     return ESP_OK;
@@ -692,9 +693,9 @@ void SandTablePlayer::unloadPatternFile() {
         return;
     }
 
-    if (pattern_file_) {
-        fclose(pattern_file_);
-        pattern_file_ = nullptr;
+    if (pattern_reader_) {
+        pattern_reader_->close();
+        pattern_reader_.reset();
     }
     current_line_index_ = 0;
     total_lines_ = 0;
@@ -703,85 +704,35 @@ void SandTablePlayer::unloadPatternFile() {
     xSemaphoreGive(file_mutex_);
 }
 
-PatternLine SandTablePlayer::parsePatternLine(const char* line, size_t line_number) {
-    if (!line || strlen(line) == 0) {
-        return PatternLine();
-    }
-
-    // Parse space-separated theta and rho values
-    char theta_str[64], rho_str[64];
-    int parsed = sscanf(line, "%63s %63s", theta_str, rho_str);
-
-    if (parsed != 2) {
-        ESP_LOGW(TAG, "Failed to parse line %zu: %s", line_number, line);
-        return PatternLine();
-    }
-
-    char* endptr;
-    double theta = strtod(theta_str, &endptr);
-    if (*endptr != '\0') {
-        ESP_LOGW(TAG, "Failed to convert theta on line %zu: %s", line_number, theta_str);
-        return PatternLine();
-    }
-
-    double rho = strtod(rho_str, &endptr);
-    if (*endptr != '\0') {
-        ESP_LOGW(TAG, "Failed to convert rho on line %zu: %s", line_number, rho_str);
-        return PatternLine();
-    }
-
-    bool is_first = (line_number == 0);
-    return PatternLine(theta, rho, is_first);
-}
-
-void SandTablePlayer::getPatternFilePath(const char* pattern_uuid, bool encrypted, char* file_path, size_t file_path_size) {
-    // Unencrypted patterns use .thr extension, encrypted use .dat
-    const char* extension = encrypted ? "dat" : "thr";
-    snprintf(file_path, file_path_size, "%s/%s.%s", PATTERNS_PATH, pattern_uuid, extension);
-}
-
 PatternLine SandTablePlayer::peekNextLine() {
-    if (!file_loaded_ || !pattern_file_) return PatternLine();
+    if (!file_loaded_ || !pattern_reader_) return PatternLine();
 
     if (xSemaphoreTake(file_mutex_, pdMS_TO_TICKS(1000)) != pdTRUE) {
         ESP_LOGE(TAG, "Failed to acquire file mutex");
         return PatternLine();
     }
 
-    long prev_pos = ftell(pattern_file_);
-    char line_buffer[MAX_LINE_BUFFER_SIZE];
-    size_t line_num = 0;
+    PatternPoint point = pattern_reader_->peekNext();
 
-    rewind(pattern_file_);
-    while (line_num < current_line_index_ && fgets(line_buffer, sizeof(line_buffer), pattern_file_)) {
-        line_num++;
-    }
+    xSemaphoreGive(file_mutex_);
 
-    if (!fgets(line_buffer, sizeof(line_buffer), pattern_file_)) {
-        fseek(pattern_file_, prev_pos, SEEK_SET);
-        xSemaphoreGive(file_mutex_);
+    if (!point.valid) {
         return PatternLine();
     }
 
-    fseek(pattern_file_, prev_pos, SEEK_SET);
-    xSemaphoreGive(file_mutex_);
-
-    // Remove newline
-    size_t len = strlen(line_buffer);
-    while (len > 0 && (line_buffer[len - 1] == '\n' || line_buffer[len - 1] == '\r')) {
-        line_buffer[--len] = '\0';
-    }
-
-    return parsePatternLine(line_buffer, current_line_index_);
+    bool is_first = (current_line_index_ == 0);
+    return PatternLine(point.theta, point.rho, is_first);
 }
 
 void SandTablePlayer::popLine() {
-    if (!file_loaded_) return;
+    if (!file_loaded_ || !pattern_reader_) return;
+    // Advance the reader position
+    pattern_reader_->readNext();
     current_line_index_++;
 }
 
 bool SandTablePlayer::hasMoreLines() {
-    return file_loaded_ && (current_line_index_ < total_lines_);
+    return file_loaded_ && pattern_reader_ && pattern_reader_->hasMore();
 }
 
 // =============================================================================
@@ -810,6 +761,17 @@ void SandTablePlayer::startCurrentPattern() {
 
     size_t idx = playlist_order_[playlist_index_];
     const std::string& pattern_uuid = playlist_patterns_[idx];
+
+    // Check authorization for encrypted patterns
+    auto pattern_info = ManifestDatabase::instance().getPattern(pattern_uuid);
+    if (pattern_info.has_value() && pattern_info->encrypted) {
+        // Check purchase receipt OR subscription license
+        if (!drm_purchase_is_valid(pattern_uuid.c_str()) && !drm_license_is_valid()) {
+            ESP_LOGW(TAG, "Skipping encrypted pattern (no valid authorization): %s", pattern_uuid.c_str());
+            advanceToNextPattern();
+            return;
+        }
+    }
 
     // Load the pattern file
     esp_err_t ret = loadPatternFile(pattern_uuid.c_str());

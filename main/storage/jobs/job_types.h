@@ -81,6 +81,15 @@ struct DownloadJobData {
     int start_point = 0;
     std::string created_at;
 
+    // Purchase receipt (if pattern is purchased)
+    // Stored as base64 to fit in JSON job_data blob
+    std::string receipt_payload_b64;    // Base64-encoded PurchaseReceipt protobuf
+    std::string receipt_signature_b64;  // Base64-encoded RSA signature
+
+    bool hasPurchaseReceipt() const {
+        return !receipt_payload_b64.empty() && !receipt_signature_b64.empty();
+    }
+
     // JSON serialization
     std::string toJson() const;
     static DownloadJobData fromJson(const std::string& json);

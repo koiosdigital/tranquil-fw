@@ -1,0 +1,1159 @@
+asyncapi: 2.6.0
+info:
+  title: Tranquil Sand Table WebSocket API
+  version: 1.0.0
+  description: |
+    WebSocket API for real-time communication with the Tranquil kinetic sand table.
+
+    Connect to `/ws` endpoint for binary protobuf messaging. All messages use the
+    `kd.v1.TranquilMessage` wrapper with a oneof field for the specific message type.
+
+    ## Protocol
+    - Binary WebSocket frames containing serialized protobuf messages
+    - Max frame size: 8KB
+    - Max concurrent clients: 4
+
+    ## Protobuf Definitions
+    See `components/protobufs/proto/kd/v1/tranquil.proto` for full message definitions.
+
+servers:
+  local:
+    url: ws://{host}/ws
+    protocol: ws
+    description: Local device WebSocket endpoint
+    variables:
+      host:
+        default: tranquil.local
+        description: Device hostname or IP
+
+defaultContentType: application/x-protobuf
+
+channels:
+  /:
+    publish:
+      operationId: sendMessage
+      summary: Send commands to device
+      description: Client sends TranquilMessage to control the device
+      message:
+        oneOf:
+          # Player Control
+          - $ref: '#/components/messages/PlayPattern'
+          - $ref: '#/components/messages/SetPaused'
+          - $ref: '#/components/messages/StopPlayback'
+          - $ref: '#/components/messages/PlaylistPlay'
+          - $ref: '#/components/messages/SetShuffle'
+          - $ref: '#/components/messages/SetLoop'
+          - $ref: '#/components/messages/SetFeedRate'
+          - $ref: '#/components/messages/PlaylistNavigate'
+          - $ref: '#/components/messages/GetPlayerState'
+          # Pattern Management
+          - $ref: '#/components/messages/DownloadedPatternsRequest'
+          - $ref: '#/components/messages/DeletePattern'
+          - $ref: '#/components/messages/ModifyPattern'
+          - $ref: '#/components/messages/GetPatternRequest'
+          - $ref: '#/components/messages/RequestPatternDownload'
+          # Playlist Management
+          - $ref: '#/components/messages/PlaylistsRequest'
+          - $ref: '#/components/messages/CreatePlaylist'
+          - $ref: '#/components/messages/UpdatePlaylist'
+          - $ref: '#/components/messages/DeletePlaylist'
+          # LED Control
+          - $ref: '#/components/messages/LEDConfigRequest'
+          - $ref: '#/components/messages/SetLEDChannel'
+          - $ref: '#/components/messages/GetLEDEffects'
+          # Configuration (Local-Only)
+          - $ref: '#/components/messages/GetConfigRequest'
+          - $ref: '#/components/messages/SetConfigRequest'
+          - $ref: '#/components/messages/ClearCalibrationRequest'
+          # Presets (Local-Only)
+          - $ref: '#/components/messages/ListPresetsRequest'
+          - $ref: '#/components/messages/LoadPresetRequest'
+          # Schedule
+          - $ref: '#/components/messages/ScheduleRequest'
+          - $ref: '#/components/messages/Schedule'
+          # System
+          - $ref: '#/components/messages/Ping'
+          - $ref: '#/components/messages/GetSystemInfo'
+          - $ref: '#/components/messages/HomeRequest'
+          - $ref: '#/components/messages/FactoryResetRequest'
+          # License (Local-Only)
+          - $ref: '#/components/messages/GetStoreTokenRequest'
+
+    subscribe:
+      operationId: receiveMessage
+      summary: Receive responses and broadcasts from device
+      description: Device sends TranquilMessage responses and state broadcasts
+      message:
+        oneOf:
+          # Generic Response
+          - $ref: '#/components/messages/CommandResult'
+          # Player
+          - $ref: '#/components/messages/PlayerState'
+          # Patterns
+          - $ref: '#/components/messages/DownloadedPatterns'
+          - $ref: '#/components/messages/PatternInfo'
+          - $ref: '#/components/messages/PatternDownloadProgress'
+          - $ref: '#/components/messages/PatternConversionProgress'
+          - $ref: '#/components/messages/PatternThumbProgress'
+          # Playlists
+          - $ref: '#/components/messages/Playlists'
+          # LED
+          - $ref: '#/components/messages/LEDConfig'
+          - $ref: '#/components/messages/LEDEffectsList'
+          # Configuration
+          - $ref: '#/components/messages/GetConfigResponse'
+          - $ref: '#/components/messages/SetConfigResponse'
+          - $ref: '#/components/messages/ClearCalibrationResponse'
+          # Presets
+          - $ref: '#/components/messages/ListPresetsResponse'
+          - $ref: '#/components/messages/LoadPresetResponse'
+          # Schedule
+          - $ref: '#/components/messages/Schedule'
+          # System
+          - $ref: '#/components/messages/Pong'
+          - $ref: '#/components/messages/SystemInfo'
+          - $ref: '#/components/messages/HomeResponse'
+          # License
+          - $ref: '#/components/messages/StoreTokenResponse'
+
+components:
+  messages:
+    # ==========================================================================
+    # Player Control Messages
+    # ==========================================================================
+    PlayPattern:
+      name: PlayPattern
+      title: Play Pattern
+      summary: Start playing a single pattern
+      contentType: application/x-protobuf
+      payload:
+        $ref: '#/components/schemas/PlayPattern'
+
+    SetPaused:
+      name: SetPaused
+      title: Set Paused
+      summary: Pause or resume playback
+      payload:
+        $ref: '#/components/schemas/SetPaused'
+
+    StopPlayback:
+      name: StopPlayback
+      title: Stop Playback
+      summary: Stop current playback
+      payload:
+        $ref: '#/components/schemas/StopPlayback'
+
+    PlaylistPlay:
+      name: PlaylistPlay
+      title: Playlist Play
+      summary: Start playing a playlist
+      payload:
+        $ref: '#/components/schemas/PlaylistPlay'
+
+    SetShuffle:
+      name: SetShuffle
+      title: Set Shuffle
+      summary: Enable or disable shuffle mode
+      payload:
+        $ref: '#/components/schemas/PlaylistSetShuffle'
+
+    SetLoop:
+      name: SetLoop
+      title: Set Loop
+      summary: Enable or disable loop mode
+      payload:
+        $ref: '#/components/schemas/SetLoop'
+
+    SetFeedRate:
+      name: SetFeedRate
+      title: Set Feed Rate
+      summary: Set the playback feed rate in RPM
+      payload:
+        $ref: '#/components/schemas/SetFeedRate'
+
+    PlaylistNavigate:
+      name: PlaylistNavigateCommand
+      title: Playlist Navigate
+      summary: Skip to next or previous pattern in playlist
+      payload:
+        $ref: '#/components/schemas/PlaylistNavigateCommand'
+
+    GetPlayerState:
+      name: GetPlayerState
+      title: Get Player State
+      summary: Request current player state
+      payload:
+        $ref: '#/components/schemas/GetPlayerState'
+
+    PlayerState:
+      name: PlayerState
+      title: Player State
+      summary: Current player state (response or broadcast)
+      description: |
+        Sent in response to GetPlayerState and broadcast on state changes.
+        State changes (play/pause/stop/track change) are sent immediately.
+        Progress-only updates have a 1-second cooldown for local clients.
+      payload:
+        $ref: '#/components/schemas/PlayerState'
+
+    # ==========================================================================
+    # Pattern Management Messages
+    # ==========================================================================
+    DownloadedPatternsRequest:
+      name: DownloadedPatternsRequest
+      title: Get Downloaded Patterns
+      summary: Request list of all downloaded patterns
+      payload:
+        $ref: '#/components/schemas/DownloadedPatternsRequest'
+
+    DownloadedPatterns:
+      name: DownloadedPatterns
+      title: Downloaded Patterns
+      summary: List of all downloaded patterns
+      payload:
+        $ref: '#/components/schemas/DownloadedPatterns'
+
+    DeletePattern:
+      name: DeletePattern
+      title: Delete Pattern
+      summary: Delete a pattern from the device
+      payload:
+        $ref: '#/components/schemas/DeletePattern'
+
+    ModifyPattern:
+      name: ModifyPattern
+      title: Modify Pattern
+      summary: Rename a pattern
+      payload:
+        $ref: '#/components/schemas/ModifyPattern'
+
+    GetPatternRequest:
+      name: GetPatternRequest
+      title: Get Pattern
+      summary: Request details for a specific pattern
+      payload:
+        $ref: '#/components/schemas/GetPatternRequest'
+
+    PatternInfo:
+      name: PatternInfo
+      title: Pattern Info
+      summary: Pattern metadata (response)
+      payload:
+        $ref: '#/components/schemas/PatternInfo'
+
+    RequestPatternDownload:
+      name: RequestPatternDownload
+      title: Request Pattern Download
+      summary: Request to download a pattern from the cloud store
+      payload:
+        $ref: '#/components/schemas/RequestPatternDownload'
+
+    PatternDownloadProgress:
+      name: PatternDownloadProgressReport
+      title: Pattern Download Progress
+      summary: Broadcast of active pattern downloads (every 5% change)
+      payload:
+        $ref: '#/components/schemas/PatternDownloadProgressReport'
+
+    PatternConversionProgress:
+      name: PatternConversionProgressReport
+      title: Pattern Conversion Progress
+      summary: Broadcast during local pattern conversion (THR to THRB)
+      payload:
+        $ref: '#/components/schemas/PatternConversionProgressReport'
+
+    PatternThumbProgress:
+      name: PatternThumbProgressReport
+      title: Thumbnail Generation Progress
+      summary: Broadcast during thumbnail generation
+      payload:
+        $ref: '#/components/schemas/PatternThumbProgressReport'
+
+    # ==========================================================================
+    # Playlist Management Messages
+    # ==========================================================================
+    PlaylistsRequest:
+      name: PlaylistsRequest
+      title: Get Playlists
+      summary: Request list of all playlists
+      payload:
+        $ref: '#/components/schemas/PlaylistsRequest'
+
+    Playlists:
+      name: Playlists
+      title: Playlists
+      summary: List of all playlists
+      payload:
+        $ref: '#/components/schemas/Playlists'
+
+    CreatePlaylist:
+      name: CreatePlaylist
+      title: Create Playlist
+      summary: Create a new playlist
+      payload:
+        $ref: '#/components/schemas/CreatePlaylist'
+
+    UpdatePlaylist:
+      name: UpdatePlaylist
+      title: Update Playlist
+      summary: Update an existing playlist
+      payload:
+        $ref: '#/components/schemas/UpdatePlaylist'
+
+    DeletePlaylist:
+      name: DeletePlaylist
+      title: Delete Playlist
+      summary: Delete a playlist
+      payload:
+        $ref: '#/components/schemas/DeletePlaylist'
+
+    # ==========================================================================
+    # LED Control Messages
+    # ==========================================================================
+    LEDConfigRequest:
+      name: LEDConfigRequest
+      title: Get LED Config
+      summary: Request LED hardware configuration
+      payload:
+        $ref: '#/components/schemas/LEDConfigRequest'
+
+    LEDConfig:
+      name: LEDConfig
+      title: LED Config
+      summary: LED hardware configuration
+      payload:
+        $ref: '#/components/schemas/LEDConfig'
+
+    SetLEDChannel:
+      name: SetLEDChannel
+      title: Set LED Channel
+      summary: Configure LED channel settings (effect, brightness, color)
+      payload:
+        $ref: '#/components/schemas/SetLEDChannel'
+
+    GetLEDEffects:
+      name: GetLEDEffects
+      title: Get LED Effects
+      summary: Request list of available LED effects
+      payload:
+        $ref: '#/components/schemas/GetLEDEffects'
+
+    LEDEffectsList:
+      name: LEDEffectsList
+      title: LED Effects List
+      summary: List of available LED effects
+      payload:
+        $ref: '#/components/schemas/LEDEffectsList'
+
+    # ==========================================================================
+    # Configuration Messages (Local-Only)
+    # ==========================================================================
+    GetConfigRequest:
+      name: GetConfigRequest
+      title: Get Config (Local Only)
+      summary: Request full device configuration
+      description: Only available from local WebSocket, not cloud.
+      payload:
+        $ref: '#/components/schemas/GetConfigRequest'
+
+    GetConfigResponse:
+      name: GetConfigResponse
+      title: Get Config Response
+      summary: Full device configuration
+      payload:
+        $ref: '#/components/schemas/GetConfigResponse'
+
+    SetConfigRequest:
+      name: SetConfigRequest
+      title: Set Config (Local Only)
+      summary: Update device configuration
+      description: Only available from local WebSocket, not cloud.
+      payload:
+        $ref: '#/components/schemas/SetConfigRequest'
+
+    SetConfigResponse:
+      name: SetConfigResponse
+      title: Set Config Response
+      summary: Configuration update result
+      payload:
+        $ref: '#/components/schemas/SetConfigResponse'
+
+    ClearCalibrationRequest:
+      name: ClearCalibrationRequest
+      title: Clear Calibration (Local Only)
+      summary: Clear stored calibration data
+      payload:
+        $ref: '#/components/schemas/ClearCalibrationRequest'
+
+    ClearCalibrationResponse:
+      name: ClearCalibrationResponse
+      title: Clear Calibration Response
+      summary: Calibration clear result
+      payload:
+        $ref: '#/components/schemas/ClearCalibrationResponse'
+
+    # ==========================================================================
+    # Preset Messages (Local-Only)
+    # ==========================================================================
+    ListPresetsRequest:
+      name: ListPresetsRequest
+      title: List Presets (Local Only)
+      summary: Request list of hardware presets
+      payload:
+        $ref: '#/components/schemas/ListPresetsRequest'
+
+    ListPresetsResponse:
+      name: ListPresetsResponse
+      title: List Presets Response
+      summary: List of available hardware presets
+      payload:
+        $ref: '#/components/schemas/ListPresetsResponse'
+
+    LoadPresetRequest:
+      name: LoadPresetRequest
+      title: Load Preset (Local Only)
+      summary: Load a hardware preset
+      payload:
+        $ref: '#/components/schemas/LoadPresetRequest'
+
+    LoadPresetResponse:
+      name: LoadPresetResponse
+      title: Load Preset Response
+      summary: Preset load result
+      payload:
+        $ref: '#/components/schemas/LoadPresetResponse'
+
+    # ==========================================================================
+    # Schedule Messages
+    # ==========================================================================
+    ScheduleRequest:
+      name: TranquilScheduleRequest
+      title: Get Schedule
+      summary: Request current schedule
+      payload:
+        $ref: '#/components/schemas/TranquilScheduleRequest'
+
+    Schedule:
+      name: TranquilSchedule
+      title: Schedule
+      summary: Device schedule (request or response)
+      payload:
+        $ref: '#/components/schemas/TranquilSchedule'
+
+    # ==========================================================================
+    # System Messages
+    # ==========================================================================
+    Ping:
+      name: Ping
+      title: Ping
+      summary: Keepalive ping
+      payload:
+        $ref: '#/components/schemas/Ping'
+
+    Pong:
+      name: Pong
+      title: Pong
+      summary: Keepalive pong response
+      payload:
+        $ref: '#/components/schemas/Pong'
+
+    GetSystemInfo:
+      name: GetSystemInfo
+      title: Get System Info
+      summary: Request system information
+      payload:
+        $ref: '#/components/schemas/GetSystemInfo'
+
+    SystemInfo:
+      name: SystemInfo
+      title: System Info
+      summary: Device system information
+      payload:
+        $ref: '#/components/schemas/SystemInfo'
+
+    HomeRequest:
+      name: HomeRequest
+      title: Home Request
+      summary: Initiate homing sequence
+      payload:
+        $ref: '#/components/schemas/HomeRequest'
+
+    HomeResponse:
+      name: HomeResponse
+      title: Home Response
+      summary: Homing result with calibration data
+      payload:
+        $ref: '#/components/schemas/HomeResponse'
+
+    FactoryResetRequest:
+      name: FactoryResetRequest
+      title: Factory Reset
+      summary: Trigger factory reset (device will restart)
+      payload:
+        $ref: '#/components/schemas/FactoryResetRequest'
+
+    # ==========================================================================
+    # License Messages (Local-Only)
+    # ==========================================================================
+    GetStoreTokenRequest:
+      name: GetStoreTokenRequest
+      title: Get Store Token (Local Only)
+      summary: Request the store authentication token
+      payload:
+        $ref: '#/components/schemas/GetStoreTokenRequest'
+
+    StoreTokenResponse:
+      name: StoreTokenResponse
+      title: Store Token Response
+      summary: Store authentication token
+      payload:
+        $ref: '#/components/schemas/StoreTokenResponse'
+
+    # ==========================================================================
+    # Generic Response
+    # ==========================================================================
+    CommandResult:
+      name: CommandResult
+      title: Command Result
+      summary: Generic success/failure response for commands
+      payload:
+        $ref: '#/components/schemas/CommandResult'
+
+  # ============================================================================
+  # Protobuf Schema Definitions
+  # ============================================================================
+  schemas:
+    # Player Control
+    PlayPattern:
+      type: object
+      description: "Protobuf: kd.v1.PlayPattern"
+      properties:
+        pattern_uuid:
+          type: string
+          description: UUID of pattern to play
+
+    SetPaused:
+      type: object
+      description: "Protobuf: kd.v1.SetPaused"
+      properties:
+        paused:
+          type: boolean
+
+    StopPlayback:
+      type: object
+      description: "Protobuf: kd.v1.StopPlayback"
+      properties: {}
+
+    PlaylistPlay:
+      type: object
+      description: "Protobuf: kd.v1.PlaylistPlay"
+      properties:
+        playlist_uuid:
+          type: string
+        shuffle:
+          type: boolean
+        loop:
+          type: boolean
+        start_pattern_uuid:
+          type: string
+          description: Optional - start from specific pattern
+
+    PlaylistSetShuffle:
+      type: object
+      description: "Protobuf: kd.v1.PlaylistSetShuffle"
+      properties:
+        shuffle:
+          type: boolean
+
+    SetLoop:
+      type: object
+      description: "Protobuf: kd.v1.SetLoop"
+      properties:
+        enabled:
+          type: boolean
+
+    SetFeedRate:
+      type: object
+      description: "Protobuf: kd.v1.SetFeedRate"
+      properties:
+        feed_rate_rpm:
+          type: number
+          format: float
+
+    PlaylistNavigateCommand:
+      type: object
+      description: "Protobuf: kd.v1.PlaylistNavigateCommand"
+      properties:
+        direction:
+          type: string
+          enum: [DIRECTION_UNSPECIFIED, DIRECTION_NEXT, DIRECTION_PREVIOUS]
+
+    GetPlayerState:
+      type: object
+      description: "Protobuf: kd.v1.GetPlayerState"
+      properties: {}
+
+    PlayerState:
+      type: object
+      description: "Protobuf: kd.v1.PlayerState"
+      properties:
+        state:
+          type: string
+          enum: [PLAYBACK_STATE_UNSPECIFIED, PLAYBACK_STATE_STOPPED, PLAYBACK_STATE_PLAYING, PLAYBACK_STATE_PAUSED]
+        mode:
+          type: string
+          enum: [PLAY_MODE_UNSPECIFIED, PLAY_MODE_SINGLE, PLAY_MODE_PLAYLIST, PLAY_MODE_PLAYLIST_LOOP, PLAY_MODE_PLAYLIST_SHUFFLE]
+        current_pattern_uuid:
+          type: string
+        current_playlist_uuid:
+          type: string
+        progress_percent:
+          type: integer
+        pattern_index:
+          type: integer
+        playlist_size:
+          type: integer
+        feed_rate:
+          type: number
+          format: float
+        shuffle:
+          type: boolean
+        loop:
+          type: boolean
+
+    # Pattern Management
+    DownloadedPatternsRequest:
+      type: object
+      description: "Protobuf: kd.v1.DownloadedPatternsRequest"
+      properties: {}
+
+    DownloadedPatterns:
+      type: object
+      description: "Protobuf: kd.v1.DownloadedPatterns"
+      properties:
+        patterns:
+          type: array
+          items:
+            $ref: '#/components/schemas/PatternInfo'
+
+    PatternInfo:
+      type: object
+      description: "Protobuf: kd.v1.PatternInfo"
+      properties:
+        uuid:
+          type: string
+        name:
+          type: string
+        creator:
+          type: string
+        encrypted:
+          type: boolean
+        size_bytes:
+          type: integer
+        reversible:
+          type: boolean
+        start_point:
+          type: integer
+          description: "0=center, 1=edge"
+        created_at:
+          type: string
+        last_played_at:
+          type: string
+        download_url:
+          type: string
+        thumb_url:
+          type: string
+        is_owned:
+          type: boolean
+        purchased_at:
+          type: integer
+          format: int64
+        receipt_id:
+          type: string
+
+    DeletePattern:
+      type: object
+      description: "Protobuf: kd.v1.DeletePattern"
+      properties:
+        uuid:
+          type: string
+
+    ModifyPattern:
+      type: object
+      description: "Protobuf: kd.v1.ModifyPattern"
+      properties:
+        uuid:
+          type: string
+        name:
+          type: string
+
+    GetPatternRequest:
+      type: object
+      description: "Protobuf: kd.v1.GetPatternRequest"
+      properties:
+        uuid:
+          type: string
+
+    RequestPatternDownload:
+      type: object
+      description: "Protobuf: kd.v1.RequestPatternDownload"
+      properties:
+        pattern_uuid:
+          type: string
+
+    PatternDownloadProgressReport:
+      type: object
+      description: "Protobuf: kd.v1.PatternDownloadProgressReport"
+      properties:
+        downloads:
+          type: array
+          items:
+            type: object
+            properties:
+              uuid:
+                type: string
+              progress_pct:
+                type: integer
+
+    PatternConversionProgressReport:
+      type: object
+      description: "Protobuf: kd.v1.PatternConversionProgressReport"
+      properties:
+        conversions:
+          type: array
+          items:
+            type: object
+            properties:
+              uuid:
+                type: string
+              stage:
+                type: string
+                enum: [converting, complete, failed]
+              progress_pct:
+                type: integer
+              error:
+                type: string
+
+    PatternThumbProgressReport:
+      type: object
+      description: "Protobuf: kd.v1.PatternThumbProgressReport"
+      properties:
+        thumbnails:
+          type: array
+          items:
+            type: object
+            properties:
+              uuid:
+                type: string
+              stage:
+                type: string
+                enum: [rendering, complete, failed]
+              progress_pct:
+                type: integer
+              error:
+                type: string
+
+    # Playlist Management
+    PlaylistsRequest:
+      type: object
+      description: "Protobuf: kd.v1.PlaylistsRequest"
+      properties: {}
+
+    Playlists:
+      type: object
+      description: "Protobuf: kd.v1.Playlists"
+      properties:
+        playlists:
+          type: array
+          items:
+            $ref: '#/components/schemas/PlaylistInfo'
+
+    PlaylistInfo:
+      type: object
+      description: "Protobuf: kd.v1.PlaylistInfo"
+      properties:
+        uuid:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        pattern_uuids:
+          type: array
+          items:
+            type: string
+        featured_pattern:
+          type: string
+        created_at:
+          type: string
+        updated_at:
+          type: string
+
+    CreatePlaylist:
+      type: object
+      description: "Protobuf: kd.v1.CreatePlaylist"
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        pattern_uuids:
+          type: array
+          items:
+            type: string
+
+    UpdatePlaylist:
+      type: object
+      description: "Protobuf: kd.v1.UpdatePlaylist"
+      properties:
+        uuid:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        pattern_uuids:
+          type: array
+          items:
+            type: string
+        featured_pattern:
+          type: string
+
+    DeletePlaylist:
+      type: object
+      description: "Protobuf: kd.v1.DeletePlaylist"
+      properties:
+        uuid:
+          type: string
+
+    # LED Control
+    LEDConfigRequest:
+      type: object
+      description: "Protobuf: kd.v1.LEDConfigRequest"
+      properties: {}
+
+    LEDConfig:
+      type: object
+      description: "Protobuf: kd.v1.LEDConfig"
+      properties:
+        has_leds:
+          type: boolean
+        led_count:
+          type: integer
+        is_rgbw:
+          type: boolean
+        pixdriver_version:
+          type: string
+
+    SetLEDChannel:
+      type: object
+      description: "Protobuf: kd.v1.SetLEDChannel"
+      properties:
+        channel:
+          type: integer
+        effect_id:
+          type: string
+        brightness:
+          type: integer
+        speed:
+          type: integer
+        enabled:
+          type: boolean
+        color:
+          type: object
+          properties:
+            r:
+              type: integer
+            g:
+              type: integer
+            b:
+              type: integer
+            w:
+              type: integer
+
+    GetLEDEffects:
+      type: object
+      description: "Protobuf: kd.v1.GetLEDEffects"
+      properties: {}
+
+    LEDEffectsList:
+      type: object
+      description: "Protobuf: kd.v1.LEDEffectsList"
+      properties:
+        effects:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              name:
+                type: string
+
+    # Configuration
+    GetConfigRequest:
+      type: object
+      description: "Protobuf: kd.v1.GetConfigRequest"
+      properties: {}
+
+    GetConfigResponse:
+      type: object
+      description: "Protobuf: kd.v1.GetConfigResponse"
+      properties:
+        motion:
+          $ref: '#/components/schemas/MotionConfigProto'
+        led:
+          $ref: '#/components/schemas/LEDConfigProto'
+        calibration:
+          $ref: '#/components/schemas/CalibrationDataProto'
+        active_preset_id:
+          type: string
+
+    SetConfigRequest:
+      type: object
+      description: "Protobuf: kd.v1.SetConfigRequest"
+      properties:
+        motion:
+          $ref: '#/components/schemas/MotionConfigProto'
+        led:
+          $ref: '#/components/schemas/LEDConfigProto'
+
+    SetConfigResponse:
+      type: object
+      description: "Protobuf: kd.v1.SetConfigResponse"
+      properties:
+        success:
+          type: boolean
+        error:
+          type: string
+
+    MotionConfigProto:
+      type: object
+      properties:
+        steps_per_rev:
+          type: integer
+        microsteps:
+          type: integer
+        theta_gear_ratio_x100:
+          type: integer
+        pinion_diameter_mm:
+          type: integer
+        theta_max_rpm:
+          type: integer
+        rho_max_rpm:
+          type: integer
+        theta_current_ma:
+          type: integer
+        rho_current_ma:
+          type: integer
+        stallguard_threshold:
+          type: integer
+        default_accel_mm_s2:
+          type: number
+          format: float
+        max_accel_mm_s2:
+          type: number
+          format: float
+
+    LEDConfigProto:
+      type: object
+      properties:
+        has_leds:
+          type: boolean
+        led_count:
+          type: integer
+        is_rgbw:
+          type: boolean
+
+    CalibrationDataProto:
+      type: object
+      properties:
+        theta_steps_per_rotation:
+          type: integer
+        rho_max_steps:
+          type: integer
+        is_valid:
+          type: boolean
+        timestamp:
+          type: integer
+
+    ClearCalibrationRequest:
+      type: object
+      description: "Protobuf: kd.v1.ClearCalibrationRequest"
+      properties: {}
+
+    ClearCalibrationResponse:
+      type: object
+      description: "Protobuf: kd.v1.ClearCalibrationResponse"
+      properties:
+        success:
+          type: boolean
+
+    # Presets
+    ListPresetsRequest:
+      type: object
+      description: "Protobuf: kd.v1.ListPresetsRequest"
+      properties: {}
+
+    ListPresetsResponse:
+      type: object
+      description: "Protobuf: kd.v1.ListPresetsResponse"
+      properties:
+        presets:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              name:
+                type: string
+              description:
+                type: string
+        active_preset_id:
+          type: string
+
+    LoadPresetRequest:
+      type: object
+      description: "Protobuf: kd.v1.LoadPresetRequest"
+      properties:
+        preset_id:
+          type: string
+
+    LoadPresetResponse:
+      type: object
+      description: "Protobuf: kd.v1.LoadPresetResponse"
+      properties:
+        success:
+          type: boolean
+        error:
+          type: string
+
+    # Schedule
+    TranquilScheduleRequest:
+      type: object
+      description: "Protobuf: kd.v1.TranquilScheduleRequest"
+      properties: {}
+
+    TranquilSchedule:
+      type: object
+      description: "Protobuf: kd.v1.TranquilSchedule"
+      properties:
+        schedule_items:
+          type: array
+          items:
+            type: object
+            properties:
+              days_of_week:
+                type: integer
+                description: "Bitmask: Sun=1, Mon=2, Tue=4, Wed=8, Thu=16, Fri=32, Sat=64"
+              time_of_day:
+                type: integer
+                description: "Minutes since midnight"
+              action:
+                type: object
+                properties:
+                  type:
+                    type: string
+                    enum: [SCHEDULE_ACTION_TYPE_UNSPECIFIED, SCHEDULE_ACTION_TYPE_LED_OFF, SCHEDULE_ACTION_TYPE_LED_ON, SCHEDULE_ACTION_TYPE_PLAY_RANDOM_PATTERN, SCHEDULE_ACTION_TYPE_PLAY_PLAYLIST, SCHEDULE_ACTION_TYPE_PLAY_PATTERN]
+                  uuid:
+                    type: string
+                    description: "Playlist/pattern UUID for PLAY_PLAYLIST/PLAY_PATTERN"
+
+    # System
+    Ping:
+      type: object
+      description: "Protobuf: kd.v1.Ping"
+      properties:
+        timestamp:
+          type: integer
+          format: int64
+
+    Pong:
+      type: object
+      description: "Protobuf: kd.v1.Pong"
+      properties:
+        timestamp:
+          type: integer
+          format: int64
+
+    GetSystemInfo:
+      type: object
+      description: "Protobuf: kd.v1.GetSystemInfo"
+      properties: {}
+
+    SystemInfo:
+      type: object
+      description: "Protobuf: kd.v1.SystemInfo"
+      properties:
+        firmware_version:
+          type: string
+        hardware_model:
+          type: string
+        device_id:
+          type: string
+        is_homed:
+          type: boolean
+        free_heap:
+          type: integer
+        hostname:
+          type: string
+
+    HomeRequest:
+      type: object
+      description: "Protobuf: kd.v1.HomeRequest"
+      properties:
+        force_full_calibration:
+          type: boolean
+          description: "Force full calibration instead of using cached values"
+
+    HomeResponse:
+      type: object
+      description: "Protobuf: kd.v1.HomeResponse"
+      properties:
+        success:
+          type: boolean
+        calibration:
+          $ref: '#/components/schemas/CalibrationDataProto'
+        used_cached_calibration:
+          type: boolean
+        error:
+          type: string
+
+    FactoryResetRequest:
+      type: object
+      description: "Protobuf: kd.v1.FactoryResetRequest"
+      properties:
+        reason:
+          type: string
+          description: "Optional reason for logging"
+
+    # License
+    GetStoreTokenRequest:
+      type: object
+      description: "Protobuf: kd.v1.GetStoreTokenRequest"
+      properties: {}
+
+    StoreTokenResponse:
+      type: object
+      description: "Protobuf: kd.v1.StoreTokenResponse"
+      properties:
+        success:
+          type: boolean
+        store_token:
+          type: string
+          description: "JWT token for store authentication"
+        error:
+          type: string
+
+    # Generic
+    CommandResult:
+      type: object
+      description: "Protobuf: kd.v1.CommandResult"
+      properties:
+        success:
+          type: boolean
+        error_code:
+          type: integer
+        detail:
+          type: string

@@ -5,11 +5,13 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "ManifestDatabase.h"
+#include "PatternReader.h"
 #include "motion_controller.h"
 #include "cJSON.h"
 #include <string>
 #include <vector>
 #include <optional>
+#include <memory>
 
 #define MAX_UUID_LEN 64
 #define MAX_LINE_BUFFER_SIZE 512
@@ -114,8 +116,6 @@ private:
     // Pattern file handling
     static esp_err_t loadPatternFile(const char* pattern_uuid);
     static void unloadPatternFile();
-    static PatternLine parsePatternLine(const char* line, size_t line_number);
-    static void getPatternFilePath(const char* pattern_uuid, bool encrypted, char* file_path, size_t file_path_size);
     static PatternLine peekNextLine();
     static void popLine();
     static bool hasMoreLines();
@@ -144,7 +144,7 @@ private:
     // Pattern state
     static char current_pattern_uuid_[MAX_UUID_LEN];
     static std::optional<Pattern> current_pattern_;
-    static FILE* pattern_file_;
+    static std::unique_ptr<IPatternReader> pattern_reader_;
     static size_t current_line_index_;
     static size_t total_lines_;
     static bool file_loaded_;
@@ -165,7 +165,6 @@ private:
 
     // Constants
     static const char* TAG;
-    static const char* PATTERNS_PATH;
     static constexpr uint32_t SERVICE_TASK_DELAY_MS = 10;
     static constexpr size_t SERVICE_TASK_STACK_SIZE = 8192;
     static constexpr UBaseType_t SERVICE_TASK_PRIORITY = 5;

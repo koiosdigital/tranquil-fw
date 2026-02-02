@@ -143,10 +143,10 @@ bool drm_license_can_download(void) {
         return false;  // No license or no limit info
     }
 
-    // Check current pattern count
-    size_t current_count = ManifestDatabase::instance().getPatternCount();
+    // Count only subscription patterns (not purchased) against limit
+    size_t subscription_count = ManifestDatabase::instance().getSubscriptionPatternCount();
 
-    return current_count < max_patterns;
+    return subscription_count < max_patterns;
 }
 
 esp_err_t drm_license_get_info(drm_license_info_t* info) {

@@ -119,6 +119,14 @@ std::string DownloadJobData::toJson() const {
     cJSON_AddNumberToObject(root, "start_point", start_point);
     cJSON_AddStringToObject(root, "created_at", created_at.c_str());
 
+    // Purchase receipt (if present)
+    if (!receipt_payload_b64.empty()) {
+        cJSON_AddStringToObject(root, "receipt_payload_b64", receipt_payload_b64.c_str());
+    }
+    if (!receipt_signature_b64.empty()) {
+        cJSON_AddStringToObject(root, "receipt_signature_b64", receipt_signature_b64.c_str());
+    }
+
     char* str = cJSON_PrintUnformatted(root);
     std::string result(str);
     free(str);
@@ -156,6 +164,13 @@ DownloadJobData DownloadJobData::fromJson(const std::string& json) {
 
     item = cJSON_GetObjectItem(root, "created_at");
     if (cJSON_IsString(item)) data.created_at = item->valuestring;
+
+    // Purchase receipt (optional)
+    item = cJSON_GetObjectItem(root, "receipt_payload_b64");
+    if (cJSON_IsString(item)) data.receipt_payload_b64 = item->valuestring;
+
+    item = cJSON_GetObjectItem(root, "receipt_signature_b64");
+    if (cJSON_IsString(item)) data.receipt_signature_b64 = item->valuestring;
 
     cJSON_Delete(root);
     return data;

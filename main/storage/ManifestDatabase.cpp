@@ -177,7 +177,10 @@ public:
                 size_bytes INTEGER DEFAULT 0,
                 created_at TEXT,
                 last_played_at TEXT,
-                downloaded_at TEXT
+                downloaded_at TEXT,
+                purchased INTEGER DEFAULT 0,
+                purchased_at INTEGER DEFAULT 0,
+                receipt_id TEXT DEFAULT ''
             );
 
             CREATE INDEX IF NOT EXISTS idx_patterns_uuid ON patterns(uuid);
@@ -240,6 +243,18 @@ public:
             sqlite3_free(err_msg);
             return ESP_FAIL;
         }
+
+        // Migration: add new columns to existing databases (silently fails if columns exist)
+        const char* migrations[] = {
+            "ALTER TABLE patterns ADD COLUMN purchased INTEGER DEFAULT 0",
+            "ALTER TABLE patterns ADD COLUMN purchased_at INTEGER DEFAULT 0",
+            "ALTER TABLE patterns ADD COLUMN receipt_id TEXT DEFAULT ''",
+            nullptr
+        };
+        for (int i = 0; migrations[i] != nullptr; i++) {
+            sqlite3_exec(db, migrations[i], nullptr, nullptr, nullptr);
+        }
+
         return ESP_OK;
     }
 
@@ -257,6 +272,9 @@ public:
         p.created_at = stmt.columnText(9);
         p.last_played_at = stmt.columnText(10);
         p.downloaded_at = stmt.columnText(11);
+        p.purchased = stmt.columnInt(12) != 0;
+        p.purchased_at = stmt.columnInt64(13);
+        p.receipt_id = stmt.columnText(14);
         return p;
     }
 
@@ -482,8 +500,9 @@ esp_err_t ManifestDatabase::addPattern(const Pattern& pattern) {
     return impl_->executeOnSqliteTask([this, &pattern]() -> esp_err_t {
         Impl::Statement stmt(impl_->db,
             "INSERT INTO patterns (uuid, name, creator, date, popularity, reversible, "
-            "start_point, encrypted, size_bytes, created_at, last_played_at, downloaded_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+            "start_point, encrypted, size_bytes, created_at, last_played_at, downloaded_at, "
+            "purchased, purchased_at, receipt_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
 
         std::string ts = pattern.created_at.empty() ? currentTimestamp() : pattern.created_at;
 
@@ -501,6 +520,9 @@ esp_err_t ManifestDatabase::addPattern(const Pattern& pattern) {
         else stmt.bindText(11, pattern.last_played_at);
         if (pattern.downloaded_at.empty()) stmt.bindNull(12);
         else stmt.bindText(12, pattern.downloaded_at);
+        stmt.bindInt(13, pattern.purchased ? 1 : 0);
+        stmt.bindInt64(14, pattern.purchased_at);
+        stmt.bindText(15, pattern.receipt_id);
 
         if (stmt.step() != SQLITE_DONE) {
             ESP_LOGE(TAG, "Failed to add pattern: %s", sqlite3_errmsg(impl_->db));
@@ -519,7 +541,8 @@ esp_err_t ManifestDatabase::updatePattern(const std::string& uuid, const Pattern
     return impl_->executeOnSqliteTask([this, &uuid, &pattern]() -> esp_err_t {
         Impl::Statement stmt(impl_->db,
             "UPDATE patterns SET name=?, creator=?, date=?, popularity=?, reversible=?, "
-            "start_point=?, encrypted=?, size_bytes=? WHERE uuid=?");
+            "start_point=?, encrypted=?, size_bytes=?, purchased=?, purchased_at=?, receipt_id=? "
+            "WHERE uuid=?");
 
         stmt.bindText(1, pattern.name);
         stmt.bindText(2, pattern.creator);
@@ -529,7 +552,10 @@ esp_err_t ManifestDatabase::updatePattern(const std::string& uuid, const Pattern
         stmt.bindInt(6, pattern.start_point);
         stmt.bindInt(7, pattern.encrypted ? 1 : 0);
         stmt.bindInt64(8, pattern.size_bytes);
-        stmt.bindText(9, uuid);
+        stmt.bindInt(9, pattern.purchased ? 1 : 0);
+        stmt.bindInt64(10, pattern.purchased_at);
+        stmt.bindText(11, pattern.receipt_id);
+        stmt.bindText(12, uuid);
 
         if (stmt.step() != SQLITE_DONE) {
             ESP_LOGE(TAG, "Failed to update pattern: %s", sqlite3_errmsg(impl_->db));
@@ -598,7 +624,8 @@ std::vector<Pattern> ManifestDatabase::getAllPatterns() {
         std::vector<Pattern> patterns;
         Impl::Statement stmt(impl_->db,
             "SELECT uuid, name, creator, date, popularity, reversible, start_point, "
-            "encrypted, size_bytes, created_at, last_played_at, downloaded_at "
+            "encrypted, size_bytes, created_at, last_played_at, downloaded_at, "
+            "purchased, purchased_at, receipt_id "
             "FROM patterns ORDER BY name");
 
         while (stmt.step() == SQLITE_ROW) {
@@ -630,7 +657,8 @@ PaginatedResult<Pattern> ManifestDatabase::getPatterns(int page, int per_page) {
         // Get page of patterns
         Impl::Statement stmt(impl_->db,
             "SELECT uuid, name, creator, date, popularity, reversible, start_point, "
-            "encrypted, size_bytes, created_at, last_played_at, downloaded_at "
+            "encrypted, size_bytes, created_at, last_played_at, downloaded_at, "
+            "purchased, purchased_at, receipt_id "
             "FROM patterns ORDER BY name LIMIT ? OFFSET ?");
 
         if (!stmt.valid()) {
@@ -659,7 +687,8 @@ std::optional<Pattern> ManifestDatabase::getPattern(const std::string& uuid) {
     return impl_->executeOnSqliteTask([this, &uuid]() -> std::optional<Pattern> {
         Impl::Statement stmt(impl_->db,
             "SELECT uuid, name, creator, date, popularity, reversible, start_point, "
-            "encrypted, size_bytes, created_at, last_played_at, downloaded_at "
+            "encrypted, size_bytes, created_at, last_played_at, downloaded_at, "
+            "purchased, purchased_at, receipt_id "
             "FROM patterns WHERE uuid = ?");
         stmt.bindText(1, uuid);
 
@@ -687,6 +716,20 @@ size_t ManifestDatabase::getPatternCount() {
 
     return impl_->executeOnSqliteTask([this]() -> size_t {
         Impl::Statement stmt(impl_->db, "SELECT COUNT(*) FROM patterns");
+        if (stmt.step() == SQLITE_ROW) {
+            return stmt.columnInt(0);
+        }
+        return 0;
+        });
+}
+
+size_t ManifestDatabase::getSubscriptionPatternCount() {
+    Impl::Lock lock(impl_->mutex);
+    if (!lock.acquired()) return 0;
+
+    return impl_->executeOnSqliteTask([this]() -> size_t {
+        // Count patterns that are NOT purchased (subscription patterns only)
+        Impl::Statement stmt(impl_->db, "SELECT COUNT(*) FROM patterns WHERE purchased = 0");
         if (stmt.step() == SQLITE_ROW) {
             return stmt.columnInt(0);
         }
@@ -1204,6 +1247,14 @@ cJSON* ManifestDatabase::patternToJson(const Pattern& p) {
     if (!p.downloaded_at.empty())
         cJSON_AddStringToObject(json, "downloaded_at", p.downloaded_at.c_str());
 
+    // Ownership fields (for purchased patterns)
+    cJSON_AddBoolToObject(json, "is_owned", p.purchased);
+    if (p.purchased) {
+        cJSON_AddNumberToObject(json, "purchased_at", static_cast<double>(p.purchased_at));
+        if (!p.receipt_id.empty())
+            cJSON_AddStringToObject(json, "receipt_id", p.receipt_id.c_str());
+    }
+
     return json;
 }
 
@@ -1260,6 +1311,13 @@ Pattern ManifestDatabase::jsonToPattern(const cJSON* json) {
     p.created_at = getText("created_at");
     p.last_played_at = getText("last_played_at");
     p.downloaded_at = getText("downloaded_at");
+
+    // Ownership fields
+    p.purchased = getBool("is_owned");
+    const cJSON* purchasedAt = cJSON_GetObjectItem(json, "purchased_at");
+    p.purchased_at = (purchasedAt && cJSON_IsNumber(purchasedAt))
+        ? static_cast<int64_t>(purchasedAt->valuedouble) : 0;
+    p.receipt_id = getText("receipt_id");
 
     return p;
 }

@@ -34,3 +34,6 @@ void cloud_msg_send_license_request();
 
 // Request pattern download from cloud
 void cloud_msg_send_pattern_download_request(const char* pattern_uuid);
+
+// Request sync of all purchase receipts from cloud
+void cloud_msg_send_sync_purchases_request();

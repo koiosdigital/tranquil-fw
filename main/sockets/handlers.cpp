@@ -10,6 +10,8 @@
 #include <kd_common.h>
 
 #include "drm/drm_license.h"
+#include "drm/drm_purchase.h"
+#include "storage/ManifestDatabase.h"
 
 static const char* TAG = "cloud_handlers";
 
@@ -183,6 +185,66 @@ namespace {
         // Server will disconnect us to reconnect with new cert
     }
 
+    void handle_sync_purchases_response(Kd__V1__SyncPurchasesResponse* response) {
+        if (response == nullptr) return;
+
+        size_t count = response->n_receipts;
+        ESP_LOGI(TAG, "Received %zu purchase receipts from server", count);
+
+        size_t saved = 0;
+        size_t failed = 0;
+
+        for (size_t i = 0; i < count; i++) {
+            Kd__V1__PurchaseReceiptBundle* bundle = response->receipts[i];
+            if (!bundle || !bundle->pattern_uuid) {
+                ESP_LOGW(TAG, "Skipping receipt %zu: missing data", i);
+                failed++;
+                continue;
+            }
+
+            if (bundle->payload.data == nullptr || bundle->payload.len == 0 ||
+                bundle->signature.data == nullptr || bundle->signature.len == 0) {
+                ESP_LOGW(TAG, "Skipping receipt for %s: missing payload or signature",
+                    bundle->pattern_uuid);
+                failed++;
+                continue;
+            }
+
+            // Save the purchase receipt (this verifies signature and device binding)
+            esp_err_t err = drm_purchase_save(bundle->pattern_uuid,
+                bundle->payload.data, bundle->payload.len,
+                bundle->signature.data, bundle->signature.len);
+
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "Saved receipt for pattern: %s", bundle->pattern_uuid);
+                saved++;
+
+                // Update ManifestDatabase if this pattern exists
+                auto existing = ManifestDatabase::instance().getPattern(bundle->pattern_uuid);
+                if (existing.has_value()) {
+                    Pattern updated = existing.value();
+                    updated.purchased = true;
+
+                    // Get purchase info for timestamp and receipt_id
+                    drm_purchase_info_t info;
+                    if (drm_purchase_verify(bundle->pattern_uuid, &info) == ESP_OK) {
+                        updated.purchased_at = info.purchased_at;
+                        updated.receipt_id = info.receipt_id;
+                    }
+
+                    ManifestDatabase::instance().updatePattern(bundle->pattern_uuid, updated);
+                    ESP_LOGD(TAG, "Updated manifest for pattern: %s", bundle->pattern_uuid);
+                }
+            } else {
+                ESP_LOGW(TAG, "Failed to save receipt for %s: %s",
+                    bundle->pattern_uuid, esp_err_to_name(err));
+                failed++;
+            }
+        }
+
+        ESP_LOGI(TAG, "Purchase sync complete: %zu saved, %zu failed", saved, failed);
+    }
+
 }  // namespace
 
 void cloud_handle_message(Kd__V1__TranquilMessage* message) {
@@ -208,6 +270,10 @@ void cloud_handle_message(Kd__V1__TranquilMessage* message) {
 
     case KD__V1__TRANQUIL_MESSAGE__MESSAGE_CERT_RENEW_RESPONSE:
         handle_cert_renew_response(message->cert_renew_response);
+        return;
+
+    case KD__V1__TRANQUIL_MESSAGE__MESSAGE_SYNC_PURCHASES_RESPONSE:
+        handle_sync_purchases_response(message->sync_purchases_response);
         return;
 
     default:

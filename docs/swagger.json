@@ -1,0 +1,954 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Tranquil Sand Table API",
+    "description": "REST API for controlling the Tranquil kinetic sand table device. For real-time updates, connect to the WebSocket API at `/ws` (see asyncapi.yaml).",
+    "version": "1.0.0",
+    "contact": {
+      "name": "Koios Design"
+    }
+  },
+  "servers": [
+    {
+      "url": "http://{host}",
+      "description": "Local device",
+      "variables": {
+        "host": {
+          "default": "tranquil.local",
+          "description": "Device hostname or IP address"
+        }
+      }
+    }
+  ],
+  "tags": [
+    { "name": "Player", "description": "Playback control" },
+    { "name": "Patterns", "description": "Pattern management" },
+    { "name": "Playlists", "description": "Playlist management" },
+    { "name": "License", "description": "DRM license information" },
+    { "name": "System", "description": "Device information and system configuration" },
+    { "name": "LED", "description": "LED lighting control" }
+  ],
+  "paths": {
+    "/api/player": {
+      "get": {
+        "tags": ["Player"],
+        "summary": "Get player state",
+        "description": "Returns the current playback state including pattern, playlist, progress, and settings.",
+        "operationId": "getPlayerState",
+        "responses": {
+          "200": {
+            "description": "Current player state",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PlayerState" }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": ["Player"],
+        "summary": "Update player state",
+        "description": "Partially update player settings. All fields are optional. Setting pattern_uuid or playlist_uuid starts new playback.",
+        "operationId": "patchPlayerState",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/PlayerPatchRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated player state",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PlayerState" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/player/play": {
+      "post": {
+        "tags": ["Player"],
+        "summary": "Start playback",
+        "description": "Start playing a pattern or playlist. Provide either pattern_uuid (single pattern) or playlist_uuid (with optional shuffle/loop).",
+        "operationId": "play",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/PlayRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Playback started, returns player state",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PlayerState" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/player/stop": {
+      "post": {
+        "tags": ["Player"],
+        "summary": "Stop playback",
+        "description": "Stop current playback. Use emergency_stop=true for immediate halt without deceleration.",
+        "operationId": "stop",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/StopRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Playback stopped, returns player state",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PlayerState" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/player/skip": {
+      "post": {
+        "tags": ["Player"],
+        "summary": "Skip to next pattern",
+        "description": "Skip to the next pattern in the current playlist. Only works in playlist mode.",
+        "operationId": "skip",
+        "responses": {
+          "200": {
+            "description": "Skipped to next pattern, returns player state",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PlayerState" }
+              }
+            }
+          },
+          "400": {
+            "description": "Not in playlist mode"
+          }
+        }
+      }
+    },
+    "/api/patterns": {
+      "get": {
+        "tags": ["Patterns"],
+        "summary": "List patterns",
+        "description": "Get a paginated list of all downloaded patterns.",
+        "operationId": "listPatterns",
+        "parameters": [
+          { "$ref": "#/components/parameters/page" },
+          { "$ref": "#/components/parameters/per_page" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Paginated list of patterns",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PatternsListResponse" }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": ["Patterns"],
+        "summary": "Upload pattern",
+        "description": "Upload a new pattern file (.thr format). The pattern will be converted to binary format and a thumbnail generated. Progress is broadcast via WebSocket.",
+        "operationId": "uploadPattern",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "Pattern file (.thr)"
+                  }
+                },
+                "required": ["file"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Upload accepted, processing started",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PatternUploadResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" }
+        }
+      }
+    },
+    "/api/patterns/{uuid}": {
+      "get": {
+        "tags": ["Patterns"],
+        "summary": "Get pattern details",
+        "description": "Get metadata for a specific pattern.",
+        "operationId": "getPattern",
+        "parameters": [
+          { "$ref": "#/components/parameters/uuid" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Pattern details",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Pattern" }
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "delete": {
+        "tags": ["Patterns"],
+        "summary": "Delete pattern",
+        "description": "Delete a pattern and its associated files.",
+        "operationId": "deletePattern",
+        "parameters": [
+          { "$ref": "#/components/parameters/uuid" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Pattern deleted",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/CommandResult" }
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/pattern_download/{uuid}": {
+      "get": {
+        "tags": ["Patterns"],
+        "summary": "Download pattern file",
+        "description": "Download the binary pattern file. Only available for unencrypted patterns.",
+        "operationId": "downloadPattern",
+        "parameters": [
+          { "$ref": "#/components/parameters/uuid" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Pattern file",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "403": { "description": "Pattern is encrypted" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/pattern_thumbs/{uuid}.png": {
+      "get": {
+        "tags": ["Patterns"],
+        "summary": "Get pattern thumbnail",
+        "description": "Get the PNG thumbnail preview of a pattern.",
+        "operationId": "getPatternThumbnail",
+        "parameters": [
+          {
+            "name": "uuid",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "Pattern UUID (without .png extension)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Thumbnail image",
+            "content": {
+              "image/png": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/playlists": {
+      "get": {
+        "tags": ["Playlists"],
+        "summary": "List playlists",
+        "description": "Get a paginated list of all playlists.",
+        "operationId": "listPlaylists",
+        "parameters": [
+          { "$ref": "#/components/parameters/page" },
+          { "$ref": "#/components/parameters/per_page" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Paginated list of playlists",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PlaylistsListResponse" }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": ["Playlists"],
+        "summary": "Create playlist",
+        "description": "Create a new playlist.",
+        "operationId": "createPlaylist",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreatePlaylistRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Playlist created",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Playlist" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" }
+        }
+      }
+    },
+    "/api/playlists/{uuid}": {
+      "get": {
+        "tags": ["Playlists"],
+        "summary": "Get playlist details",
+        "description": "Get details for a specific playlist.",
+        "operationId": "getPlaylist",
+        "parameters": [
+          { "$ref": "#/components/parameters/uuid" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Playlist details",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Playlist" }
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "post": {
+        "tags": ["Playlists"],
+        "summary": "Modify playlist",
+        "description": "Add or remove patterns from a playlist.",
+        "operationId": "modifyPlaylist",
+        "parameters": [
+          { "$ref": "#/components/parameters/uuid" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ModifyPlaylistRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Playlist modified",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Playlist" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "delete": {
+        "tags": ["Playlists"],
+        "summary": "Delete playlist",
+        "description": "Delete a playlist.",
+        "operationId": "deletePlaylist",
+        "parameters": [
+          { "$ref": "#/components/parameters/uuid" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Playlist deleted",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/CommandResult" }
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/playlists/{uuid}/order": {
+      "post": {
+        "tags": ["Playlists"],
+        "summary": "Reorder playlist patterns",
+        "description": "Set the order of patterns in a playlist.",
+        "operationId": "reorderPlaylist",
+        "parameters": [
+          { "$ref": "#/components/parameters/uuid" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ReorderPlaylistRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Playlist reordered",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Playlist" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/license/store-token": {
+      "get": {
+        "tags": ["License"],
+        "summary": "Get store token",
+        "description": "Get the JWT store token from the device's DRM license. Used for authenticating with the pattern store.",
+        "operationId": "getStoreToken",
+        "responses": {
+          "200": {
+            "description": "Store token retrieved",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/StoreTokenResponse" }
+              }
+            }
+          },
+          "403": {
+            "description": "No valid license",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/StoreTokenResponse" }
+              }
+            }
+          },
+          "404": {
+            "description": "No store token in license",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/StoreTokenResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/about": {
+      "get": {
+        "tags": ["System"],
+        "summary": "Get device information",
+        "description": "Returns basic device information including model, type, and firmware version.",
+        "operationId": "getAbout",
+        "responses": {
+          "200": {
+            "description": "Device information",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AboutResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/system/config": {
+      "get": {
+        "tags": ["System"],
+        "summary": "Get system configuration",
+        "description": "Returns current system configuration including timezone, NTP server, and hostname settings.",
+        "operationId": "getSystemConfig",
+        "responses": {
+          "200": {
+            "description": "System configuration",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SystemConfig" }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": ["System"],
+        "summary": "Update system configuration",
+        "description": "Update system configuration settings. All fields are optional.",
+        "operationId": "setSystemConfig",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/SystemConfigUpdate" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Configuration updated",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SystemConfig" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" }
+        }
+      }
+    },
+    "/api/time/zonedb": {
+      "get": {
+        "tags": ["System"],
+        "summary": "Get timezone database",
+        "description": "Returns the list of available timezones with their POSIX rules.",
+        "operationId": "getTimezoneDatabase",
+        "responses": {
+          "200": {
+            "description": "List of timezones",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TimezoneListResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/led/effects": {
+      "get": {
+        "tags": ["LED"],
+        "summary": "List LED effects",
+        "description": "Returns the list of available LED effects.",
+        "operationId": "getLEDEffects",
+        "responses": {
+          "200": {
+            "description": "List of effects",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/LEDEffectsListResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/led/config": {
+      "get": {
+        "tags": ["LED"],
+        "summary": "Get LED configuration",
+        "description": "Returns the LED system configuration including version and channel information.",
+        "operationId": "getLEDConfig",
+        "responses": {
+          "200": {
+            "description": "LED configuration",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/LEDConfigResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/led/channel/{index}": {
+      "get": {
+        "tags": ["LED"],
+        "summary": "Get LED channel state",
+        "description": "Returns the current state of a specific LED channel.",
+        "operationId": "getLEDChannel",
+        "parameters": [
+          {
+            "name": "index",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "integer", "minimum": 0 },
+            "description": "Channel index (0-based)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Channel state",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/LEDChannelState" }
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "post": {
+        "tags": ["LED"],
+        "summary": "Update LED channel state",
+        "description": "Update the state of a specific LED channel. All fields are optional.",
+        "operationId": "setLEDChannel",
+        "parameters": [
+          {
+            "name": "index",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "integer", "minimum": 0 },
+            "description": "Channel index (0-based)"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/LEDChannelUpdate" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Channel updated",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/LEDChannelState" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "uuid": {
+        "name": "uuid",
+        "in": "path",
+        "required": true,
+        "schema": { "type": "string" },
+        "description": "Resource UUID"
+      },
+      "page": {
+        "name": "page",
+        "in": "query",
+        "schema": { "type": "integer", "default": 0, "minimum": 0 },
+        "description": "Page number (0-indexed)"
+      },
+      "per_page": {
+        "name": "per_page",
+        "in": "query",
+        "schema": { "type": "integer", "default": 20, "minimum": 1, "maximum": 100 },
+        "description": "Items per page"
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Invalid request",
+        "content": {
+          "text/plain": {
+            "schema": { "type": "string" }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "Resource not found",
+        "content": {
+          "text/plain": {
+            "schema": { "type": "string" }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "PlayerState": {
+        "type": "object",
+        "properties": {
+          "state": { "type": "string", "enum": ["STOPPED", "PLAYING", "PAUSED"] },
+          "mode": { "type": "string", "enum": ["SINGLE_PATTERN", "PLAYLIST", "PLAYLIST_LOOP", "PLAYLIST_SHUFFLE"] },
+          "current_pattern_uuid": { "type": "string" },
+          "current_playlist_uuid": { "type": "string" },
+          "progress_percent": { "type": "integer", "minimum": 0, "maximum": 100 },
+          "pattern_index": { "type": "integer" },
+          "playlist_size": { "type": "integer" },
+          "feed_rate": { "type": "number" },
+          "shuffle": { "type": "boolean" },
+          "loop": { "type": "boolean" }
+        }
+      },
+      "PlayerPatchRequest": {
+        "type": "object",
+        "properties": {
+          "is_paused": { "type": "boolean", "description": "Pause or resume playback" },
+          "loop": { "type": "boolean", "description": "Enable/disable loop mode" },
+          "shuffle": { "type": "boolean", "description": "Enable/disable shuffle mode" },
+          "feed_rate": { "type": "number", "description": "Set feed rate (RPM)" },
+          "pattern_uuid": { "type": "string", "description": "Start playing this pattern" },
+          "playlist_uuid": { "type": "string", "description": "Start playing this playlist" }
+        }
+      },
+      "PlayRequest": {
+        "type": "object",
+        "properties": {
+          "pattern_uuid": { "type": "string", "description": "Pattern to play (single pattern mode)" },
+          "playlist_uuid": { "type": "string", "description": "Playlist to play" },
+          "shuffle": { "type": "boolean", "default": false },
+          "loop": { "type": "boolean", "default": false }
+        },
+        "description": "Provide either pattern_uuid OR playlist_uuid. If both provided, starts playlist from the specified pattern."
+      },
+      "StopRequest": {
+        "type": "object",
+        "properties": {
+          "emergency_stop": { "type": "boolean", "default": false, "description": "Immediate halt without deceleration" }
+        }
+      },
+      "Pattern": {
+        "type": "object",
+        "properties": {
+          "uuid": { "type": "string" },
+          "name": { "type": "string" },
+          "creator": { "type": "string" },
+          "encrypted": { "type": "boolean" },
+          "size_bytes": { "type": "integer" },
+          "reversible": { "type": "boolean" },
+          "start_point": { "type": "integer", "description": "0=center, 1=edge" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "last_played_at": { "type": "string", "format": "date-time" },
+          "download_url": { "type": "string", "description": "URL to download pattern (empty if encrypted)" },
+          "thumb_url": { "type": "string", "description": "URL to pattern thumbnail" }
+        }
+      },
+      "PatternsListResponse": {
+        "type": "object",
+        "properties": {
+          "pagination": { "$ref": "#/components/schemas/Pagination" },
+          "patterns": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Pattern" }
+          }
+        }
+      },
+      "PatternUploadResponse": {
+        "type": "object",
+        "properties": {
+          "uuid": { "type": "string" },
+          "name": { "type": "string" },
+          "status": { "type": "string", "enum": ["processing"] }
+        }
+      },
+      "Playlist": {
+        "type": "object",
+        "properties": {
+          "uuid": { "type": "string" },
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "pattern_uuids": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "featured_pattern": { "type": "string" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "updated_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "PlaylistsListResponse": {
+        "type": "object",
+        "properties": {
+          "pagination": { "$ref": "#/components/schemas/Pagination" },
+          "playlists": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Playlist" }
+          }
+        }
+      },
+      "CreatePlaylistRequest": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "pattern_uuids": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      },
+      "ModifyPlaylistRequest": {
+        "type": "object",
+        "properties": {
+          "action": { "type": "string", "enum": ["add", "remove"] },
+          "pattern_uuid": { "type": "string" }
+        }
+      },
+      "ReorderPlaylistRequest": {
+        "type": "object",
+        "required": ["pattern_uuids"],
+        "properties": {
+          "pattern_uuids": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Ordered list of pattern UUIDs"
+          }
+        }
+      },
+      "Pagination": {
+        "type": "object",
+        "properties": {
+          "page": { "type": "integer" },
+          "per_page": { "type": "integer" },
+          "total_pages": { "type": "integer" },
+          "total_items": { "type": "integer" }
+        }
+      },
+      "CommandResult": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "error_code": { "type": "integer" },
+          "detail": { "type": "string" }
+        }
+      },
+      "StoreTokenResponse": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "store_token": { "type": "string", "description": "JWT token for store authentication" },
+          "error": { "type": "string" }
+        }
+      },
+      "AboutResponse": {
+        "type": "object",
+        "properties": {
+          "model": { "type": "string", "description": "Device model name" },
+          "type": { "type": "string", "description": "Device type identifier" },
+          "version": { "type": "string", "description": "Firmware version" }
+        }
+      },
+      "SystemConfig": {
+        "type": "object",
+        "properties": {
+          "auto_timezone": { "type": "boolean", "description": "Whether timezone is automatically detected" },
+          "timezone": { "type": "string", "description": "Current timezone name (e.g., 'America/New_York')" },
+          "ntp_server": { "type": "string", "description": "NTP server address" },
+          "wifi_hostname": { "type": "string", "description": "Device hostname on WiFi network" }
+        }
+      },
+      "SystemConfigUpdate": {
+        "type": "object",
+        "properties": {
+          "auto_timezone": { "type": "boolean", "description": "Enable/disable automatic timezone detection" },
+          "timezone": { "type": "string", "description": "Timezone name to set" },
+          "ntp_server": { "type": "string", "description": "NTP server address to use" },
+          "wifi_hostname": { "type": "string", "description": "Device hostname to set" }
+        }
+      },
+      "TimezoneEntry": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "description": "Timezone name (e.g., 'America/New_York')" },
+          "rule": { "type": "string", "description": "POSIX timezone rule string" }
+        }
+      },
+      "TimezoneListResponse": {
+        "type": "array",
+        "items": { "$ref": "#/components/schemas/TimezoneEntry" }
+      },
+      "LEDEffect": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "description": "Effect display name" },
+          "id": { "type": "integer", "description": "Effect ID" }
+        }
+      },
+      "LEDEffectsListResponse": {
+        "type": "array",
+        "items": { "$ref": "#/components/schemas/LEDEffect" }
+      },
+      "LEDChannelInfo": {
+        "type": "object",
+        "properties": {
+          "index": { "type": "integer", "description": "Channel index" },
+          "num_leds": { "type": "integer", "description": "Number of LEDs in this channel" },
+          "type": { "type": "string", "description": "LED strip type" }
+        }
+      },
+      "LEDConfigResponse": {
+        "type": "object",
+        "properties": {
+          "version": { "type": "string", "description": "LED driver version" },
+          "channels": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/LEDChannelInfo" }
+          }
+        }
+      },
+      "LEDChannelState": {
+        "type": "object",
+        "properties": {
+          "effect_id": { "type": "integer", "description": "Current effect ID" },
+          "brightness": { "type": "integer", "minimum": 0, "maximum": 255, "description": "Brightness level (0-255)" },
+          "speed": { "type": "integer", "description": "Effect animation speed" },
+          "on": { "type": "boolean", "description": "Whether channel is on" },
+          "color": { "type": "string", "description": "RGB color in hex format (e.g., '#FF0000')" }
+        }
+      },
+      "LEDChannelUpdate": {
+        "type": "object",
+        "properties": {
+          "effect_id": { "type": "integer", "description": "Effect ID to set" },
+          "brightness": { "type": "integer", "minimum": 0, "maximum": 255, "description": "Brightness level (0-255)" },
+          "speed": { "type": "integer", "description": "Effect animation speed" },
+          "on": { "type": "boolean", "description": "Turn channel on/off" },
+          "color": { "type": "string", "description": "RGB color in hex format (e.g., '#FF0000')" }
+        }
+      }
+    }
+  }
+}

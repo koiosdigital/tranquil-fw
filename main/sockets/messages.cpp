@@ -274,3 +274,14 @@ void cloud_msg_send_pattern_download_request(const char* pattern_uuid) {
     cloud_msg_queue(&msg);
     ESP_LOGI(TAG, "Sent pattern download request for %s", pattern_uuid);
 }
+
+void cloud_msg_send_sync_purchases_request() {
+    Kd__V1__SyncPurchasesRequest req = KD__V1__SYNC_PURCHASES_REQUEST__INIT;
+
+    Kd__V1__TranquilMessage msg = KD__V1__TRANQUIL_MESSAGE__INIT;
+    msg.message_case = KD__V1__TRANQUIL_MESSAGE__MESSAGE_SYNC_PURCHASES_REQUEST;
+    msg.sync_purchases_request = &req;
+
+    cloud_msg_queue(&msg);
+    ESP_LOGI(TAG, "Sent sync purchases request");
+}

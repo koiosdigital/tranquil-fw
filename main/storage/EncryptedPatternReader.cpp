@@ -1,6 +1,7 @@
 #include "EncryptedPatternReader.h"
 #include "drm/drm_crypto.h"
 #include "drm/drm_license.h"
+#include "drm/drm_purchase.h"
 
 #include <esp_log.h>
 #include <mbedtls/aes.h>
@@ -52,6 +53,25 @@ esp_err_t EncryptedPatternReader::open(const char* uuid) {
         close();
     }
 
+    // Check authorization: purchase receipt OR valid subscription
+    bool authorized = false;
+
+    // First, check for purchase receipt (permanent ownership)
+    if (drm_purchase_is_valid(uuid)) {
+        ESP_LOGI(TAG, "Pattern authorized via purchase receipt: %s", uuid);
+        authorized = true;
+    }
+    // Fall back to subscription license
+    else if (drm_license_is_valid()) {
+        ESP_LOGI(TAG, "Pattern authorized via subscription: %s", uuid);
+        authorized = true;
+    }
+
+    if (!authorized) {
+        ESP_LOGE(TAG, "Cannot decrypt pattern: no valid authorization");
+        return ESP_ERR_NOT_ALLOWED;
+    }
+
     char file_path[256];
     getFilePath(uuid, file_path, sizeof(file_path));
 
@@ -59,12 +79,7 @@ esp_err_t EncryptedPatternReader::open(const char* uuid) {
 }
 
 esp_err_t EncryptedPatternReader::openFile(const char* path) {
-    // Verify DRM license before attempting decryption
-    if (!drm_license_is_valid()) {
-        ESP_LOGE(TAG, "Cannot decrypt pattern: no valid DRM license");
-        return ESP_ERR_NOT_ALLOWED;
-    }
-
+    // Authorization already checked in open() - openFile is internal only
     file_ = fopen(path, "rb");
     if (file_ == nullptr) {
         ESP_LOGE(TAG, "Failed to open encrypted pattern: %s", path);

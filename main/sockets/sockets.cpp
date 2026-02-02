@@ -189,6 +189,7 @@ namespace {
             cloud_msg_send_device_info();
             cloud_msg_send_cert_report();
             cloud_msg_send_license_request();
+            cloud_msg_send_sync_purchases_request();
             start_queue_timer();
             break;
 

@@ -31,6 +31,11 @@ struct Pattern {
     std::string created_at;
     std::string last_played_at;
     std::string downloaded_at;
+
+    // Purchase/ownership metadata (for encrypted patterns)
+    bool purchased = false;       // True if owned via purchase receipt
+    int64_t purchased_at = 0;     // Unix timestamp, 0 if not owned
+    std::string receipt_id;       // Receipt ID for support, empty if not owned
 };
 
 // Playlist metadata
@@ -81,6 +86,7 @@ public:
     std::optional<Pattern> getPattern(const std::string& uuid);
     bool patternExists(const std::string& uuid);
     size_t getPatternCount();
+    size_t getSubscriptionPatternCount();  // Count patterns where purchased=false
 
     // Pattern-specific updates
     esp_err_t updateLastPlayed(const std::string& uuid);

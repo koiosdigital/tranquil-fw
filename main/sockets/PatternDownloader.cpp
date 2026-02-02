@@ -4,10 +4,12 @@
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
+#include <mbedtls/base64.h>
 
 #include <unordered_map>
 
 #include "drm/drm_license.h"
+#include "drm/drm_purchase.h"
 #include "storage/jobs/job_queue.h"
 #include "storage/jobs/job_types.h"
 
@@ -74,19 +76,28 @@ public:
             return {DownloadStatus::InvalidResponse, "", "Invalid download response"};
         }
 
-        // Check license
-        if (!drm_license_is_valid()) {
-            drm_license_status_t status = drm_license_get_status();
-            return {DownloadStatus::LicenseInvalid, response->pattern_uuid,
-                    "License invalid: " + std::to_string(static_cast<int>(status))};
-        }
-
-        if (!drm_license_can_download()) {
-            return {DownloadStatus::PatternLimitReached, response->pattern_uuid,
-                    "Pattern download limit reached"};
-        }
-
         std::string pattern_uuid = response->pattern_uuid;
+
+        // Check if this is a purchased pattern (has receipt)
+        bool has_receipt = response->purchase_receipt_payload.data &&
+                           response->purchase_receipt_payload.len > 0 &&
+                           response->purchase_receipt_signature.data &&
+                           response->purchase_receipt_signature.len > 0;
+
+        // For subscription patterns, check license validity and limits
+        // For purchased patterns, we can download regardless of subscription status
+        if (!has_receipt) {
+            if (!drm_license_is_valid()) {
+                drm_license_status_t status = drm_license_get_status();
+                return {DownloadStatus::LicenseInvalid, pattern_uuid,
+                        "License invalid: " + std::to_string(static_cast<int>(status))};
+            }
+
+            if (!drm_license_can_download()) {
+                return {DownloadStatus::PatternLimitReached, pattern_uuid,
+                        "Pattern download limit reached"};
+            }
+        }
 
         // Check if download job already exists
         if (jobs::JobQueue::instance().hasJob(pattern_uuid, jobs::JobType::Download)) {
@@ -105,6 +116,33 @@ public:
             data.reversible = response->pattern->reversible;
             data.start_point = response->pattern->start_point;
             data.created_at = response->pattern->created_at ? response->pattern->created_at : "";
+        }
+
+        // Check for purchase receipt in response
+        if (response->purchase_receipt_payload.data && response->purchase_receipt_payload.len > 0 &&
+            response->purchase_receipt_signature.data && response->purchase_receipt_signature.len > 0) {
+
+            ESP_LOGI(TAG, "Pattern %s includes purchase receipt", pattern_uuid.c_str());
+
+            // Base64 encode the receipt payload
+            size_t payload_b64_len = 0;
+            mbedtls_base64_encode(nullptr, 0, &payload_b64_len,
+                response->purchase_receipt_payload.data, response->purchase_receipt_payload.len);
+            std::string payload_b64(payload_b64_len, '\0');
+            mbedtls_base64_encode(reinterpret_cast<unsigned char*>(payload_b64.data()), payload_b64.size(), &payload_b64_len,
+                response->purchase_receipt_payload.data, response->purchase_receipt_payload.len);
+            payload_b64.resize(payload_b64_len);
+            data.receipt_payload_b64 = std::move(payload_b64);
+
+            // Base64 encode the receipt signature
+            size_t sig_b64_len = 0;
+            mbedtls_base64_encode(nullptr, 0, &sig_b64_len,
+                response->purchase_receipt_signature.data, response->purchase_receipt_signature.len);
+            std::string sig_b64(sig_b64_len, '\0');
+            mbedtls_base64_encode(reinterpret_cast<unsigned char*>(sig_b64.data()), sig_b64.size(), &sig_b64_len,
+                response->purchase_receipt_signature.data, response->purchase_receipt_signature.len);
+            sig_b64.resize(sig_b64_len);
+            data.receipt_signature_b64 = std::move(sig_b64);
         }
 
         // Store callback for completion notification
