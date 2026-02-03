@@ -63,7 +63,7 @@ public:
 
             if (!executor) {
                 ESP_LOGE(TAG, "No executor for job type: %s", jobTypeToString(job->type));
-                JobQueue::instance().markFailed(job->uuid, "No executor registered");
+                JobQueue::instance().markFailed(job->id, "No executor registered");
                 continue;
             }
 
@@ -74,10 +74,10 @@ public:
             if (xTaskCreate(workerTaskFunction, "job_worker",
                            config.worker_stack_size, ctx,
                            config.worker_priority, nullptr) != pdPASS) {
-                ESP_LOGE(TAG, "Failed to create worker task for job: %s", job->uuid.c_str());
+                ESP_LOGE(TAG, "Failed to create worker task for job ID: %u", job->id);
                 activeJobs--;
                 delete ctx;
-                JobQueue::instance().markFailed(job->uuid, "Failed to create worker task");
+                JobQueue::instance().markFailed(job->id, "Failed to create worker task");
             }
         }
     }
@@ -85,19 +85,19 @@ public:
     static void workerTaskFunction(void* param) {
         auto* ctx = static_cast<WorkerContext*>(param);
 
-        ESP_LOGD(TAG, "Worker started for job: %s (type=%s)",
-            ctx->job.uuid.c_str(), jobTypeToString(ctx->job.type));
+        ESP_LOGD(TAG, "Worker started for job ID: %u (type=%s)",
+            ctx->job.id, jobTypeToString(ctx->job.type));
 
         // Execute the job
         JobResult result = ctx->executor->execute(ctx->job);
 
         // Update job status
         if (result.success) {
-            JobQueue::instance().markCompleted(ctx->job.uuid);
-            ESP_LOGD(TAG, "Job completed: %s", ctx->job.uuid.c_str());
+            JobQueue::instance().markCompleted(ctx->job.id);
+            ESP_LOGD(TAG, "Job completed: %u", ctx->job.id);
         } else {
-            JobQueue::instance().markFailed(ctx->job.uuid, result.error);
-            ESP_LOGW(TAG, "Job failed: %s - %s", ctx->job.uuid.c_str(), result.error.c_str());
+            JobQueue::instance().markFailed(ctx->job.id, result.error);
+            ESP_LOGW(TAG, "Job failed: %u - %s", ctx->job.id, result.error.c_str());
         }
 
         // Decrement active count and trigger next job processing

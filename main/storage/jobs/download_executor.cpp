@@ -121,7 +121,8 @@ JobResult DownloadExecutor::execute(const Job& job) {
         return JobResult::fail("Missing download URL");
     }
 
-    return performDownload(job.pattern_uuid, data);
+    // Download jobs use pattern_external_uuid (pattern doesn't exist yet)
+    return performDownload(job.pattern_external_uuid, data);
 }
 
 JobResult DownloadExecutor::performDownload(const std::string& pattern_uuid,
@@ -229,7 +230,8 @@ JobResult DownloadExecutor::performDownload(const std::string& pattern_uuid,
 
     // Build pattern info for database
     Pattern pattern_info;
-    pattern_info.uuid = pattern_uuid;
+    pattern_info.id = 0;  // Will be assigned by TQDB
+    pattern_info.external_uuid = pattern_uuid;  // Server UUID for linking
     pattern_info.name = data.pattern_name;
     pattern_info.creator = data.pattern_creator;
     pattern_info.encrypted = data.encrypted;
@@ -297,11 +299,19 @@ JobResult DownloadExecutor::performDownload(const std::string& pattern_uuid,
         return JobResult::fail("Failed to add to manifest");
     }
 
-    // Enqueue thumbnail generation job
+    // Get the newly created pattern's internal ID for thumbnail job
+    auto created_pattern = ManifestDatabase::instance().getPatternByExternalUuid(pattern_uuid);
+    if (!created_pattern) {
+        ESP_LOGE(TAG, "Failed to find newly created pattern");
+        remove(file_path);
+        return JobResult::fail("Failed to find created pattern");
+    }
+
+    // Enqueue thumbnail generation job using internal ID
     ThumbnailJobData thumb_data;
     thumb_data.encrypted = data.encrypted;
     thumb_data.output_path = "/sd/previews/" + pattern_uuid + ".png";
-    JobQueue::instance().enqueueThumbnail(pattern_uuid, thumb_data, -1);
+    JobQueue::instance().enqueueThumbnail(created_pattern->id, thumb_data, -1);
 
     ESP_LOGD(TAG, "Download complete: %s -> %s", pattern_uuid.c_str(), file_path);
     return JobResult::ok();

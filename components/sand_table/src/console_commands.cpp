@@ -49,21 +49,21 @@ static int cmd_home(int argc, char** argv) {
     }
 
     if (!s_controller) {
-        console_out("{\"error\":true,\"message\":\"Motion controller not initialized\"}\n");
+        printf("{\"error\":true,\"message\":\"Motion controller not initialized\"}\n");
         return 1;
     }
 
     bool force_full = (home_args.full->count > 0);
-    console_out("Starting %s homing...\n", force_full ? "full" : "quick");
+    printf("Starting %s homing...\n", force_full ? "full" : "quick");
 
     auto result = s_controller->home(force_full);
 
     if (result.is_err()) {
-        console_out("{\"error\":true,\"message\":\"Homing failed\"}\n");
+        printf("{\"error\":true,\"message\":\"Homing failed\"}\n");
         return 1;
     }
 
-    console_out("{\"error\":false,\"message\":\"Homing complete\"}\n");
+    printf("{\"error\":false,\"message\":\"Homing complete\"}\n");
     return 0;
 }
 
@@ -82,12 +82,12 @@ static void register_home() {
 // --- stop ---
 static int cmd_stop(int argc, char** argv) {
     if (!s_controller) {
-        console_out("{\"error\":true,\"message\":\"Motion controller not initialized\"}\n");
+        printf("{\"error\":true,\"message\":\"Motion controller not initialized\"}\n");
         return 1;
     }
 
     s_controller->emergency_stop();
-    console_out("{\"error\":false,\"message\":\"Emergency stop triggered\"}\n");
+    printf("{\"error\":false,\"message\":\"Emergency stop triggered\"}\n");
     return 0;
 }
 
@@ -98,20 +98,20 @@ static void register_stop() {
 // --- pos ---
 static int cmd_pos(int argc, char** argv) {
     if (!s_controller) {
-        console_out("{\"error\":true,\"message\":\"Motion controller not initialized\"}\n");
+        printf("{\"error\":true,\"message\":\"Motion controller not initialized\"}\n");
         return 1;
     }
 
     auto pos = s_controller->get_position();
     auto status = s_controller->get_status();
 
-    console_out("{\n");
-    console_out("  \"theta_rad\": %.4f,\n", pos.theta);
-    console_out("  \"rho_norm\": %.4f,\n", pos.rho);
-    console_out("  \"theta_steps\": %" PRId32 ",\n", status.theta.position_steps);
-    console_out("  \"rho_steps\": %" PRId32 ",\n", status.rho.position_steps);
-    console_out("  \"error\": false\n");
-    console_out("}\n");
+    printf("{\n");
+    printf("  \"theta_rad\": %.4f,\n", pos.theta);
+    printf("  \"rho_norm\": %.4f,\n", pos.rho);
+    printf("  \"theta_steps\": %" PRId32 ",\n", status.theta.position_steps);
+    printf("  \"rho_steps\": %" PRId32 ",\n", status.rho.position_steps);
+    printf("  \"error\": false\n");
+    printf("}\n");
     return 0;
 }
 
@@ -122,21 +122,21 @@ static void register_pos() {
 // --- status ---
 static int cmd_status(int argc, char** argv) {
     if (!s_controller) {
-        console_out("{\"error\":true,\"message\":\"Motion controller not initialized\"}\n");
+        printf("{\"error\":true,\"message\":\"Motion controller not initialized\"}\n");
         return 1;
     }
 
     auto status = s_controller->get_status();
 
-    console_out("{\n");
-    console_out("  \"state\": \"%s\",\n", state_to_string(status.state));
-    console_out("  \"is_homed\": %s,\n", status.is_homed ? "true" : "false");
-    console_out("  \"queue_depth\": %zu,\n", status.queue_depth);
-    console_out("  \"queue_capacity\": %zu,\n", status.queue_capacity);
-    console_out("  \"theta_enabled\": %s,\n", status.theta.is_enabled ? "true" : "false");
-    console_out("  \"rho_enabled\": %s,\n", status.rho.is_enabled ? "true" : "false");
-    console_out("  \"error\": false\n");
-    console_out("}\n");
+    printf("{\n");
+    printf("  \"state\": \"%s\",\n", state_to_string(status.state));
+    printf("  \"is_homed\": %s,\n", status.is_homed ? "true" : "false");
+    printf("  \"queue_depth\": %zu,\n", status.queue_depth);
+    printf("  \"queue_capacity\": %zu,\n", status.queue_capacity);
+    printf("  \"theta_enabled\": %s,\n", status.theta.is_enabled ? "true" : "false");
+    printf("  \"rho_enabled\": %s,\n", status.rho.is_enabled ? "true" : "false");
+    printf("  \"error\": false\n");
+    printf("}\n");
     return 0;
 }
 
@@ -163,7 +163,7 @@ static int cmd_set_rho_sgthrs(int argc, char** argv) {
 
     int val = set_sgthrs_args.threshold->ival[0];
     if (val < 0 || val > 255) {
-        console_out("{\"error\":true,\"message\":\"Threshold must be 0-255\"}\n");
+        printf("{\"error\":true,\"message\":\"Threshold must be 0-255\"}\n");
         return 1;
     }
 
@@ -173,11 +173,11 @@ static int cmd_set_rho_sgthrs(int argc, char** argv) {
 
     esp_err_t err = cfg.set_motion_config(motion);
     if (err != ESP_OK) {
-        console_out("{\"error\":true,\"message\":\"Failed to save config\"}\n");
+        printf("{\"error\":true,\"message\":\"Failed to save config\"}\n");
         return 1;
     }
 
-    console_out("{\"error\":false,\"stallguard_threshold\":%d}\n", val);
+    printf("{\"error\":false,\"stallguard_threshold\":%d}\n", val);
     return 0;
 }
 
@@ -208,7 +208,7 @@ static int cmd_set_theta_gear_ratio(int argc, char** argv) {
 
     double ratio = set_gear_args.ratio->dval[0];
     if (ratio < 1.0 || ratio > 100.0) {
-        console_out("{\"error\":true,\"message\":\"Ratio must be 1.0-100.0\"}\n");
+        printf("{\"error\":true,\"message\":\"Ratio must be 1.0-100.0\"}\n");
         return 1;
     }
 
@@ -220,11 +220,11 @@ static int cmd_set_theta_gear_ratio(int argc, char** argv) {
 
     esp_err_t err = cfg.set_motion_config(motion);
     if (err != ESP_OK) {
-        console_out("{\"error\":true,\"message\":\"Failed to save config\"}\n");
+        printf("{\"error\":true,\"message\":\"Failed to save config\"}\n");
         return 1;
     }
 
-    console_out("{\"error\":false,\"theta_gear_ratio\":%.2f,\"note\":\"Recalibration recommended\"}\n",
+    printf("{\"error\":false,\"theta_gear_ratio\":%.2f,\"note\":\"Recalibration recommended\"}\n",
                 ratio_x100 / 100.0);
     return 0;
 }
@@ -256,7 +256,7 @@ static int cmd_set_theta_max_rpm(int argc, char** argv) {
 
     int val = set_theta_rpm_args.rpm->ival[0];
     if (val < 1 || val > 100) {
-        console_out("{\"error\":true,\"message\":\"RPM must be 1-100\"}\n");
+        printf("{\"error\":true,\"message\":\"RPM must be 1-100\"}\n");
         return 1;
     }
 
@@ -266,11 +266,11 @@ static int cmd_set_theta_max_rpm(int argc, char** argv) {
 
     esp_err_t err = cfg.set_motion_config(motion);
     if (err != ESP_OK) {
-        console_out("{\"error\":true,\"message\":\"Failed to save config\"}\n");
+        printf("{\"error\":true,\"message\":\"Failed to save config\"}\n");
         return 1;
     }
 
-    console_out("{\"error\":false,\"theta_max_rpm\":%d}\n", val);
+    printf("{\"error\":false,\"theta_max_rpm\":%d}\n", val);
     return 0;
 }
 
@@ -301,7 +301,7 @@ static int cmd_set_rho_max_rpm(int argc, char** argv) {
 
     int val = set_rho_rpm_args.rpm->ival[0];
     if (val < 1 || val > 100) {
-        console_out("{\"error\":true,\"message\":\"RPM must be 1-100\"}\n");
+        printf("{\"error\":true,\"message\":\"RPM must be 1-100\"}\n");
         return 1;
     }
 
@@ -311,11 +311,11 @@ static int cmd_set_rho_max_rpm(int argc, char** argv) {
 
     esp_err_t err = cfg.set_motion_config(motion);
     if (err != ESP_OK) {
-        console_out("{\"error\":true,\"message\":\"Failed to save config\"}\n");
+        printf("{\"error\":true,\"message\":\"Failed to save config\"}\n");
         return 1;
     }
 
-    console_out("{\"error\":false,\"rho_max_rpm\":%d}\n", val);
+    printf("{\"error\":false,\"rho_max_rpm\":%d}\n", val);
     return 0;
 }
 
@@ -346,7 +346,7 @@ static int cmd_set_accel(int argc, char** argv) {
 
     double val = set_accel_args.accel->dval[0];
     if (val < 10.0 || val > 1000.0) {
-        console_out("{\"error\":true,\"message\":\"Acceleration must be 10-1000 mm/s^2\"}\n");
+        printf("{\"error\":true,\"message\":\"Acceleration must be 10-1000 mm/s^2\"}\n");
         return 1;
     }
 
@@ -356,11 +356,11 @@ static int cmd_set_accel(int argc, char** argv) {
 
     esp_err_t err = cfg.set_motion_config(motion);
     if (err != ESP_OK) {
-        console_out("{\"error\":true,\"message\":\"Failed to save config\"}\n");
+        printf("{\"error\":true,\"message\":\"Failed to save config\"}\n");
         return 1;
     }
 
-    console_out("{\"error\":false,\"default_accel\":%.1f}\n", val);
+    printf("{\"error\":false,\"default_accel\":%.1f}\n", val);
     return 0;
 }
 
@@ -381,20 +381,20 @@ static int cmd_get_config(int argc, char** argv) {
     auto& cfg = ConfigManager::instance();
     const auto& m = cfg.motion_config();
 
-    console_out("{\n");
-    console_out("  \"steps_per_rev\": %" PRIu32 ",\n", m.steps_per_rev);
-    console_out("  \"microsteps\": %u,\n", m.microsteps);
-    console_out("  \"theta_gear_ratio\": %.2f,\n", m.theta_gear_ratio_x100 / 100.0);
-    console_out("  \"pinion_diameter_mm\": %" PRId32 ",\n", m.pinion_diameter_mm);
-    console_out("  \"theta_max_rpm\": %" PRId32 ",\n", m.theta_max_rpm);
-    console_out("  \"rho_max_rpm\": %" PRId32 ",\n", m.rho_max_rpm);
-    console_out("  \"theta_current_ma\": %u,\n", m.theta_current_ma);
-    console_out("  \"rho_current_ma\": %u,\n", m.rho_current_ma);
-    console_out("  \"stallguard_threshold\": %u,\n", m.stallguard_threshold);
-    console_out("  \"default_accel\": %.1f,\n", m.default_accel);
-    console_out("  \"max_accel\": %.1f,\n", m.max_accel);
-    console_out("  \"error\": false\n");
-    console_out("}\n");
+    printf("{\n");
+    printf("  \"steps_per_rev\": %" PRIu32 ",\n", m.steps_per_rev);
+    printf("  \"microsteps\": %u,\n", m.microsteps);
+    printf("  \"theta_gear_ratio\": %.2f,\n", m.theta_gear_ratio_x100 / 100.0);
+    printf("  \"pinion_diameter_mm\": %" PRId32 ",\n", m.pinion_diameter_mm);
+    printf("  \"theta_max_rpm\": %" PRId32 ",\n", m.theta_max_rpm);
+    printf("  \"rho_max_rpm\": %" PRId32 ",\n", m.rho_max_rpm);
+    printf("  \"theta_current_ma\": %u,\n", m.theta_current_ma);
+    printf("  \"rho_current_ma\": %u,\n", m.rho_current_ma);
+    printf("  \"stallguard_threshold\": %u,\n", m.stallguard_threshold);
+    printf("  \"default_accel\": %.1f,\n", m.default_accel);
+    printf("  \"max_accel\": %.1f,\n", m.max_accel);
+    printf("  \"error\": false\n");
+    printf("}\n");
     return 0;
 }
 
@@ -421,7 +421,7 @@ static int cmd_set_theta_current(int argc, char** argv) {
 
     int val = set_theta_curr_args.current->ival[0];
     if (val < 100 || val > 2000) {
-        console_out("{\"error\":true,\"message\":\"Current must be 100-2000 mA\"}\n");
+        printf("{\"error\":true,\"message\":\"Current must be 100-2000 mA\"}\n");
         return 1;
     }
 
@@ -431,11 +431,11 @@ static int cmd_set_theta_current(int argc, char** argv) {
 
     esp_err_t err = cfg.set_motion_config(motion);
     if (err != ESP_OK) {
-        console_out("{\"error\":true,\"message\":\"Failed to save config\"}\n");
+        printf("{\"error\":true,\"message\":\"Failed to save config\"}\n");
         return 1;
     }
 
-    console_out("{\"error\":false,\"theta_current_ma\":%d,\"note\":\"Restart required\"}\n", val);
+    printf("{\"error\":false,\"theta_current_ma\":%d,\"note\":\"Restart required\"}\n", val);
     return 0;
 }
 
@@ -466,7 +466,7 @@ static int cmd_set_rho_current(int argc, char** argv) {
 
     int val = set_rho_curr_args.current->ival[0];
     if (val < 100 || val > 2000) {
-        console_out("{\"error\":true,\"message\":\"Current must be 100-2000 mA\"}\n");
+        printf("{\"error\":true,\"message\":\"Current must be 100-2000 mA\"}\n");
         return 1;
     }
 
@@ -476,11 +476,11 @@ static int cmd_set_rho_current(int argc, char** argv) {
 
     esp_err_t err = cfg.set_motion_config(motion);
     if (err != ESP_OK) {
-        console_out("{\"error\":true,\"message\":\"Failed to save config\"}\n");
+        printf("{\"error\":true,\"message\":\"Failed to save config\"}\n");
         return 1;
     }
 
-    console_out("{\"error\":false,\"rho_current_ma\":%d,\"note\":\"Restart required\"}\n", val);
+    printf("{\"error\":false,\"rho_current_ma\":%d,\"note\":\"Restart required\"}\n", val);
     return 0;
 }
 
@@ -501,13 +501,13 @@ static int cmd_calibration(int argc, char** argv) {
     auto& cfg = ConfigManager::instance();
     const auto& cal = cfg.calibration();
 
-    console_out("{\n");
-    console_out("  \"is_valid\": %s,\n", cal.is_valid ? "true" : "false");
-    console_out("  \"theta_steps_per_rotation\": %" PRId32 ",\n", cal.theta_steps_per_rotation);
-    console_out("  \"rho_max_steps\": %" PRId32 ",\n", cal.rho_max_steps);
-    console_out("  \"timestamp\": %" PRIu32 ",\n", cal.timestamp);
-    console_out("  \"error\": false\n");
-    console_out("}\n");
+    printf("{\n");
+    printf("  \"is_valid\": %s,\n", cal.is_valid ? "true" : "false");
+    printf("  \"theta_steps_per_rotation\": %" PRId32 ",\n", cal.theta_steps_per_rotation);
+    printf("  \"rho_max_steps\": %" PRId32 ",\n", cal.rho_max_steps);
+    printf("  \"timestamp\": %" PRIu32 ",\n", cal.timestamp);
+    printf("  \"error\": false\n");
+    printf("}\n");
     return 0;
 }
 
@@ -521,11 +521,11 @@ static int cmd_clear_calibration(int argc, char** argv) {
     esp_err_t err = cfg.clear_calibration();
 
     if (err != ESP_OK) {
-        console_out("{\"error\":true,\"message\":\"Failed to clear calibration\"}\n");
+        printf("{\"error\":true,\"message\":\"Failed to clear calibration\"}\n");
         return 1;
     }
 
-    console_out("{\"error\":false,\"message\":\"Calibration cleared, full home required\"}\n");
+    printf("{\"error\":false,\"message\":\"Calibration cleared, full home required\"}\n");
     return 0;
 }
 
@@ -536,12 +536,12 @@ static void register_clear_calibration() {
 // --- motor_enable ---
 static int cmd_motor_enable(int argc, char** argv) {
     if (!s_controller) {
-        console_out("{\"error\":true,\"message\":\"Motion controller not initialized\"}\n");
+        printf("{\"error\":true,\"message\":\"Motion controller not initialized\"}\n");
         return 1;
     }
 
     s_controller->enable_motors();
-    console_out("{\"error\":false,\"message\":\"Motors enabled\"}\n");
+    printf("{\"error\":false,\"message\":\"Motors enabled\"}\n");
     return 0;
 }
 
@@ -552,12 +552,12 @@ static void register_motor_enable() {
 // --- motor_disable ---
 static int cmd_motor_disable(int argc, char** argv) {
     if (!s_controller) {
-        console_out("{\"error\":true,\"message\":\"Motion controller not initialized\"}\n");
+        printf("{\"error\":true,\"message\":\"Motion controller not initialized\"}\n");
         return 1;
     }
 
     s_controller->disable_motors();
-    console_out("{\"error\":false,\"message\":\"Motors disabled\"}\n");
+    printf("{\"error\":false,\"message\":\"Motors disabled\"}\n");
     return 0;
 }
 

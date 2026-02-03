@@ -100,7 +100,7 @@ public:
         }
 
         // Check if download job already exists
-        if (jobs::JobQueue::instance().hasJob(pattern_uuid, jobs::JobType::Download)) {
+        if (jobs::JobQueue::instance().hasJobForExternalUuid(pattern_uuid, jobs::JobType::Download)) {
             return { DownloadStatus::InProgress, pattern_uuid, "Already downloading" };
         }
 
@@ -191,8 +191,8 @@ public:
     }
 
     bool cancelDownload(const std::string& pattern_uuid) {
-        // Cancel via job queue
-        esp_err_t err = jobs::JobQueue::instance().cancelJobsForPattern(pattern_uuid);
+        // Cancel via job queue (using external UUID variant)
+        esp_err_t err = jobs::JobQueue::instance().cancelJobsForExternalUuid(pattern_uuid);
 
         // Also remove any pending callback
         MutexGuard lock(mutex_);
@@ -202,7 +202,7 @@ public:
     }
 
     bool isDownloading(const std::string& pattern_uuid) const {
-        return jobs::JobQueue::instance().hasJob(pattern_uuid, jobs::JobType::Download);
+        return jobs::JobQueue::instance().hasJobForExternalUuid(pattern_uuid, jobs::JobType::Download);
     }
 
 private:

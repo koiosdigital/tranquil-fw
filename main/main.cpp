@@ -11,8 +11,10 @@
 
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_task_wdt.h"
 
 #include "kd_common.h"
+#include "kdc_heap_tracing.h"
 #include "kd_pixdriver.h"
 
 #include "sand_table.h"
@@ -38,11 +40,16 @@ static sand_table::MotionController* g_motion_controller = nullptr;
 
 extern "C" void app_main(void)
 {
+    kdc_heap_trace_init();
+
+    // Disable watchdogs for slow integrity checking
+    esp_task_wdt_deinit();
+
     esp_event_loop_create_default();
 
     stusb_init();
 
-    kd_common_set_provisioning_srp_password_format(ProvisioningSRPPasswordFormat_t::STATIC);
+    kd_common_set_provisioning_srp_password_format(PROVISIONING_SRP_FORMAT_STATIC);
     kd_common_init();
 
     // Initialize ConfigManager early (before components that need config)
@@ -51,8 +58,10 @@ extern "C" void app_main(void)
         ESP_LOGW(TAG, "ConfigManager init failed: %s, using defaults", esp_err_to_name(cfg_err));
     }
 
-    //ManifestDatabase::instance().initialize();
+    ManifestDatabase::instance().initialize();
+    ManifestDatabase::instance().selfTest();
 
+    vTaskSuspend(NULL);
     /*
 
     // Initialize job processing system
@@ -65,8 +74,6 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "Job processing system initialized");
 
     */
-
-    vTaskSuspend(NULL);
 
     // Initialize motion controller
     g_motion_controller = new sand_table::MotionController();

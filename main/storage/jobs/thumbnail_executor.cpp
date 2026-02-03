@@ -1,6 +1,7 @@
 #include "thumbnail_executor.h"
 #include "job_queue.h"
 #include "PatternReader.h"
+#include "ManifestDatabase.h"
 #include "thumbnail/framebuffer.h"
 #include "thumbnail/bezier_renderer.h"
 #include "thumbnail/png_encoder.h"
@@ -14,12 +15,19 @@ static const char* TAG = "ThumbnailExecutor";
 namespace jobs {
 
 JobResult ThumbnailExecutor::execute(const Job& job) {
+    // Get pattern by internal ID to find external_uuid
+    auto pattern = ManifestDatabase::instance().getPattern(job.pattern_id);
+    if (!pattern) {
+        return JobResult::fail("Pattern not found");
+    }
+    const std::string& pattern_uuid = pattern->external_uuid;
+
     // Parse job data
     ThumbnailJobData data = ThumbnailJobData::fromJson(job.job_data);
 
     if (data.output_path.empty()) {
-        // Default output path
-        data.output_path = "/sd/previews/" + job.pattern_uuid + ".png";
+        // Default output path using external_uuid
+        data.output_path = "/sd/previews/" + pattern_uuid + ".png";
     }
 
     // Ensure previews directory exists
@@ -30,8 +38,8 @@ JobResult ThumbnailExecutor::execute(const Job& job) {
         }
     }
 
-    // Render the pattern
-    return renderPattern(job.pattern_uuid, data.encrypted, data.output_path);
+    // Render the pattern using external_uuid (file path)
+    return renderPattern(pattern_uuid, data.encrypted, data.output_path);
 }
 
 JobResult ThumbnailExecutor::renderPattern(const std::string& pattern_uuid,

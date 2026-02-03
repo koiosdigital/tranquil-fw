@@ -82,7 +82,8 @@ HandleResult PatternHandler::handleDownloadedPatternsRequest(ResponseMessage& re
     for (size_t i = 0; i < count; i++) {
         pattern_infos[i] = KD__V1__PATTERN_INFO__INIT;
         // Note: These pointers are valid while patterns vector is in scope
-        pattern_infos[i].uuid = const_cast<char*>(patterns[i].uuid.c_str());
+        // Use external_uuid as "uuid" for API compatibility
+        pattern_infos[i].uuid = const_cast<char*>(patterns[i].external_uuid.c_str());
         pattern_infos[i].name = const_cast<char*>(patterns[i].name.c_str());
         pattern_infos[i].creator = const_cast<char*>(patterns[i].creator.c_str());
         pattern_infos[i].encrypted = patterns[i].encrypted;
@@ -118,7 +119,16 @@ HandleResult PatternHandler::handleDeletePattern(
     }
 
     ESP_LOGI(TAG, "DeletePattern: %s", msg->uuid);
-    esp_err_t ret = ManifestDatabase::instance().deletePattern(msg->uuid);
+
+    // Find pattern by external UUID and delete by internal ID
+    auto pattern = ManifestDatabase::instance().getPatternByExternalUuid(msg->uuid);
+    if (!pattern) {
+        ESP_LOGW(TAG, "DeletePattern: pattern not found: %s", msg->uuid);
+        response = makeCommandResult(false, "Pattern not found");
+        return HandleResult::ok();
+    }
+
+    esp_err_t ret = ManifestDatabase::instance().deletePattern(pattern->id);
 
     if (ret == ESP_OK) {
         response = makeCommandResult(true);
@@ -140,8 +150,8 @@ HandleResult PatternHandler::handleModifyPattern(
         return HandleResult::ok();
     }
 
-    // Get existing pattern
-    auto pattern = ManifestDatabase::instance().getPattern(msg->uuid);
+    // Get existing pattern by external UUID
+    auto pattern = ManifestDatabase::instance().getPatternByExternalUuid(msg->uuid);
     if (!pattern) {
         ESP_LOGW(TAG, "ModifyPattern: pattern not found: %s", msg->uuid);
         response = makeCommandResult(false, "Pattern not found");
@@ -154,8 +164,8 @@ HandleResult PatternHandler::handleModifyPattern(
         ESP_LOGI(TAG, "ModifyPattern: rename %s to '%s'", msg->uuid, msg->name);
     }
 
-    // Save updated pattern
-    esp_err_t ret = ManifestDatabase::instance().updatePattern(msg->uuid, *pattern);
+    // Save updated pattern using internal ID
+    esp_err_t ret = ManifestDatabase::instance().updatePattern(pattern->id, *pattern);
 
     if (ret == ESP_OK) {
         response = makeCommandResult(true);
@@ -176,7 +186,8 @@ HandleResult PatternHandler::handleGetPatternRequest(
         return HandleResult::ok();
     }
 
-    auto pattern = ManifestDatabase::instance().getPattern(msg->uuid);
+    // Lookup by external UUID
+    auto pattern = ManifestDatabase::instance().getPatternByExternalUuid(msg->uuid);
     if (!pattern) {
         ESP_LOGW(TAG, "GetPatternRequest: pattern not found: %s", msg->uuid);
         response = makeCommandResult(false, "Pattern not found");
@@ -188,7 +199,8 @@ HandleResult PatternHandler::handleGetPatternRequest(
     static char uuid_buf[64], name_buf[128], creator_buf[64];
     static char created_buf[32], played_buf[32];
 
-    strncpy(uuid_buf, pattern->uuid.c_str(), sizeof(uuid_buf) - 1);
+    // Use external_uuid as "uuid" for API compatibility
+    strncpy(uuid_buf, pattern->external_uuid.c_str(), sizeof(uuid_buf) - 1);
     strncpy(name_buf, pattern->name.c_str(), sizeof(name_buf) - 1);
     strncpy(creator_buf, pattern->creator.c_str(), sizeof(creator_buf) - 1);
     strncpy(created_buf, pattern->created_at.c_str(), sizeof(created_buf) - 1);

@@ -180,7 +180,7 @@ static esp_err_t patterns_list_handler(httpd_req_t* req) {
     for (auto& pattern : result.items) {
         // Update size from disk if not set
         if (pattern.size_bytes == 0) {
-            pattern.size_bytes = getPatternFileSize(pattern.uuid, pattern.encrypted);
+            pattern.size_bytes = getPatternFileSize(pattern.external_uuid, pattern.encrypted);
         }
         cJSON_AddItemToArray(patternsArray, ManifestDatabase::patternToJson(pattern));
     }
@@ -385,15 +385,42 @@ static esp_err_t patterns_upload_handler(httpd_req_t* req) {
         return ESP_FAIL;
     }
 
-    // Enqueue conversion job via job queue
+    // Create pattern in database first to get internal ID
+    Pattern pattern;
+    pattern.id = 0;  // Will be assigned by TQDB
+    pattern.external_uuid = ctx->uuid;
+    pattern.name = strlen(ctx->filename) > 0 ? ctx->filename : ctx->uuid;
+    pattern.creator = "Uploaded";
+    pattern.encrypted = false;
+    pattern.size_bytes = 0;  // Will be updated after conversion
+    pattern.created_at = ManifestDatabase::currentTimestamp();
+
+    if (ManifestDatabase::instance().addPattern(pattern) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to add pattern to database");
+        unlink(ctx->temp_path);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    // Look up the newly created pattern to get its internal ID
+    auto created_pattern = ManifestDatabase::instance().getPatternByExternalUuid(ctx->uuid);
+    if (!created_pattern) {
+        ESP_LOGE(TAG, "Failed to find newly created pattern");
+        unlink(ctx->temp_path);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    // Enqueue conversion job via job queue using internal ID
     jobs::ConversionJobData conv_data;
     conv_data.temp_path = ctx->temp_path;
-    conv_data.name = strlen(ctx->filename) > 0 ? ctx->filename : ctx->uuid;
+    conv_data.name = pattern.name;
     conv_data.encrypted = false;
 
-    esp_err_t enqueue_result = jobs::JobQueue::instance().enqueueConversion(ctx->uuid, conv_data);
+    esp_err_t enqueue_result = jobs::JobQueue::instance().enqueueConversion(created_pattern->id, conv_data);
     if (enqueue_result != ESP_OK) {
         ESP_LOGE(TAG, "Failed to enqueue conversion job");
+        ManifestDatabase::instance().deletePattern(created_pattern->id);
         unlink(ctx->temp_path);
         httpd_resp_send_500(req);
         return ESP_FAIL;
@@ -439,7 +466,8 @@ static esp_err_t patterns_detail_handler(httpd_req_t* req) {
         return ESP_FAIL;
     }
 
-    auto pattern = ManifestDatabase::instance().getPattern(uuid);
+    // uuid is external_uuid
+    auto pattern = ManifestDatabase::instance().getPatternByExternalUuid(uuid);
     if (!pattern) {
         httpd_resp_send_404(req);
         return ESP_FAIL;
@@ -447,7 +475,7 @@ static esp_err_t patterns_detail_handler(httpd_req_t* req) {
 
     // Update size from disk if not set
     if (pattern->size_bytes == 0) {
-        pattern->size_bytes = getPatternFileSize(pattern->uuid, pattern->encrypted);
+        pattern->size_bytes = getPatternFileSize(pattern->external_uuid, pattern->encrypted);
     }
 
     cJSON* json = ManifestDatabase::patternToJson(*pattern);
@@ -477,12 +505,14 @@ static esp_err_t patterns_delete_handler(httpd_req_t* req) {
         return ESP_FAIL;
     }
 
-    if (!ManifestDatabase::instance().patternExists(uuid)) {
+    // uuid is external_uuid - look up to get internal ID
+    auto pattern = ManifestDatabase::instance().getPatternByExternalUuid(uuid);
+    if (!pattern) {
         httpd_resp_send_404(req);
         return ESP_FAIL;
     }
 
-    if (ManifestDatabase::instance().deletePattern(uuid) != ESP_OK) {
+    if (ManifestDatabase::instance().deletePattern(pattern->id) != ESP_OK) {
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
@@ -508,8 +538,8 @@ static esp_err_t patterns_download_handler(httpd_req_t* req) {
         return ESP_FAIL;
     }
 
-    // Look up pattern
-    auto pattern = ManifestDatabase::instance().getPattern(uuid);
+    // Look up pattern (uuid is external_uuid)
+    auto pattern = ManifestDatabase::instance().getPatternByExternalUuid(uuid);
     if (!pattern) {
         httpd_resp_send_404(req);
         return ESP_FAIL;
@@ -521,9 +551,9 @@ static esp_err_t patterns_download_handler(httpd_req_t* req) {
         return ESP_FAIL;
     }
 
-    // Get file path
+    // Get file path (use external_uuid for file naming)
     char file_path[128];
-    getPatternFilePath(pattern->uuid, pattern->encrypted, file_path, sizeof(file_path));
+    getPatternFilePath(pattern->external_uuid, pattern->encrypted, file_path, sizeof(file_path));
 
     FILE* f = fopen(file_path, "rb");
     if (!f) {
@@ -620,14 +650,13 @@ static esp_err_t pattern_thumb_handler(httpd_req_t* req) {
     struct stat st;
     if (stat(thumb_path, &st) != 0) {
         // Thumbnail not found - check if pattern exists and enqueue generation
-        if (ManifestDatabase::instance().patternExists(uuid)) {
-            auto pattern = ManifestDatabase::instance().getPattern(uuid);
-            if (pattern && !jobs::JobQueue::instance().hasJob(uuid, jobs::JobType::Thumbnail)) {
-                jobs::ThumbnailJobData data;
-                data.encrypted = pattern->encrypted;
-                data.output_path = thumb_path;
-                jobs::JobQueue::instance().enqueueThumbnail(uuid, data, 0);
-            }
+        // uuid is external_uuid
+        auto pattern = ManifestDatabase::instance().getPatternByExternalUuid(uuid);
+        if (pattern && !jobs::JobQueue::instance().hasJobForPatternId(pattern->id, jobs::JobType::Thumbnail)) {
+            jobs::ThumbnailJobData data;
+            data.encrypted = pattern->encrypted;
+            data.output_path = thumb_path;
+            jobs::JobQueue::instance().enqueueThumbnail(pattern->id, data, 0);
         }
         httpd_resp_send_404(req);
         return ESP_FAIL;

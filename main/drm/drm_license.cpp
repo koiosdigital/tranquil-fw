@@ -18,7 +18,7 @@
 #include <time.h>
 #include <sys/stat.h>
 
-#include "storage/ManifestDatabase.h"
+#include "ManifestDatabase.h"
 
 static const char* TAG = "drm_license";
 

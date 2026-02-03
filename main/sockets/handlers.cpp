@@ -11,7 +11,7 @@
 
 #include "drm/drm_license.h"
 #include "drm/drm_purchase.h"
-#include "storage/ManifestDatabase.h"
+#include "ManifestDatabase.h"
 
 static const char* TAG = "cloud_handlers";
 
@@ -219,8 +219,8 @@ namespace {
                 ESP_LOGI(TAG, "Saved receipt for pattern: %s", bundle->pattern_uuid);
                 saved++;
 
-                // Update ManifestDatabase if this pattern exists
-                auto existing = ManifestDatabase::instance().getPattern(bundle->pattern_uuid);
+                // Update ManifestDatabase if this pattern exists (pattern_uuid is external_uuid)
+                auto existing = ManifestDatabase::instance().getPatternByExternalUuid(bundle->pattern_uuid);
                 if (existing.has_value()) {
                     Pattern updated = existing.value();
                     updated.purchased = true;
@@ -232,7 +232,8 @@ namespace {
                         updated.receipt_id = info.receipt_id;
                     }
 
-                    ManifestDatabase::instance().updatePattern(bundle->pattern_uuid, updated);
+                    // Update by internal ID
+                    ManifestDatabase::instance().updatePattern(existing->id, updated);
                     ESP_LOGD(TAG, "Updated manifest for pattern: %s", bundle->pattern_uuid);
                 }
             }

@@ -298,8 +298,9 @@ void ScheduleManager::executeAction(const ScheduleItem& item) {
             auto patterns = ManifestDatabase::instance().getAllPatterns();
             if (!patterns.empty()) {
                 size_t idx = esp_random() % patterns.size();
-                SandTablePlayer::playPattern(patterns[idx].uuid.c_str());
-                ESP_LOGI(TAG, "Scheduled: Playing random pattern %s", patterns[idx].uuid.c_str());
+                // Use external_uuid for playback
+                SandTablePlayer::playPattern(patterns[idx].external_uuid.c_str());
+                ESP_LOGI(TAG, "Scheduled: Playing random pattern %s", patterns[idx].external_uuid.c_str());
             }
             break;
         }

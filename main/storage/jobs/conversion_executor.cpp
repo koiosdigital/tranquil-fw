@@ -22,17 +22,24 @@ JobResult ConversionExecutor::execute(const Job& job) {
         return JobResult::fail("Missing temp_path in job data");
     }
 
+    // Get the pattern to find its external_uuid for file paths
+    auto pattern = ManifestDatabase::instance().getPattern(job.pattern_id);
+    if (!pattern) {
+        return JobResult::fail("Pattern not found for job");
+    }
+    const std::string& pattern_uuid = pattern->external_uuid;
+
     // Verify input file exists
     struct stat st;
     if (stat(data.temp_path.c_str(), &st) != 0) {
         return JobResult::fail("Input file not found: " + data.temp_path);
     }
 
-    // Build output paths
+    // Build output paths (use external_uuid for file naming)
     char binary_path[128];
     char final_path[128];
-    snprintf(binary_path, sizeof(binary_path), "/sd/patterns/%s.thrb", job.pattern_uuid.c_str());
-    snprintf(final_path, sizeof(final_path), "/sd/patterns/%s.dat", job.pattern_uuid.c_str());
+    snprintf(binary_path, sizeof(binary_path), "/sd/patterns/%s.thrb", pattern_uuid.c_str());
+    snprintf(final_path, sizeof(final_path), "/sd/patterns/%s.dat", pattern_uuid.c_str());
 
     // Perform conversion
     size_t point_count = 0;
@@ -60,25 +67,30 @@ JobResult ConversionExecutor::execute(const Job& job) {
         file_size = st.st_size;
     }
 
-    // Add to database
-    esp_err_t db_result = addPatternToDatabase(job.pattern_uuid, data.name, file_size, data.encrypted);
+    // Update pattern in database with final size
+    pattern->size_bytes = file_size;
+    pattern->encrypted = data.encrypted;
+    if (!data.name.empty()) {
+        pattern->name = data.name;
+    }
+    esp_err_t db_result = ManifestDatabase::instance().updatePattern(job.pattern_id, *pattern);
     if (db_result != ESP_OK) {
         unlink(final_path);
         unlink(data.temp_path.c_str());
-        return JobResult::fail("Failed to add pattern to database");
+        return JobResult::fail("Failed to update pattern in database");
     }
 
     // Success - delete temp file
     unlink(data.temp_path.c_str());
 
-    ESP_LOGD(TAG, "Conversion complete: %s (%zu points)", job.pattern_uuid.c_str(), point_count);
+    ESP_LOGD(TAG, "Conversion complete: %s (%zu points)", pattern_uuid.c_str(), point_count);
 
-    // Enqueue thumbnail generation job
+    // Enqueue thumbnail generation job using pattern's internal ID
     ThumbnailJobData thumb_data;
     thumb_data.encrypted = data.encrypted;
-    thumb_data.output_path = "/sd/previews/" + job.pattern_uuid + ".png";
+    thumb_data.output_path = "/sd/previews/" + pattern_uuid + ".png";
 
-    JobQueue::instance().enqueueThumbnail(job.pattern_uuid, thumb_data, -1);
+    JobQueue::instance().enqueueThumbnail(job.pattern_id, thumb_data, -1);
 
     return JobResult::ok();
 }
@@ -181,13 +193,14 @@ esp_err_t ConversionExecutor::convertToBinary(const char* input_path,
     return ESP_OK;
 }
 
-esp_err_t ConversionExecutor::addPatternToDatabase(const std::string& uuid,
+esp_err_t ConversionExecutor::addPatternToDatabase(const std::string& external_uuid,
                                                     const std::string& name,
                                                     size_t file_size,
                                                     bool encrypted) {
     Pattern pattern;
-    pattern.uuid = uuid;
-    pattern.name = name.empty() ? uuid : name;
+    pattern.id = 0;  // Will be assigned by TQDB
+    pattern.external_uuid = external_uuid;
+    pattern.name = name.empty() ? external_uuid : name;
     pattern.creator = "Uploaded";
     pattern.encrypted = encrypted;
     pattern.size_bytes = file_size;

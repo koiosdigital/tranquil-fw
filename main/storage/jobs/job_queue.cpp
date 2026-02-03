@@ -39,21 +39,21 @@ bool JobQueue::isInitialized() const {
     return initialized_;
 }
 
-esp_err_t JobQueue::enqueueConversion(const std::string& pattern_uuid,
+esp_err_t JobQueue::enqueueConversion(uint32_t pattern_id,
                                        const ConversionJobData& data,
                                        int priority) {
     if (!initialized_) return ESP_ERR_INVALID_STATE;
 
-    // Check if job already exists
-    if (hasJob(pattern_uuid, JobType::Conversion)) {
-        ESP_LOGW(TAG, "Conversion job already exists for pattern: %s", pattern_uuid.c_str());
+    // Check if job already exists for this pattern
+    if (hasJobForPatternId(pattern_id, JobType::Conversion)) {
+        ESP_LOGW(TAG, "Conversion job already exists for pattern ID: %u", pattern_id);
         return ESP_OK;
     }
 
     Job job;
-    job.uuid = ManifestDatabase::generateUUID();
+    job.id = 0;  // Will be assigned by TQDB
     job.type = JobType::Conversion;
-    job.pattern_uuid = pattern_uuid;
+    job.pattern_id = pattern_id;
     job.status = JobStatus::Pending;
     job.priority = priority;
     job.retry_count = 0;
@@ -64,21 +64,21 @@ esp_err_t JobQueue::enqueueConversion(const std::string& pattern_uuid,
     return ManifestDatabase::instance().enqueueJob(job);
 }
 
-esp_err_t JobQueue::enqueueThumbnail(const std::string& pattern_uuid,
+esp_err_t JobQueue::enqueueThumbnail(uint32_t pattern_id,
                                       const ThumbnailJobData& data,
                                       int priority) {
     if (!initialized_) return ESP_ERR_INVALID_STATE;
 
-    // Check if job already exists
-    if (hasJob(pattern_uuid, JobType::Thumbnail)) {
-        ESP_LOGW(TAG, "Thumbnail job already exists for pattern: %s", pattern_uuid.c_str());
+    // Check if job already exists for this pattern
+    if (hasJobForPatternId(pattern_id, JobType::Thumbnail)) {
+        ESP_LOGW(TAG, "Thumbnail job already exists for pattern ID: %u", pattern_id);
         return ESP_OK;
     }
 
     Job job;
-    job.uuid = ManifestDatabase::generateUUID();
+    job.id = 0;  // Will be assigned by TQDB
     job.type = JobType::Thumbnail;
-    job.pattern_uuid = pattern_uuid;
+    job.pattern_id = pattern_id;
     job.status = JobStatus::Pending;
     job.priority = priority;
     job.retry_count = 0;
@@ -89,21 +89,22 @@ esp_err_t JobQueue::enqueueThumbnail(const std::string& pattern_uuid,
     return ManifestDatabase::instance().enqueueJob(job);
 }
 
-esp_err_t JobQueue::enqueueDownload(const std::string& pattern_uuid,
+esp_err_t JobQueue::enqueueDownload(const std::string& pattern_external_uuid,
                                      const DownloadJobData& data,
                                      int priority) {
     if (!initialized_) return ESP_ERR_INVALID_STATE;
 
-    // Check if job already exists
-    if (hasJob(pattern_uuid, JobType::Download)) {
-        ESP_LOGW(TAG, "Download job already exists for pattern: %s", pattern_uuid.c_str());
+    // Check if job already exists for this external UUID
+    if (hasJobForExternalUuid(pattern_external_uuid, JobType::Download)) {
+        ESP_LOGW(TAG, "Download job already exists for pattern: %s", pattern_external_uuid.c_str());
         return ESP_OK;
     }
 
     Job job;
-    job.uuid = ManifestDatabase::generateUUID();
+    job.id = 0;  // Will be assigned by TQDB
     job.type = JobType::Download;
-    job.pattern_uuid = pattern_uuid;
+    job.pattern_id = 0;  // Pattern doesn't exist yet
+    job.pattern_external_uuid = pattern_external_uuid;
     job.status = JobStatus::Pending;
     job.priority = priority;
     job.retry_count = 0;
@@ -119,29 +120,39 @@ std::optional<Job> JobQueue::claimNextPendingJob() {
     return ManifestDatabase::instance().claimNextPendingJob();
 }
 
-esp_err_t JobQueue::markCompleted(const std::string& job_uuid) {
+esp_err_t JobQueue::markCompleted(uint32_t job_id) {
     if (!initialized_) return ESP_ERR_INVALID_STATE;
-    return ManifestDatabase::instance().markJobCompleted(job_uuid);
+    return ManifestDatabase::instance().markJobCompleted(job_id);
 }
 
-esp_err_t JobQueue::markFailed(const std::string& job_uuid, const std::string& error) {
+esp_err_t JobQueue::markFailed(uint32_t job_id, const std::string& error) {
     if (!initialized_) return ESP_ERR_INVALID_STATE;
-    return ManifestDatabase::instance().markJobFailed(job_uuid, error);
+    return ManifestDatabase::instance().markJobFailed(job_id, error);
 }
 
-std::optional<Job> JobQueue::getJob(const std::string& job_uuid) {
+std::optional<Job> JobQueue::getJob(uint32_t job_id) {
     if (!initialized_) return std::nullopt;
-    return ManifestDatabase::instance().getJob(job_uuid);
+    return ManifestDatabase::instance().getJob(job_id);
 }
 
-std::optional<Job> JobQueue::getJobByPattern(const std::string& pattern_uuid, JobType type) {
+std::optional<Job> JobQueue::getJobByPatternId(uint32_t pattern_id, JobType type) {
     if (!initialized_) return std::nullopt;
-    return ManifestDatabase::instance().getJobByPattern(pattern_uuid, type);
+    return ManifestDatabase::instance().getJobByPatternId(pattern_id, type);
 }
 
-bool JobQueue::hasJob(const std::string& pattern_uuid, JobType type) {
+std::optional<Job> JobQueue::getJobByPatternExternalUuid(const std::string& external_uuid, JobType type) {
+    if (!initialized_) return std::nullopt;
+    return ManifestDatabase::instance().getJobByPatternExternalUuid(external_uuid, type);
+}
+
+bool JobQueue::hasJobForPatternId(uint32_t pattern_id, JobType type) {
     if (!initialized_) return false;
-    return ManifestDatabase::instance().hasJob(pattern_uuid, type);
+    return ManifestDatabase::instance().hasJobForPattern(pattern_id, type);
+}
+
+bool JobQueue::hasJobForExternalUuid(const std::string& external_uuid, JobType type) {
+    if (!initialized_) return false;
+    return ManifestDatabase::instance().hasJobForPatternExternalUuid(external_uuid, type);
 }
 
 size_t JobQueue::getPendingCount() {
@@ -154,14 +165,24 @@ size_t JobQueue::getInProgressCount() {
     return ManifestDatabase::instance().getInProgressJobCount();
 }
 
-esp_err_t JobQueue::deleteJob(const std::string& job_uuid) {
+esp_err_t JobQueue::deleteJob(uint32_t job_id) {
     if (!initialized_) return ESP_ERR_INVALID_STATE;
-    return ManifestDatabase::instance().deleteJob(job_uuid);
+    return ManifestDatabase::instance().deleteJob(job_id);
 }
 
-esp_err_t JobQueue::cancelJobsForPattern(const std::string& pattern_uuid) {
+esp_err_t JobQueue::cancelJobsForPatternId(uint32_t pattern_id) {
     if (!initialized_) return ESP_ERR_INVALID_STATE;
-    return ManifestDatabase::instance().cancelJobsForPattern(pattern_uuid);
+    return ManifestDatabase::instance().cancelJobsForPattern(pattern_id);
+}
+
+esp_err_t JobQueue::cancelJobsForExternalUuid(const std::string& external_uuid) {
+    if (!initialized_) return ESP_ERR_INVALID_STATE;
+    // Look up pattern by external UUID to get internal ID
+    auto pattern_id = ManifestDatabase::instance().findPatternIdByExternalUuid(external_uuid);
+    if (!pattern_id) {
+        return ESP_OK;  // No pattern with this UUID, nothing to cancel
+    }
+    return ManifestDatabase::instance().cancelJobsForPattern(*pattern_id);
 }
 
 } // namespace jobs

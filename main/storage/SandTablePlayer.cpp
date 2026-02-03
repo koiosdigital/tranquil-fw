@@ -112,7 +112,8 @@ esp_err_t SandTablePlayer::playPattern(const char* pattern_uuid) {
     if (!motion_controller_->is_homed()) return ESP_ERR_INVALID_STATE;
 
     // Check authorization for encrypted patterns before acquiring mutex
-    auto pattern_info = ManifestDatabase::instance().getPattern(pattern_uuid);
+    // pattern_uuid is the external_uuid, so use getPatternByExternalUuid
+    auto pattern_info = ManifestDatabase::instance().getPatternByExternalUuid(pattern_uuid);
     if (pattern_info.has_value() && pattern_info->encrypted) {
         // Check purchase receipt OR subscription license
         if (!drm_purchase_is_valid(pattern_uuid) && !drm_license_is_valid()) {
@@ -138,8 +139,8 @@ esp_err_t SandTablePlayer::playPattern(const char* pattern_uuid) {
         return ret;
     }
 
-    // Get pattern info from ManifestDatabase
-    current_pattern_ = ManifestDatabase::instance().getPattern(pattern_uuid);
+    // Get pattern info from ManifestDatabase (pattern_uuid is external_uuid)
+    current_pattern_ = ManifestDatabase::instance().getPatternByExternalUuid(pattern_uuid);
     if (!current_pattern_.has_value()) {
         ESP_LOGE(TAG, "Pattern not found in manifest: %s", pattern_uuid);
         unloadPatternFile();
@@ -661,8 +662,8 @@ esp_err_t SandTablePlayer::loadPatternFile(const char* pattern_uuid) {
     total_lines_ = 0;
     file_loaded_ = false;
 
-    // Get pattern metadata to determine if encrypted
-    auto pattern = ManifestDatabase::instance().getPattern(pattern_uuid);
+    // Get pattern metadata to determine if encrypted (pattern_uuid is external_uuid)
+    auto pattern = ManifestDatabase::instance().getPatternByExternalUuid(pattern_uuid);
     bool is_encrypted = pattern.has_value() ? pattern->encrypted : false;
 
     // Create the appropriate reader via factory function
@@ -745,9 +746,16 @@ void SandTablePlayer::loadPlaylist(const char* playlist_uuid) {
     playlist_order_.clear();
     playlist_index_ = 0;
 
-    auto playlist = ManifestDatabase::instance().getPlaylist(playlist_uuid);
+    // playlist_uuid is external_uuid
+    auto playlist = ManifestDatabase::instance().getPlaylistByExternalUuid(playlist_uuid);
     if (playlist.has_value()) {
-        playlist_patterns_ = playlist->patterns;
+        // Convert pattern IDs to external UUIDs for playback
+        for (uint32_t pattern_id : playlist->pattern_ids) {
+            auto pattern = ManifestDatabase::instance().getPattern(pattern_id);
+            if (pattern) {
+                playlist_patterns_.push_back(pattern->external_uuid);
+            }
+        }
         playlist_order_.resize(playlist_patterns_.size());
         for (size_t i = 0; i < playlist_order_.size(); ++i) {
             playlist_order_[i] = i;
@@ -763,8 +771,8 @@ void SandTablePlayer::startCurrentPattern() {
     size_t idx = playlist_order_[playlist_index_];
     const std::string& pattern_uuid = playlist_patterns_[idx];
 
-    // Check authorization for encrypted patterns
-    auto pattern_info = ManifestDatabase::instance().getPattern(pattern_uuid);
+    // Check authorization for encrypted patterns (pattern_uuid is external_uuid)
+    auto pattern_info = ManifestDatabase::instance().getPatternByExternalUuid(pattern_uuid);
     if (pattern_info.has_value() && pattern_info->encrypted) {
         // Check purchase receipt OR subscription license
         if (!drm_purchase_is_valid(pattern_uuid.c_str()) && !drm_license_is_valid()) {
@@ -783,7 +791,7 @@ void SandTablePlayer::startCurrentPattern() {
     }
 
     // Get pattern info
-    current_pattern_ = ManifestDatabase::instance().getPattern(pattern_uuid);
+    current_pattern_ = ManifestDatabase::instance().getPatternByExternalUuid(pattern_uuid);
     strncpy(current_pattern_uuid_, pattern_uuid.c_str(), MAX_UUID_LEN - 1);
     current_pattern_uuid_[MAX_UUID_LEN - 1] = '\0';
 
