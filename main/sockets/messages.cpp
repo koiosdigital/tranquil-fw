@@ -44,7 +44,7 @@ bool cloud_msg_queue_raw(const uint8_t* data, size_t len) {
     struct { uint8_t* data; size_t len; } msg = { buf, len };
     if (xQueueSend(g_outbox, &msg, pdMS_TO_TICKS(100)) != pdTRUE) {
         ESP_LOGW(TAG, "Outbox full");
-        free(buf);
+        heap_caps_free(buf);
         return false;
     }
     return true;
@@ -65,7 +65,7 @@ bool cloud_msg_queue(const Kd__V1__TranquilMessage* message) {
     struct { uint8_t* data; size_t len; } msg = { buf, len };
     if (xQueueSend(g_outbox, &msg, pdMS_TO_TICKS(100)) != pdTRUE) {
         ESP_LOGW(TAG, "Outbox full");
-        free(buf);
+        heap_caps_free(buf);
         return false;
     }
     return true;
@@ -101,7 +101,7 @@ void cloud_msg_upload_coredump() {
     if (data == nullptr) return;
 
     if (esp_partition_read(part, 0, data, size) != ESP_OK) {
-        free(data);
+        heap_caps_free(data);
         return;
     }
 
@@ -131,7 +131,7 @@ void cloud_msg_upload_coredump() {
         }
     }
 
-    free(data);
+    heap_caps_free(data);
 }
 
 void cloud_msg_send_claim_if_needed() {
@@ -147,7 +147,7 @@ void cloud_msg_send_claim_if_needed() {
 
     size_t token_len = CLAIM_TOKEN_MAX;
     if (kd_common_get_claim_token(reinterpret_cast<char*>(token), &token_len) != ESP_OK || token_len == 0) {
-        free(token);
+        heap_caps_free(token);
         return;
     }
 
@@ -161,7 +161,7 @@ void cloud_msg_send_claim_if_needed() {
 
     cloud_msg_queue(&msg);
     g_last_claim_ms = now;
-    free(token);
+    heap_caps_free(token);
 
     ESP_LOGI(TAG, "Sent claim request");
 }

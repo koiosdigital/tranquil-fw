@@ -544,7 +544,6 @@ esp_err_t ManifestDatabase::initialize() {
     if (!s_crc32_ready) crc32_init();
 
     init_sd();
-    //format_sd();
 
     struct stat st = { 0 };
     if (stat("/sd/patterns", &st) == -1) {

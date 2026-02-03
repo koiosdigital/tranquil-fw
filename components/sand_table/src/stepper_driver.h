@@ -318,11 +318,12 @@ namespace sand_table {
         static constexpr size_t kMaxIntervalsPerSegment = 32768;
 
         struct IntervalTable {
-            uint16_t intervals[kMaxIntervalsPerSegment];  // Microseconds per step
+            uint16_t* intervals = nullptr;  // Allocated from SPIRAM
             uint32_t total_steps = 0;
 
             void clear() { total_steps = 0; }
-        } interval_table_;
+        };
+        IntervalTable interval_table_;
 
         void prepare_interval_table(const VelocityProfile& profile, uint32_t total_steps);
 

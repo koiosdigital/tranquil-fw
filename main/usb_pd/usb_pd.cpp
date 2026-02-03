@@ -102,6 +102,5 @@ void stusb_init() {
     if (!controller.is_initialized()) {
         ESP_LOGE(TAG, "USB-PD initialization failed: %s",
             esp_err_to_name(controller.get_last_error()));
-        esp_restart();
     }
 }

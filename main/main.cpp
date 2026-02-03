@@ -51,9 +51,9 @@ extern "C" void app_main(void)
         ESP_LOGW(TAG, "ConfigManager init failed: %s, using defaults", esp_err_to_name(cfg_err));
     }
 
-    /*
+    //ManifestDatabase::instance().initialize();
 
-    ManifestDatabase::instance().initialize();
+    /*
 
     // Initialize job processing system
     jobs::JobQueue::instance().initialize();
@@ -65,6 +65,8 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "Job processing system initialized");
 
     */
+
+    vTaskSuspend(NULL);
 
     // Initialize motion controller
     g_motion_controller = new sand_table::MotionController();
@@ -96,11 +98,7 @@ extern "C" void app_main(void)
         PixelDriver::setCurrentLimit(1750);
         PixelDriver::start();
 
-        ESP_LOGI(TAG, "LED driver initialized: %d LEDs, %s format",
-            led_config.led_count, led_config.is_rgbw ? "RGBW" : "RGB");
-    }
-    else {
-        ESP_LOGI(TAG, "LEDs disabled in configuration");
+        kd_common_api_register_handlers(PixelDriver::attach_api);
     }
 
     tranquil_api_init();

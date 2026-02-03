@@ -649,13 +649,28 @@ namespace sand_table {
         if (rmt_sequencer_) {
             rmt_sequencer_->deinit();
         }
+        if (interval_table_.intervals) {
+            heap_caps_free(interval_table_.intervals);
+            interval_table_.intervals = nullptr;
+        }
     }
 
     Result<void> CoordinatedStepperController::init() {
+        // Allocate interval table from SPIRAM (65KB - too large for internal RAM)
+        interval_table_.intervals = static_cast<uint16_t*>(
+            heap_caps_calloc(kMaxIntervalsPerSegment, sizeof(uint16_t), MALLOC_CAP_SPIRAM)
+        );
+        if (!interval_table_.intervals) {
+            ESP_LOGE(TAG, "Failed to allocate interval table from SPIRAM");
+            return Result<void>::err(MotionError::HardwareFault);
+        }
+
         // Allocate RMT sequencer in internal RAM (required for ISR callback safety)
         void* mem = malloc(sizeof(RmtStepSequencer));
         if (!mem) {
             ESP_LOGE(TAG, "Failed to allocate RMT sequencer in internal RAM");
+            heap_caps_free(interval_table_.intervals);
+            interval_table_.intervals = nullptr;
             return Result<void>::err(MotionError::HardwareFault);
         }
         rmt_sequencer_.reset(new (mem) RmtStepSequencer());

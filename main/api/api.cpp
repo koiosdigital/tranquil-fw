@@ -41,13 +41,7 @@ static esp_err_t static_file_handler(httpd_req_t* req) {
     return ESP_OK;
 }
 
-void tranquil_api_init() {
-    // Set device info before mDNS
-    kd_common_set_device_info(FIRMWARE_VARIANT, "tranquil");
-
-    // Get handle for app-specific routes
-    httpd_handle_t server = kd_common_api_get_httpd_handle();
-
+static void register_tranquil_handlers(httpd_handle_t server) {
     // Register app-specific handlers
     patterns_api_register_handlers(server);
     playlists_api_register_handlers(server);
@@ -55,15 +49,8 @@ void tranquil_api_init() {
     PixelDriver::attach_api(server);
     license_api_register_handlers(server);
 
-    // Initialize unified message dispatcher with standard handlers
-    dispatcher_register_standard_handlers();
+    // Initialize websocket server
     websocket_server_init(server);
-
-    // Initialize player state broadcaster for rate-limited state updates
-    PlayerStateBroadcaster::instance().init();
-
-    // Initialize schedule manager for scheduled actions
-    ScheduleManager::instance().init();
 
     // Create an array of httpd_uri_t to keep them alive after the loop
     static httpd_uri_t static_file_uris[static_files::num_of_files + 1]; // +1 for root '/' override
@@ -101,4 +88,21 @@ void tranquil_api_init() {
         };
         httpd_register_uri_handler(server, &static_file_uris[static_files::num_of_files]);
     }
+}
+
+void tranquil_api_init() {
+    // Set device info before mDNS
+    kd_common_set_device_info(FIRMWARE_VARIANT, "tranquil");
+
+    // Initialize unified message dispatcher with standard handlers
+    dispatcher_register_standard_handlers();
+
+    // Initialize player state broadcaster for rate-limited state updates
+    PlayerStateBroadcaster::instance().init();
+
+    // Initialize schedule manager for scheduled actions
+    ScheduleManager::instance().init();
+
+    // Register handler callback - will be called when httpd starts (on WiFi connect)
+    kd_common_api_register_handlers(register_tranquil_handlers);
 }
