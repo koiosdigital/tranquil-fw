@@ -52,6 +52,8 @@ extern "C" void app_main(void)
     kd_common_set_provisioning_srp_password_format(PROVISIONING_SRP_FORMAT_STATIC);
     kd_common_init();
 
+    vTaskSuspend(NULL);
+
     // Initialize ConfigManager early (before components that need config)
     auto cfg_err = sand_table::ConfigManager::instance().init();
     if (cfg_err != ESP_OK) {
@@ -61,7 +63,7 @@ extern "C" void app_main(void)
     ManifestDatabase::instance().initialize();
     ManifestDatabase::instance().selfTest();
 
-    vTaskSuspend(NULL);
+
     /*
 
     // Initialize job processing system
