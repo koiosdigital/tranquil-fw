@@ -44,16 +44,15 @@ extern "C" {
 #define TEE_PRIVATE_BASE        0x600FE000
 #define TEE_PRIVATE_SIZE        0x1000      /* 4KB */
 
-#define TEE_HANDLERS_ADDR       0x600FE000  /* C handlers start here */
-#define TEE_HANDLERS_SIZE       0x080       /* 128 bytes for handlers */
-
 #define TEE_EXIT_STUB           0x600FE080  /* W0->W1 exit stub */
 #define TEE_ENTRY_STUB          0x600FE100  /* W1->W0 entry (WCL monitored) */
 #define TEE_RETURN_TRAMPOLINE   0x600FE200  /* W0->W1 return trampoline */
 
-#define TEE_DISPATCH_TABLE      0x600FE300  /* Dispatch table location */
+#define TEE_HANDLERS_ADDR       0x600FE300  /* C handlers copied here (PIC) */
+#define TEE_HANDLERS_SIZE       0x500       /* 1.25KB max for handlers */
+
 #define TEE_STATE_ADDR          0x600FEF00  /* TEE state variables */
-#define TEE_STACK_TOP           0x600FF000  /* Stack grows down from here */
+#define TEE_STACK_TOP           0x600FEF00  /* Stack grows down from state */
 
 #define TEE_API_ADDR            0x600FF000  /* Shared API structure */
 #define TEE_SHARED_SIZE         0x1000      /* 4KB */

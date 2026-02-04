@@ -35,9 +35,61 @@
 
 static const char* TAG = "tee";
 
-/* External declarations for handler initialization */
-extern void tee_api_init(void);
-extern void tee_state_init(void);
+/* Embedded handlers binary (generated from tee_handlers.c, linked at 0x600FE300) */
+extern const uint8_t _tee_handlers_bin[];
+extern const size_t _tee_handlers_bin_len;
+
+/* ============================================================================
+ * Bootloader-Time API Table Initialization
+ * ============================================================================ */
+
+/**
+ * @brief Initialize the shared API table
+ */
+static void tee_api_init(void)
+{
+    volatile tee_api_t* api = TEE_API();
+
+    /* Zero the entire structure */
+    memset((void*)api, 0, sizeof(tee_api_t));
+
+    /* Set header fields */
+    api->magic = TEE_API_MAGIC;
+    api->version = TEE_API_VERSION;
+    api->flags = 0;
+
+    /* Set capabilities - bitmask of supported services */
+    api->capabilities = (1 << TEE_SVC_NOP) |
+                       (1 << TEE_SVC_TEST) |
+                       (1 << TEE_SVC_GET_INFO);
+
+    /* Initialize call state */
+    api->service_id = 0;
+    api->result = 0;
+    api->call_count = 0;
+    api->return_addr = 0;
+
+    /* Memory barrier */
+    __asm__ volatile("memw" ::: "memory");
+}
+
+/**
+ * @brief Initialize the TEE private state
+ */
+static void tee_state_init(void)
+{
+    volatile tee_state_t* state = TEE_STATE();
+
+    /* Zero the state */
+    memset((void*)state, 0, sizeof(tee_state_t));
+
+    /* Mark as initialized */
+    state->initialized = 1;
+    state->attestation_level = 0;
+
+    /* Memory barrier */
+    __asm__ volatile("memw" ::: "memory");
+}
 
 /**
  * @brief Print current world status for debugging
@@ -117,6 +169,24 @@ __attribute__((noinline, used))
 static void continue_boot_in_w1(void)
 {
     print_world("continue_boot_in_w1");
+
+    /* Copy C handlers binary to RTC FAST (linked at 0x600FE300) */
+    size_t handlers_size = _tee_handlers_bin_len;
+    if (handlers_size > TEE_HANDLERS_SIZE) {
+        ESP_LOGW(TAG, "Handlers size %u exceeds max %u, truncating",
+                 (unsigned)handlers_size, TEE_HANDLERS_SIZE);
+        handlers_size = TEE_HANDLERS_SIZE;
+    }
+
+    /* Word-aligned copy */
+    const uint32_t* src = (const uint32_t*)_tee_handlers_bin;
+    uint32_t* dst = (uint32_t*)TEE_HANDLERS_ADDR;
+    size_t words = (handlers_size + 3) / 4;
+    for (size_t i = 0; i < words; i++) {
+        dst[i] = src[i];
+    }
+    ESP_LOGI(TAG, "Handlers binary copied to 0x%08x (%u bytes)",
+             TEE_HANDLERS_ADDR, (unsigned)handlers_size);
 
     /* Copy entry stub for app TEE calls */
     size_t entry_size = copy_to_rtc(
