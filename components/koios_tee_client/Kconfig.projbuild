@@ -1,0 +1,20 @@
+menu "Koios TEE Client (ESP32-S3)"
+    depends on IDF_TARGET_ESP32S3
+
+    config KOIOS_TEE_CLIENT_ENABLED
+        bool "Enable Koios TEE Client"
+        default y
+        help
+            Enable Koios TEE Client for calling TEE services from the app.
+            Requires TEE to be initialized by the bootloader.
+
+    config KOIOS_TEE_EXCLUDE_RTC_FAST
+        bool "Exclude RTC FAST from app heap"
+        default y
+        depends on KOIOS_TEE_CLIENT_ENABLED
+        help
+            When enabled, RTC FAST memory (0x600FE000-0x60100000) is reserved
+            for TEE and not added to the app's heap. This prevents the app
+            from overwriting TEE code and shared memory.
+
+endmenu

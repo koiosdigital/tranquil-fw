@@ -34,7 +34,7 @@
 #include "storage/jobs/thumbnail_executor.h"
 #include "storage/jobs/download_executor.h"
 
-#include "security/tee_client.h"
+#include "tee_client.h"
 
 static const char* TAG = "main";
 
@@ -65,25 +65,27 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "  [0x00] %08x %08x %08x %08x",
         tee_ws_entry[0], tee_ws_entry[1], tee_ws_entry[2], tee_ws_entry[3]);
 
-    // Initialize TEE and switch to World 1
-    int tee_ret = tee_init();
-    ESP_LOGI(TAG, "tee_init() returned: %d", tee_ret);
-
-    vTaskDelay(pdMS_TO_TICKS(3000));
+    // Verify TEE was initialized by bootloader
+    tee_error_t tee_ret = tee_client_init();
+    ESP_LOGI(TAG, "tee_client_init() returned: %d", tee_ret);
 
     if (tee_ret == TEE_OK) {
-        // Test World 1 -> World 0 -> World 1 round-trip
-        ESP_LOGI(TAG, "Testing TEE call...");
-        int32_t test_result = tee_test_call(0x42);
-        ESP_LOGI(TAG, "tee_test_call(0x42) returned: %ld", (long)test_result);
-        ESP_LOGI(TAG, "TEE call_count: %lu", (unsigned long)tee_get_call_count());
+        while (1) {
+            // Test World 1 -> World 0 -> World 1 round-trip
+            ESP_LOGI(TAG, "Testing TEE call...");
+            int32_t test_result = tee_call(TEE_SVC_TEST);
+            ESP_LOGI(TAG, "tee_call(TEE_SVC_TEST) returned: %ld", (long)test_result);
+            ESP_LOGI(TAG, "TEE call_count: %lu", (unsigned long)tee_get_call_count());
 
-        volatile tee_api_t* api = TEE_API();
-        ESP_LOGI(TAG, "api->response: 0x%lx (expected 0x1042)",
-            (unsigned long)api->response);
+            volatile tee_api_t* api = TEE_API();
+            ESP_LOGI(TAG, "api->result: %ld, api->debug_stage: %lu",
+                (long)api->result, (unsigned long)api->debug_stage);
+
+
+            print_world("post_tee_call");
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
     }
-
-    print_world("post_tee_call");
 
     vTaskSuspend(NULL);
 

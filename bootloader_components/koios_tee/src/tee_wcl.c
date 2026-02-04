@@ -42,9 +42,9 @@ void tee_wcl_configure(uint32_t core, uint32_t address)
         };
         REG_WRITE(WCL_CORE_0_MESSAGE_MAX_REG, wcl_core_0_message_max_reg.val);
 
-        /* Configure entry point 1 for W1->W0 transition (test service) */
+        /* Configure entry point 1 for W1->W0 transition */
         wcl_core_0_entry_1_addr_reg_t core_0_entry_1_addr_reg = {
-            .core_0_entry_1_addr = TEE_ENTRY_TEST
+            .core_0_entry_1_addr = address
         };
         REG_WRITE(WCL_CORE_0_ENTRY_1_ADDR_REG, core_0_entry_1_addr_reg.val);
 
@@ -72,9 +72,9 @@ void tee_wcl_configure(uint32_t core, uint32_t address)
         };
         REG_WRITE(WCL_CORE_1_MESSAGE_MAX_REG, wcl_core_1_message_max_reg.val);
 
-        /* Configure entry point 1 for W1->W1 transition (test service) */
+        /* Configure entry point 1 for W1->W0 transition */
         wcl_core_1_entry_1_addr_reg_t core_1_entry_1_addr_reg = {
-            .core_1_entry_1_addr = TEE_ENTRY_TEST
+            .core_1_entry_1_addr = address
         };
         REG_WRITE(WCL_CORE_1_ENTRY_1_ADDR_REG, core_1_entry_1_addr_reg.val);
 
@@ -103,7 +103,7 @@ void tee_wcl_configure(uint32_t core, uint32_t address)
  * @param core The core to enable this switch for, should be the core that called TEE
  *
  * @note This is called by service handlers before returning.
- *       The handler then jumps to TEE_ENTRY_TRAMPOLINE, which
+ *       The handler then jumps to TEE_RETURN_TRAMPOLINE, which
  *       triggers the world switch and jumps to return_addr.
  */
 void tee_wcl_setup_world_return(uint32_t return_addr, uint32_t core)
@@ -119,7 +119,7 @@ void tee_wcl_setup_world_return(uint32_t return_addr, uint32_t core)
 
         /* Indicate that it will happen at the trampoline */
         wcl_core_0_world_trigger_addr_reg_t core_0_world_trigger_addr = {
-            .core_0_world_trigger_addr = TEE_ENTRY_TRAMPOLINE
+            .core_0_world_trigger_addr = TEE_RETURN_TRAMPOLINE
         };
         REG_WRITE(WCL_CORE_0_WORLD_TRIGGER_ADDR_REG, core_0_world_trigger_addr.val);
 
@@ -138,7 +138,7 @@ void tee_wcl_setup_world_return(uint32_t return_addr, uint32_t core)
 
         /* Indicate that it will happen at the trampoline */
         wcl_core_1_world_trigger_addr_reg_t core_1_world_trigger_addr = {
-            .core_1_world_trigger_addr = TEE_ENTRY_TRAMPOLINE
+            .core_1_world_trigger_addr = TEE_RETURN_TRAMPOLINE
         };
         REG_WRITE(WCL_CORE_1_WORLD_TRIGGER_ADDR_REG, core_1_world_trigger_addr.val);
 
@@ -172,6 +172,9 @@ void tee_wcl_clear_write_buffer(uint32_t core)
     else {
         msg_addr = &TEE_STATE()->wcl_msg_seq_core1;
     }
+
+    /* Suppress unused variable warning - function intentionally not fully implemented */
+    (void)msg_addr;
 
     /* Write sequence 0-8 to trigger data bus switch to Non-secure World */
 

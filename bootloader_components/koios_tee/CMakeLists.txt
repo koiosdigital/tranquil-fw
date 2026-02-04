@@ -2,10 +2,11 @@ idf_component_register(
     SRCS
         "src/tee_init.c"
         "src/tee_wcl.c"
-        "src/tee_entry_stub.S"
         "src/tee_pms.c"
-        "src/tee_trampoline.S"
+        "src/tee_handlers.c"
+        "src/tee_entry_stub.S"
         "src/tee_exit_stub.S"
+        "src/tee_trampoline.S"
     INCLUDE_DIRS "include"
     PRIV_REQUIRES bootloader_support bootloader esp_app_format
 )

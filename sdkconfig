@@ -952,13 +952,13 @@ CONFIG_KD_COMMON_CONSOLE_ENABLE=y
 # end of KD Common Configuration
 
 #
-# Koios TEE (ESP32-S3)
+# Koios TEE Client (ESP32-S3)
 #
 # default:
-CONFIG_KOIOS_TEE_ENABLED=y
+CONFIG_KOIOS_TEE_CLIENT_ENABLED=y
 # default:
 CONFIG_KOIOS_TEE_EXCLUDE_RTC_FAST=y
-# end of Koios TEE (ESP32-S3)
+# end of Koios TEE Client (ESP32-S3)
 
 #
 # Polar Robot Motion System

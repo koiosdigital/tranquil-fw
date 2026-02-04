@@ -7,55 +7,45 @@
  * @file tee_trampoline.S
  * @brief Return trampoline for World 0 -> World 1 transition
  *
- * This code is copied to TEE_ENTRY_TRAMPOLINE (0x600FE200) in RTC FAST memory.
+ * This code is copied to TEE_RETURN_TRAMPOLINE (0x600FE200) in RTC FAST memory.
  * When executed, WCL detects the address and switches to World 1, then the
  * code jumps to the return address passed in a2.
  *
- * The world switch happens when the CPU's PC matches the configured
- * WORLD_TRIGGER_ADDR register.
+ * Position Independence:
+ *   This code is minimal and uses only the a2 register passed from the handler.
+ *
+ * Prerequisites:
+ *   1. a2 contains the return address
+ *   2. WCL configured: WORLD_PREPARE=0x2, WORLD_TRIGGER=this address, WORLD_UPDATE=1
+ *
+ * Flow:
+ *   1. Handler sets up WCL for W0->W1 transition
+ *   2. Handler loads return address into a2
+ *   3. Handler jumps here
+ *   4. WCL detects this address and switches to W1
+ *   5. Jump to a2 (return address) - now in W1
  */
 
     .section .text
-    .global tee_return_trampoline
-    .type   tee_return_trampoline, @function
+    .global tee_return_trampoline_start
+    .type   tee_return_trampoline_start, @function
     .align  4
 
-/*
- * tee_return_trampoline
- *
- * Entry:
- *   a2 = return address (set by handler before jumping here)
- *   WCL configured to switch to World 1 when this address is executed
- *
- * Exit:
- *   Jumps to a2 in World 1
- *
- * The handler sets up WCL registers:
- *   WORLD_PREPARE = WORLD_REE (0x02)
- *   WORLD_TRIGGER = TEE_ENTRY_TRAMPOLINE
- *   WORLD_UPDATE  = 1
- *
- * When CPU executes this address:
- *   - WCL triggers world switch to World 1
- *   - Execution continues in World 1
- *   - Jump to a2 returns to caller
- */
-tee_return_trampoline:
-    /* Two NOPs required per TRM 16.5.4.1 for world switch completion */
+tee_return_trampoline_start:
+    /* World switch completion (required by TRM 16.5.4.1) */
     nop.n
     nop.n
 
     /* Memory barrier after world switch */
     memw
 
-    /* Jump to return address - now in World 1 */
+    /* Jump to return address (in a2) - now in World 1 */
     jx      a2
 
-    .size   tee_return_trampoline, . - tee_return_trampoline
-
+    .size   tee_return_trampoline_start, . - tee_return_trampoline_start
 
 /*
- * Trampoline end marker for size calculation
+ * End marker for size calculation during copy
  */
     .global tee_return_trampoline_end
 tee_return_trampoline_end:
