@@ -7,7 +7,7 @@ idf_component_register(
         "src/tee_exit_stub.S"
         "src/tee_trampoline.S"
     INCLUDE_DIRS "include"
-    PRIV_REQUIRES bootloader_support bootloader esp_app_format
+    PRIV_REQUIRES bootloader_support bootloader esp_app_format soc
 )
 
 # Get the cross-compiler prefix
@@ -34,6 +34,7 @@ add_custom_command(
         -DESP_PLATFORM
         -mabi=call0
         -mlongcalls
+        -mtext-section-literals
         -fno-jump-tables
         -ffunction-sections
         -fdata-sections
