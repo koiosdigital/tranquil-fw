@@ -97,8 +97,11 @@ extern "C" {
         volatile uint32_t app_trust_level;   /* APP_TRUST_SIGNED or APP_TRUST_UNSIGNED */
         volatile uint32_t provisioned;       /* Non-zero if device is provisioned */
 
+        /* Debug counter - tracks execution progress through handler */
+        volatile uint32_t debug_stage;       /* Incremented at each stage */
+
         /* Padding to 64 bytes */
-        uint32_t reserved[6];
+        uint32_t reserved[5];
 
     } __attribute__((packed, aligned(4))) tee_api_t;
 

@@ -50,22 +50,23 @@ static void print_world(const char* tag) {
  * @param max_size Maximum bytes to copy
  * @return Number of bytes copied, or 0 on error
  */
-static size_t copy_handler_to_rtc(void* dest, const void* src, size_t max_size)
+static size_t copy_handler_to_rtc(void* dest, const void* src, const void* src_end, size_t max_size)
 {
     /*
-     * We don't know exact function sizes at compile time.
-     * Copy a reasonable amount and rely on the functions being small.
-     * The handler + trampoline should fit in ~256 bytes total.
+     * Calculate actual size from the end marker.
+     * The assembly files define foo_end labels for size calculation.
      */
-    size_t size = 128;  /* Conservative size for each handler */
+    size_t size = (size_t)((const uint8_t*)src_end - (const uint8_t*)src);
     if (size > max_size) {
+        ESP_LOGW(TAG, "Handler size %u exceeds max %u, truncating", (unsigned)size, (unsigned)max_size);
         size = max_size;
     }
 
-    /* Word-aligned copy for IRAM compatibility */
+    /* Word-aligned copy for IRAM compatibility - round UP to include partial words */
     const uint32_t* s = (const uint32_t*)src;
     uint32_t* d = (uint32_t*)dest;
-    for (size_t i = 0; i < size / 4; i++) {
+    size_t words = (size + 3) / 4;  /* Round up to next word */
+    for (size_t i = 0; i < words; i++) {
         d[i] = s[i];
     }
 
@@ -125,6 +126,7 @@ static void continue_boot_in_w1(void)
     size_t handler_size = copy_handler_to_rtc(
         (void*)TEE_ENTRY_TEST,
         (const void*)tee_test_handler,
+        (const void*)tee_test_handler_end,
         0x100  /* Max 256 bytes */
     );
     ESP_LOGI(TAG, "Copied test handler to 0x%08x (%u bytes)",
@@ -188,6 +190,7 @@ void bootloader_after_init(void)
     size_t exit_size = copy_handler_to_rtc(
         (void*)TEE_EXIT_TO_W1,
         (const void*)tee_exit_stub,
+        (const void*)tee_exit_stub_end,
         0x40  /* Max 64 bytes - stub builds address without literal pool */
     );
     ESP_LOGI(TAG, "Copied exit stub to 0x%08x (%u bytes)",
@@ -197,6 +200,7 @@ void bootloader_after_init(void)
     size_t tramp_size = copy_handler_to_rtc(
         (void*)TEE_ENTRY_TRAMPOLINE,
         (const void*)tee_return_trampoline,
+        (const void*)tee_return_trampoline_end,
         0x40  /* Max 64 bytes */
     );
     ESP_LOGI(TAG, "Copied trampoline to 0x%08x (%u bytes)",

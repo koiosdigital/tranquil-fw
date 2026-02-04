@@ -99,5 +99,6 @@ extern void tee_exit_stub_end(void);
 
 /* tee_trampoline.S */
 void tee_return_trampoline(void);
+extern void tee_return_trampoline_end(void);
 
 #endif /* TEE_CONFIG_H */

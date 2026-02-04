@@ -41,7 +41,11 @@
  *   - Jump to a2 returns to caller
  */
 tee_return_trampoline:
-    /* Memory barrier before world switch */
+    /* Two NOPs required per TRM 16.5.4.1 for world switch completion */
+    nop.n
+    nop.n
+
+    /* Memory barrier after world switch */
     memw
 
     /* Jump to return address - now in World 1 */

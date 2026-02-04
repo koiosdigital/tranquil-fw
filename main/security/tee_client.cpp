@@ -116,27 +116,33 @@ bool tee_is_world1(void)
 /**
  * @brief Call TEE entry point and return here
  *
- * This function:
- * 1. Stores the return label address in shared memory
- * 2. Jumps to TEE entry (triggering W1->W0 switch)
- * 3. TEE handler processes, configures W0->W1 switch
- * 4. Trampoline jumps to return_addr, resuming here
+ * Uses a15 to preserve A0 across the TEE call since the TEE handler
+ * doesn't touch a13-a15. This ensures retw works after returning.
  */
 static void __attribute__((noinline, used)) tee_invoke_entry(void)
 {
     volatile tee_api_t* api = TEE_API();
 
     /*
-     * Get the address of our return label using inline assembly.
-     * The trampoline will jump here after the world switch completes.
-     * We use a label instead of A0 because A0 contains windowed return
-     * format which can't be used with a simple jx instruction.
+     * Save A0 to a15 (TEE handler doesn't use a13-a15).
+     * Get return label address.
+     * Store return address in shared memory.
+     * Jump to TEE.
+     * After return, restore A0 from a15.
      */
-    uint32_t ret_addr;
     __asm__ volatile(
-        "movi %0, .Ltee_return_label\n"
-        : "=r"(ret_addr)
+        /* Save A0 to a15 (preserved across TEE call) */
+        "mov a15, a0\n"
+        /* Get return label address into a14 */
+        "movi a14, .Ltee_return_label\n"
+        :
+        :
+        : "a14", "a15"
     );
+
+    /* Store return address - use register directly */
+    uint32_t ret_addr;
+    __asm__ volatile("mov %0, a14" : "=r"(ret_addr));
     api->return_addr = ret_addr;
 
     /* Memory barrier */
@@ -144,18 +150,28 @@ static void __attribute__((noinline, used)) tee_invoke_entry(void)
 
     /*
      * Jump to TEE entry point.
-     * WCL will detect PC == TEE_ENTRY_TEST and switch to World 0.
+     * TEE handler uses: a2 (ret addr), a3 (core id), a8-a12 (temp)
+     * TEE handler preserves: a0, a1, a13-a15
+     * After return via trampoline, restore A0 and use explicit retw.
+     *
+     * We use explicit retw because the compiler doesn't understand the
+     * control flow (jx away, return via trampoline to label) and may
+     * generate incorrect return code.
      */
     __asm__ volatile(
         "movi a8, %0\n"
         "jx a8\n"
         ".Ltee_return_label:\n"
+        /* Restore A0 from a15 and return with windowed ABI */
+        "mov a0, a15\n"
+        "retw\n"
         :
         : "i"(TEE_ENTRY_TEST)
         : "a8", "memory"
     );
 
-    /* Execution resumes here after world switch back to W1 */
+    /* Never reached - retw returns directly */
+    __builtin_unreachable();
 }
 
 int32_t tee_test_call(uint32_t input)
