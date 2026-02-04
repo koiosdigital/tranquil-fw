@@ -113,13 +113,15 @@ tee_entry_stub_start:
 
     movi    a13, 4                  /* Debug: Stage 4 - Dispatch addr built */
 
+    /* Write stage 4 to debug_stage BEFORE callx0 */
+    s32i    a13, a8, API_DEBUG_STAGE_OFF
+
     /* ========================================================================
      * STAGE 5: Call C Dispatcher
      * ======================================================================== */
     /* a2 = service_id, a3 = api pointer, a9 = dispatcher address */
-    /* TEMP DEBUG: Skip C call, just set result=0 */
-    /* callx0  a9 */                /* Call tee_dispatch(service_id, api) */
-    movi    a2, 0                   /* TEMP: fake success result */
+    callx0  a9                      /* Call tee_dispatch(service_id, api) */
+                                    /* Result returned in a2 */
 
     movi    a13, 5                  /* Debug: Stage 5 - Returned from C */
 
@@ -166,14 +168,14 @@ tee_entry_stub_start:
 
     movi    a13, 7                  /* Debug: Stage 7 - PREPARE set */
 
-    /* Build trampoline address (0x600FE200) */
+    /* Build trampoline address (0x600FF080 - in shared memory so W1 can execute) */
     movi    a9, 0x600
     slli    a9, a9, 20
-    movi    a11, 0xFE
+    movi    a11, 0xFF
     slli    a11, a11, 12
-    or      a9, a9, a11             /* a9 = 0x600FE000 */
-    movi    a11, 0x200
-    or      a9, a9, a11             /* a9 = 0x600FE200 (trampoline) */
+    or      a9, a9, a11             /* a9 = 0x600FF000 */
+    movi    a11, 0x080
+    or      a9, a9, a11             /* a9 = 0x600FF080 (trampoline) */
 
     /* Set WORLD_TRIGGER = trampoline address */
     memw
@@ -195,11 +197,12 @@ tee_entry_stub_start:
     memw
 
     movi    a13, 10                 /* Debug: Stage 10 - Jumping */
+    s32i    a13, a8, API_DEBUG_STAGE_OFF  /* Write stage 10 */
 
     /* ========================================================================
      * STAGE 8: Jump to Trampoline
      * ======================================================================== */
-    /* a9 already contains trampoline address (0x600FE200) */
+    /* a9 already contains trampoline address (0x600FF080) */
     /* a2 contains return address for trampoline to use */
     jx      a9
 

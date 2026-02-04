@@ -3,60 +3,73 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/**
- * @file tee_handlers.c
- * @brief TEE service handlers and dispatch logic
- *
- * This file contains:
- * 1. C handlers compiled with PIC (-fPIC -fno-jump-tables)
- * 2. Bootloader-time initialization helpers
- *
- * All functions in .tee_handlers section are copied to RTC FAST memory
- * at boot time. The entry stub calls tee_dispatch() which must be the
- * FIRST function in this section (at offset 0 from TEE_HANDLERS_ADDR).
- *
- * Constraints for handlers:
- * - No global/static variables (use api struct for state)
- * - No switch statements (use if-else to avoid jump tables)
- * - Compiled with -fPIC -fno-jump-tables
- */
+ /**
+  * @file tee_handlers.c
+  * @brief TEE service handlers and dispatch logic
+  *
+  * This file contains:
+  * 1. C handlers compiled with PIC (-fPIC -fno-jump-tables)
+  * 2. Bootloader-time initialization helpers
+  *
+  * All functions in .tee_handlers section are copied to RTC FAST memory
+  * at boot time. The entry stub calls tee_dispatch() which must be the
+  * FIRST function in this section (at offset 0 from TEE_HANDLERS_ADDR).
+  *
+  * Constraints for handlers:
+  * - No global/static variables (use api struct for state)
+  * - No switch statements (use if-else to avoid jump tables)
+  * - Compiled with -fPIC -fno-jump-tables
+  */
 
 #include "tee_config.h"
 #include <string.h>
 
-/*
- * Handlers are compiled separately and linked at 0x600FE300.
- * No section attributes needed - the linker script handles placement.
- * tee_dispatch MUST be first (entry point specified in linker).
- */
+  /*
+   * Handlers are compiled separately and linked at 0x600FE300.
+   * No section attributes needed - the linker script handles placement.
+   * tee_dispatch MUST be first (entry point specified in linker).
+   */
 
-/* ============================================================================
- * C Handlers - linked at 0x600FE300 (RTC FAST)
- * ============================================================================ */
+   /* ============================================================================
+    * C Handlers - linked at 0x600FE300 (RTC FAST)
+    * ============================================================================ */
 
-/**
- * @brief Service dispatcher - entry point called from assembly stub
- *
- * Routes service calls to appropriate handlers.
- * This is the ENTRY POINT - must be at 0x600FE300.
- *
- * @param service_id Service to invoke
- * @param api Pointer to shared API structure
- * @return Result code (TEE_OK or error)
- */
+    /**
+     * @brief Service dispatcher - entry point called from assembly stub
+     *
+     * Routes service calls to appropriate handlers.
+     * This is the ENTRY POINT - must be at 0x600FE300.
+     *
+     * @param service_id Service to invoke
+     * @param api Pointer to shared API structure
+     * @return Result code (TEE_OK or error)
+     */
 int32_t tee_dispatch(uint32_t service_id, volatile tee_api_t* api)
 {
+    /* TEMP: Write marker - small value fits in movi (max 2047) */
+    api->call_count = 99;  /* Marker: handler was reached */
+
+    /* DEBUG: Copy return_addr to reserved[0] so we can see it after reset */
+    api->reserved[0] = api->return_addr;
+
+    (void)service_id;
+    return 0;
+#if 0
     /* Use if-else instead of switch to avoid jump tables */
     if (service_id == TEE_SVC_NOP) {
         return tee_handle_nop(api);
-    } else if (service_id == TEE_SVC_TEST) {
+    }
+    else if (service_id == TEE_SVC_TEST) {
         return tee_handle_test(api);
-    } else if (service_id == TEE_SVC_GET_INFO) {
+    }
+    else if (service_id == TEE_SVC_GET_INFO) {
         return tee_handle_get_info(api);
-    } else {
+    }
+    else {
         api->last_error = TEE_ERR_INVALID_SVC;
         return TEE_ERR_INVALID_SVC;
     }
+#endif
 }
 
 /**

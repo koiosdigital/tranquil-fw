@@ -21,8 +21,11 @@
  *
  * Stores return address in API, then jumps to TEE entry stub.
  * WCL triggers world switch when entry stub address is executed.
+ *
+ * MUST be in IRAM - return point needs to be in IRAM, not flash,
+ * because flash cache access after world switch may not work.
  */
-static inline int32_t tee_invoke(void)
+static int32_t __attribute__((noinline, section(".iram1"))) tee_invoke(void)
 {
     volatile tee_api_t* api = TEE_API();
     int32_t result;
@@ -43,6 +46,11 @@ static inline int32_t tee_invoke(void)
      * and execution continues at the return label.
      */
     __asm__ volatile(
+        /* Save a0 (return address) and a1 (stack pointer) before TEE call */
+        /* Use api->reserved[1] (offset 100) for a1, reserved[2] (offset 104) for a0 */
+        "s32i   a0, %[api], 104\n"          /* api->reserved[2] = a0 (return addr) */
+        "s32i   a1, %[api], 100\n"          /* api->reserved[1] = a1 (stack ptr) */
+
         /* Build return address and store in API */
         "movi   a2, .Ltee_return_%=\n"
         "s32i   a2, %[api], 28\n"           /* api->return_addr offset */
@@ -62,6 +70,15 @@ static inline int32_t tee_invoke(void)
 
         /* Return point - execution resumes here after TEE returns */
         ".Ltee_return_%=:\n"
+        /* Rebuild API address (0x600FF000) - can't trust any registers after TEE */
+        "movi   a2, 0x600\n"
+        "slli   a2, a2, 20\n"
+        "movi   a3, 0xFF\n"
+        "slli   a3, a3, 12\n"
+        "or     a2, a2, a3\n"               /* a2 = 0x600FF000 (API address) */
+        /* Restore a0 and a1 from api->reserved */
+        "l32i   a0, a2, 104\n"              /* Restore a0 (return addr) */
+        "l32i   a1, a2, 100\n"              /* Restore a1 (stack ptr) */
         "memw\n"
         :
         : [api] "a"(api)

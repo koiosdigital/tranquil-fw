@@ -65,12 +65,24 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "  [0x00] %08x %08x %08x %08x",
         tee_ws_entry[0], tee_ws_entry[1], tee_ws_entry[2], tee_ws_entry[3]);
 
+    // Dump handlers at 0x600FE300
+    uint32_t* tee_handlers = (uint32_t*)0x600FE300;
+    ESP_LOGI(TAG, "TEE handlers @ 0x600FE300:");
+    ESP_LOGI(TAG, "  [0x00] %08x %08x %08x %08x",
+        tee_handlers[0], tee_handlers[1], tee_handlers[2], tee_handlers[3]);
+    // Expected for minimal handler: 020c f00d (movi.n a2,0; ret.n)
+    // In little-endian 32-bit: 0x0df00c02
+
     // Verify TEE was initialized by bootloader
     tee_error_t tee_ret = tee_client_init();
     ESP_LOGI(TAG, "tee_client_init() returned: %d", tee_ret);
 
     if (tee_ret == TEE_OK) {
         while (1) {
+            // Check debug_stage before call (should be 0 or previous value)
+            volatile tee_api_t* api_pre = TEE_API();
+            ESP_LOGI(TAG, "Before TEE: debug_stage=0x%lx", (unsigned long)api_pre->debug_stage);
+
             // Test World 1 -> World 0 -> World 1 round-trip
             ESP_LOGI(TAG, "Testing TEE call...");
             int32_t test_result = tee_call(TEE_SVC_TEST);

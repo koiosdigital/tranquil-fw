@@ -28,16 +28,16 @@ extern "C" {
  * RTC FAST Memory: 0x600FE000 - 0x60100000 (8KB total)
  *
  * 0x600FE000-0x600FF000 (4KB): TEE Private (World 0 only)
- *   0x600FE000-0x600FE080: C handler code area (tee_handlers.c)
+ *   0x600FE000-0x600FE080: [reserved]
  *   0x600FE080: TEE_EXIT_STUB - W0->W1 exit stub for bootloader
  *   0x600FE100: TEE_ENTRY_STUB - W1->W0 entry (WCL monitored)
- *   0x600FE200: TEE_RETURN_TRAMPOLINE - W0->W1 return trampoline
- *   0x600FE300-0x600FEF00: Handler dispatch table, data
+ *   0x600FE300-0x600FEF00: C handlers (linked at this address)
  *   0x600FEF00-0x600FF000: State variables, stack
  *
  * 0x600FF000-0x60100000 (4KB): Shared Memory (both worlds)
  *   0x600FF000: tee_api_t structure (128 bytes)
- *   0x600FF080-0x60100000: Request/response buffers
+ *   0x600FF080: TEE_RETURN_TRAMPOLINE - W0->W1 return (must be in shared so W1 can execute)
+ *   0x600FF0C0-0x60100000: Request/response buffers
  */
 
 /* Fixed memory addresses */
@@ -46,7 +46,7 @@ extern "C" {
 
 #define TEE_EXIT_STUB           0x600FE080  /* W0->W1 exit stub */
 #define TEE_ENTRY_STUB          0x600FE100  /* W1->W0 entry (WCL monitored) */
-#define TEE_RETURN_TRAMPOLINE   0x600FE200  /* W0->W1 return trampoline */
+#define TEE_RETURN_TRAMPOLINE   0x600FF080  /* W0->W1 return trampoline (in shared memory so W1 can execute) */
 
 #define TEE_HANDLERS_ADDR       0x600FE300  /* C handlers copied here (PIC) */
 #define TEE_HANDLERS_SIZE       0x500       /* 1.25KB max for handlers */
@@ -56,7 +56,7 @@ extern "C" {
 
 #define TEE_API_ADDR            0x600FF000  /* Shared API structure */
 #define TEE_SHARED_SIZE         0x1000      /* 4KB */
-#define TEE_BUFFER_ADDR         0x600FF080  /* Start of buffer area */
+#define TEE_BUFFER_ADDR         0x600FF0C0  /* Start of buffer area (after trampoline) */
 #define TEE_BUFFER_SIZE         0x0F80      /* ~4KB for buffers */
 
 /* ============================================================================

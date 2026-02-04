@@ -3,27 +3,27 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/**
- * @file tee_init.c
- * @brief TEE initialization in bootloader
- *
- * Uses ESP-IDF bootloader hooks to initialize the TEE before the
- * application starts. Sets up:
- * - Handler code in RTC FAST memory
- * - World Controller entry points
- * - Shared memory API table
- *
- * Initialization Flow:
- * 1. bootloader_after_init() runs in W0 (secure world)
- * 2. Configure PMS (placeholder)
- * 3. Copy stubs to RTC FAST memory
- * 4. Configure WCL for W0->W1 exit
- * 5. Jump to exit stub -> switches to W1
- * 6. continue_boot_in_w1() runs in W1
- * 7. Copy entry stub, configure WCL for app calls
- * 8. Initialize API table
- * 9. Load and launch application
- */
+ /**
+  * @file tee_init.c
+  * @brief TEE initialization in bootloader
+  *
+  * Uses ESP-IDF bootloader hooks to initialize the TEE before the
+  * application starts. Sets up:
+  * - Handler code in RTC FAST memory
+  * - World Controller entry points
+  * - Shared memory API table
+  *
+  * Initialization Flow:
+  * 1. bootloader_after_init() runs in W0 (secure world)
+  * 2. Configure PMS (placeholder)
+  * 3. Copy stubs to RTC FAST memory
+  * 4. Configure WCL for W0->W1 exit
+  * 5. Jump to exit stub -> switches to W1
+  * 6. continue_boot_in_w1() runs in W1
+  * 7. Copy entry stub, configure WCL for app calls
+  * 8. Initialize API table
+  * 9. Load and launch application
+  */
 
 #include <string.h>
 #include "esp_log.h"
@@ -43,9 +43,9 @@ extern const size_t _tee_handlers_bin_len;
  * Bootloader-Time API Table Initialization
  * ============================================================================ */
 
-/**
- * @brief Initialize the shared API table
- */
+ /**
+  * @brief Initialize the shared API table
+  */
 static void tee_api_init(void)
 {
     volatile tee_api_t* api = TEE_API();
@@ -60,8 +60,8 @@ static void tee_api_init(void)
 
     /* Set capabilities - bitmask of supported services */
     api->capabilities = (1 << TEE_SVC_NOP) |
-                       (1 << TEE_SVC_TEST) |
-                       (1 << TEE_SVC_GET_INFO);
+        (1 << TEE_SVC_TEST) |
+        (1 << TEE_SVC_GET_INFO);
 
     /* Initialize call state */
     api->service_id = 0;
@@ -123,7 +123,7 @@ static size_t copy_to_rtc(void* dest, const void* src, const void* src_end, size
 
     if (size > max_size) {
         ESP_LOGW(TAG, "Code size %u exceeds max %u, truncating",
-                 (unsigned)size, (unsigned)max_size);
+            (unsigned)size, (unsigned)max_size);
         size = max_size;
     }
 
@@ -151,12 +151,12 @@ static void sync_icache(void)
  * Bootloader Hooks
  * ============================================================================ */
 
-/**
- * @brief Called before bootloader hardware initialization
- */
+ /**
+  * @brief Called before bootloader hardware initialization
+  */
 void bootloader_before_init(void)
 {
-    /* Nothing needed */
+
 }
 
 /**
@@ -174,7 +174,7 @@ static void continue_boot_in_w1(void)
     size_t handlers_size = _tee_handlers_bin_len;
     if (handlers_size > TEE_HANDLERS_SIZE) {
         ESP_LOGW(TAG, "Handlers size %u exceeds max %u, truncating",
-                 (unsigned)handlers_size, TEE_HANDLERS_SIZE);
+            (unsigned)handlers_size, TEE_HANDLERS_SIZE);
         handlers_size = TEE_HANDLERS_SIZE;
     }
 
@@ -186,7 +186,7 @@ static void continue_boot_in_w1(void)
         dst[i] = src[i];
     }
     ESP_LOGI(TAG, "Handlers binary copied to 0x%08x (%u bytes)",
-             TEE_HANDLERS_ADDR, (unsigned)handlers_size);
+        TEE_HANDLERS_ADDR, (unsigned)handlers_size);
 
     /* Copy entry stub for app TEE calls */
     size_t entry_size = copy_to_rtc(
@@ -196,7 +196,7 @@ static void continue_boot_in_w1(void)
         0x100  /* Max 256 bytes */
     );
     ESP_LOGI(TAG, "Entry stub copied to 0x%08x (%u bytes)",
-             TEE_ENTRY_STUB, (unsigned)entry_size);
+        TEE_ENTRY_STUB, (unsigned)entry_size);
 
     sync_icache();
 
@@ -246,6 +246,24 @@ void bootloader_after_init(void)
 {
     print_world("bootloader_after_init");
 
+    volatile tee_api_t* api = TEE_API();
+    uint32_t debug_stage = api->debug_stage;
+    uint32_t call_count = api->call_count;
+    uint32_t magic = api->magic;
+
+    /* Use early log (works before full init) */
+    ESP_LOGE(TAG, "RTC FAST post-reset: magic=0x%08lx debug_stage=%lu call_count=%lu",
+        (unsigned long)magic, (unsigned long)debug_stage, (unsigned long)call_count);
+
+    /* Log the captured return_addr (stored by handler in reserved[0]) */
+    ESP_LOGE(TAG, "Captured return_addr=0x%08lx  current return_addr=0x%08lx",
+        (unsigned long)api->reserved[0], (unsigned long)api->return_addr);
+
+    /* Also dump first words of handler area */
+    uint32_t* handlers = (uint32_t*)TEE_HANDLERS_ADDR;
+    ESP_LOGE(TAG, "Handlers @ 0x%08x: %08lx %08lx",
+        TEE_HANDLERS_ADDR, (unsigned long)handlers[0], (unsigned long)handlers[1]);
+
     /* 1. Configure PMS while in secure world */
     tee_configure_pms();
 
@@ -261,7 +279,7 @@ void bootloader_after_init(void)
         0x40  /* Max 64 bytes */
     );
     ESP_LOGI(TAG, "Exit stub copied to 0x%08x (%u bytes)",
-             TEE_EXIT_STUB, (unsigned)exit_size);
+        TEE_EXIT_STUB, (unsigned)exit_size);
 
     /* Copy return trampoline */
     size_t tramp_size = copy_to_rtc(
@@ -271,7 +289,7 @@ void bootloader_after_init(void)
         0x40  /* Max 64 bytes */
     );
     ESP_LOGI(TAG, "Trampoline copied to 0x%08x (%u bytes)",
-             TEE_RETURN_TRAMPOLINE, (unsigned)tramp_size);
+        TEE_RETURN_TRAMPOLINE, (unsigned)tramp_size);
 
     sync_icache();
 
@@ -294,9 +312,9 @@ void bootloader_after_init(void)
         __asm__ volatile(
             "jx %0\n"
             :
-            : "r"(target)
+        : "r"(target)
             : "memory"
-        );
+            );
     }
 
     /* Should never reach here */
