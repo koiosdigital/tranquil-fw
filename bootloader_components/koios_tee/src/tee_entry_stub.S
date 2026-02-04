@@ -34,7 +34,6 @@
  *   a9  - Scratch register
  *   a10 - WCL per-core base, built after call
  *   a11 - Scratch for address building
- *   a13 - Debug stage counter
  */
 
     .section .text
@@ -48,8 +47,6 @@
 #define API_SERVICE_ID_OFF      16
 #define API_RESULT_OFF          20
 #define API_RETURN_ADDR_OFF     28
-#define API_DEBUG_STAGE_OFF     80
-#define API_CORE_ID_OFF         88
 
 /*
  * WCL register offsets from per-core base
@@ -65,8 +62,6 @@ tee_entry_stub_start:
     nop.n                           /* Required by TRM 16.5.4.1 */
     nop.n
 
-    movi    a13, 1                  /* Debug: Stage 1 - Entry */
-
     /* ========================================================================
      * STAGE 2: Set Up Stack Pointer (0x600FEF00)
      * ======================================================================== */
@@ -77,8 +72,6 @@ tee_entry_stub_start:
     or      a1, a1, a9              /* a1 = 0x600FE000 */
     movi    a9, 0xF00               /* a9 = 0xF00 */
     or      a1, a1, a9              /* a1 = 0x600FEF00 (stack pointer) */
-
-    movi    a13, 2                  /* Debug: Stage 2 - Stack set */
 
     /* ========================================================================
      * STAGE 3: Build TEE_API_ADDR (0x600FF000) and Read Service ID
@@ -93,13 +86,6 @@ tee_entry_stub_start:
     l32i    a2, a8, API_SERVICE_ID_OFF   /* a2 = service_id (arg 1) */
     mov     a3, a8                       /* a3 = api pointer (arg 2) */
 
-    /* Store core ID in API for debug */
-    rsr.prid a4                     /* Read processor ID */
-    extui   a4, a4, 13, 1           /* Extract core ID (bit 13) */
-    s32i    a4, a8, API_CORE_ID_OFF
-
-    movi    a13, 3                  /* Debug: Stage 3 - Args ready */
-
     /* ========================================================================
      * STAGE 4: Build Dispatcher Address (TEE_HANDLERS_ADDR = 0x600FE300)
      * ======================================================================== */
@@ -111,19 +97,12 @@ tee_entry_stub_start:
     movi    a10, 0x300              /* a10 = 0x300 */
     or      a9, a9, a10             /* a9 = 0x600FE300 (tee_dispatch) */
 
-    movi    a13, 4                  /* Debug: Stage 4 - Dispatch addr built */
-
-    /* Write stage 4 to debug_stage BEFORE callx0 */
-    s32i    a13, a8, API_DEBUG_STAGE_OFF
-
     /* ========================================================================
      * STAGE 5: Call C Dispatcher
      * ======================================================================== */
     /* a2 = service_id, a3 = api pointer, a9 = dispatcher address */
     callx0  a9                      /* Call tee_dispatch(service_id, api) */
                                     /* Result returned in a2 */
-
-    movi    a13, 5                  /* Debug: Stage 5 - Returned from C */
 
     /* ========================================================================
      * STAGE 6: Rebuild Addresses (clobbered by C call)
@@ -151,8 +130,6 @@ tee_entry_stub_start:
     slli    a11, a3, 10             /* a11 = core_id * 0x400 */
     add     a10, a10, a11           /* a10 = per-core WCL base */
 
-    movi    a13, 6                  /* Debug: Stage 6 - Addresses rebuilt */
-
     /* ========================================================================
      * STAGE 7: Setup WCL Return (W0 -> W1)
      * ======================================================================== */
@@ -165,8 +142,6 @@ tee_entry_stub_start:
     movi    a9, 2
     memw
     s32i    a9, a10, WCL_WORLD_PREPARE_OFF
-
-    movi    a13, 7                  /* Debug: Stage 7 - PREPARE set */
 
     /* Build trampoline address (0x600FF080 - in shared memory so W1 can execute) */
     movi    a9, 0x600
@@ -181,23 +156,13 @@ tee_entry_stub_start:
     memw
     s32i    a9, a10, WCL_WORLD_TRIGGER_OFF
 
-    movi    a13, 8                  /* Debug: Stage 8 - TRIGGER set */
-
     /* Set WORLD_UPDATE = 1 to commit changes */
     movi    a11, 1
     memw
     s32i    a11, a10, WCL_WORLD_UPDATE_OFF
 
-    movi    a13, 9                  /* Debug: Stage 9 - UPDATE set */
-
-    /* Store debug stage in API */
-    s32i    a13, a8, API_DEBUG_STAGE_OFF
-
     /* Memory barrier before jump */
     memw
-
-    movi    a13, 10                 /* Debug: Stage 10 - Jumping */
-    s32i    a13, a8, API_DEBUG_STAGE_OFF  /* Write stage 10 */
 
     /* ========================================================================
      * STAGE 8: Jump to Trampoline

@@ -246,24 +246,6 @@ void bootloader_after_init(void)
 {
     print_world("bootloader_after_init");
 
-    volatile tee_api_t* api = TEE_API();
-    uint32_t debug_stage = api->debug_stage;
-    uint32_t call_count = api->call_count;
-    uint32_t magic = api->magic;
-
-    /* Use early log (works before full init) */
-    ESP_LOGE(TAG, "RTC FAST post-reset: magic=0x%08lx debug_stage=%lu call_count=%lu",
-        (unsigned long)magic, (unsigned long)debug_stage, (unsigned long)call_count);
-
-    /* Log the captured return_addr (stored by handler in reserved[0]) */
-    ESP_LOGE(TAG, "Captured return_addr=0x%08lx  current return_addr=0x%08lx",
-        (unsigned long)api->reserved[0], (unsigned long)api->return_addr);
-
-    /* Also dump first words of handler area */
-    uint32_t* handlers = (uint32_t*)TEE_HANDLERS_ADDR;
-    ESP_LOGE(TAG, "Handlers @ 0x%08x: %08lx %08lx",
-        TEE_HANDLERS_ADDR, (unsigned long)handlers[0], (unsigned long)handlers[1]);
-
     /* 1. Configure PMS while in secure world */
     tee_configure_pms();
 
