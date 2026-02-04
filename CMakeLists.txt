@@ -24,3 +24,4 @@ add_compile_definitions(ENABLE_OTA) #comment this line to disable OTA updates
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
 project(tranquil-fw)
+

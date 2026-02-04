@@ -1,0 +1,20 @@
+menu "Koios TEE (ESP32-S3)"
+    depends on IDF_TARGET_ESP32S3
+
+    config KOIOS_TEE_ENABLED
+        bool "Enable Koios TEE"
+        default y
+        help
+            Enable Koios TEE (Trusted Execution Environment).
+            TEE runs in RTC FAST memory (8KB at 0x600FE000).
+
+    config KOIOS_TEE_EXCLUDE_RTC_FAST
+        bool "Exclude RTC FAST from app heap"
+        default y
+        depends on KOIOS_TEE_ENABLED
+        help
+            When enabled, RTC FAST memory is reserved for TEE and
+            not added to the app's heap. This prevents the app from
+            overwriting TEE code.
+
+endmenu

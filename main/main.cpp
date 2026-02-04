@@ -34,13 +34,56 @@
 #include "storage/jobs/thumbnail_executor.h"
 #include "storage/jobs/download_executor.h"
 
+#include "security/tee_client.h"
+
 static const char* TAG = "main";
 
 static sand_table::MotionController* g_motion_controller = nullptr;
 
+static void print_world(const char* tag) {
+    // Read WCL_CORE_0_World_IRam0_REG
+    uint32_t wcl0_val = *(volatile uint32_t*)0x600D0000 + 0x150;
+    uint32_t world0_bit = wcl0_val & 0x1;  // Extract bit 0
+
+    uint32_t wcl1_val = *(volatile uint32_t*)0x600D0000 + 0x550;
+    uint32_t world1_bit = wcl1_val & 0x1;  // Extract bit 0
+
+    // Per TRM: bit 0 indicates IRAM world - 0=non-secure(W1), 1=secure(W0)
+    // Note: W0=secure, W1=non-secure
+    const char* world0_name = world0_bit ? "secure" : "non-secure";
+    const char* world1_name = world1_bit ? "secure" : "non-secure";
+    ESP_LOGE(TAG, "%s: core 0: %s, core 1: %s", tag, world0_name, world1_name);
+}
+
 extern "C" void app_main(void)
 {
-    kdc_heap_trace_init();
+    print_world("app_main_start");
+
+    // Dump what's at the hardcoded TEE_ENTRY_ADDR (0x600FE100)
+    uint32_t* tee_ws_entry = (uint32_t*)0x600FE100;
+    ESP_LOGI(TAG, "TEE world switch entry @ 0x600FE100:");
+    ESP_LOGI(TAG, "  [0x00] %08x %08x %08x %08x",
+        tee_ws_entry[0], tee_ws_entry[1], tee_ws_entry[2], tee_ws_entry[3]);
+
+    // Initialize TEE and switch to World 1
+    int tee_ret = tee_init();
+    ESP_LOGI(TAG, "tee_init() returned: %d", tee_ret);
+
+    vTaskDelay(pdMS_TO_TICKS(3000));
+
+    if (tee_ret == TEE_OK) {
+        // Test World 1 -> World 0 -> World 1 round-trip
+        ESP_LOGI(TAG, "Testing TEE call...");
+        int32_t test_result = tee_test_call(0x42);
+        ESP_LOGI(TAG, "tee_test_call(0x42) returned: %ld", (long)test_result);
+        ESP_LOGI(TAG, "TEE call_count: %lu", (unsigned long)tee_get_call_count());
+
+        volatile tee_api_t* api = TEE_API();
+        ESP_LOGI(TAG, "api->response: 0x%lx (expected 0x1042)",
+            (unsigned long)api->response);
+    }
+
+    vTaskSuspend(NULL);
 
     // Disable watchdogs for slow integrity checking
     esp_task_wdt_deinit();
@@ -51,8 +94,6 @@ extern "C" void app_main(void)
 
     kd_common_set_provisioning_srp_password_format(PROVISIONING_SRP_FORMAT_STATIC);
     kd_common_init();
-
-    vTaskSuspend(NULL);
 
     // Initialize ConfigManager early (before components that need config)
     auto cfg_err = sand_table::ConfigManager::instance().init();
