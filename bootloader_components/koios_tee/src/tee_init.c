@@ -90,6 +90,7 @@ static void init_api_table(void)
     api->request = 0;
     api->response = 0;
     api->return_addr = 0;
+    api->handler_addr = 0;  /* Not used - handler logic is inline in entry stub */
 
     /* Memory barrier */
     __asm__ volatile("memw" ::: "memory");

@@ -83,6 +83,8 @@ extern "C" void app_main(void)
             (unsigned long)api->response);
     }
 
+    print_world("post_tee_call");
+
     vTaskSuspend(NULL);
 
     // Disable watchdogs for slow integrity checking

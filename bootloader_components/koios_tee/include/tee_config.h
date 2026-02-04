@@ -71,7 +71,8 @@ typedef struct {
     volatile uint32_t request;           /* Input from app */
     volatile uint32_t response;          /* Output from TEE */
     volatile uint32_t return_addr;       /* Return address for world switch */
-    uint32_t reserved[9];                /* Padding to 64 bytes */
+    uint32_t handler_addr;               /* Address of C handler in flash (set by bootloader) */
+    uint32_t reserved[8];                /* Padding to 64 bytes */
 } __attribute__((packed, aligned(4))) tee_api_t;
 
 #define TEE_API() ((volatile tee_api_t*)TEE_API_ADDR)
@@ -85,8 +86,9 @@ void tee_wcl_configure(uint32_t core, uint32_t address);
 void tee_wcl_setup_world_return(uint32_t return_addr, uint32_t core);
 void tee_wcl_clear_write_buffer(uint32_t core);
 
-/* tee_handlers.c */
+/* tee_entry_stub.S - entry stub copied to RTC (includes inline handler logic) */
 void tee_test_handler(void);
+extern void tee_test_handler_end(void);
 
 /* tee_pms.c */
 void tee_configure_pms(void);

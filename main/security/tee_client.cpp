@@ -116,22 +116,27 @@ bool tee_is_world1(void)
 /**
  * @brief Call TEE entry point and return here
  *
- * This is done in a separate noinline function to ensure the return
- * address mechanism works properly. The function:
- * 1. Stores its return address in shared memory
+ * This function:
+ * 1. Stores the return label address in shared memory
  * 2. Jumps to TEE entry (triggering W1->W0 switch)
- * 3. TEE handler will configure W0->W1 switch and return here
+ * 3. TEE handler processes, configures W0->W1 switch
+ * 4. Trampoline jumps to return_addr, resuming here
  */
 static void __attribute__((noinline, used)) tee_invoke_entry(void)
 {
     volatile tee_api_t* api = TEE_API();
 
     /*
-     * Get our return address (where the caller of this function should return to).
-     * After the TEE processes, it will use this to return to our caller.
+     * Get the address of our return label using inline assembly.
+     * The trampoline will jump here after the world switch completes.
+     * We use a label instead of A0 because A0 contains windowed return
+     * format which can't be used with a simple jx instruction.
      */
     uint32_t ret_addr;
-    __asm__ volatile("mov %0, a0" : "=r"(ret_addr));
+    __asm__ volatile(
+        "movi %0, .Ltee_return_label\n"
+        : "=r"(ret_addr)
+    );
     api->return_addr = ret_addr;
 
     /* Memory barrier */
@@ -140,15 +145,17 @@ static void __attribute__((noinline, used)) tee_invoke_entry(void)
     /*
      * Jump to TEE entry point.
      * WCL will detect PC == TEE_ENTRY_TEST and switch to World 0.
-     * The TEE handler will process the request, then configure
-     * a return switch and jump to the trampoline.
-     * The trampoline will then jump to api->return_addr in World 1.
      */
-    typedef void (*tee_fn)(void);
-    tee_fn fn = (tee_fn)TEE_ENTRY_TEST;
-    fn();
+    __asm__ volatile(
+        "movi a8, %0\n"
+        "jx a8\n"
+        ".Ltee_return_label:\n"
+        :
+        : "i"(TEE_ENTRY_TEST)
+        : "a8", "memory"
+    );
 
-    /* We shouldn't reach here - the TEE returns via trampoline to our caller */
+    /* Execution resumes here after world switch back to W1 */
 }
 
 int32_t tee_test_call(uint32_t input)
