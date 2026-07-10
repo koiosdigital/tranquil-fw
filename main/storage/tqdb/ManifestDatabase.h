@@ -138,10 +138,6 @@ public:
     void releaseMemory();   // No-op, kept for API compatibility
     esp_err_t vacuum();     // Compact database file (reclaim deleted space)
 
-    // Self-test: exercises all CRUD operations and reports timing
-    // Returns ESP_OK if all tests pass, logs detailed results
-    esp_err_t selfTest(int iterations = 100);
-
     // Job queue operations (using internal IDs)
     esp_err_t enqueueJob(jobs::Job& job);  // ID assigned on success
     std::optional<jobs::Job> claimNextPendingJob();

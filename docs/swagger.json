@@ -44,6 +44,14 @@
     {
       "name": "LED",
       "description": "LED lighting control"
+    },
+    {
+      "name": "Config",
+      "description": "Motion/LED configuration, calibration, presets"
+    },
+    {
+      "name": "Schedule",
+      "description": "Scheduled actions"
     }
   ],
   "paths": {
@@ -562,6 +570,48 @@
             "$ref": "#/components/responses/NotFound"
           }
         }
+      },
+      "patch": {
+        "tags": [
+          "Playlists"
+        ],
+        "summary": "Update playlist metadata and/or replace pattern list",
+        "operationId": "updatePlaylist",
+        "parameters": [
+          {
+            "name": "uuid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdatePlaylistRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated playlist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Playlist"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Playlist not found"
+          }
+        }
       }
     },
     "/api/playlists/{uuid}/order": {
@@ -873,6 +923,276 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/api/system/info": {
+      "get": {
+        "tags": [
+          "System"
+        ],
+        "summary": "Get device info",
+        "operationId": "getSystemInfo",
+        "responses": {
+          "200": {
+            "description": "Device information",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SystemInfo"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/system/home": {
+      "post": {
+        "tags": [
+          "System"
+        ],
+        "summary": "Run homing sequence",
+        "description": "Blocks until homing completes. Player state broadcasts on the WebSocket reflect progress.",
+        "operationId": "homeDevice",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HomeRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Homing result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HomeResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Motion controller unavailable or homing failed"
+          }
+        }
+      }
+    },
+    "/api/system/factory-reset": {
+      "post": {
+        "tags": [
+          "System"
+        ],
+        "summary": "Factory reset the device",
+        "description": "Clears NVS, patterns, playlists and license, then restarts ~300ms after responding.",
+        "operationId": "factoryReset",
+        "responses": {
+          "200": {
+            "description": "Reset performed, device restarting",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Reset failed"
+          }
+        }
+      }
+    },
+    "/api/config": {
+      "get": {
+        "tags": [
+          "Config"
+        ],
+        "summary": "Get motion/LED configuration",
+        "operationId": "getConfig",
+        "responses": {
+          "200": {
+            "description": "Current configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeviceConfig"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "Config"
+        ],
+        "summary": "Update motion/LED configuration",
+        "operationId": "patchConfig",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeviceConfigPatch"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeviceConfig"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "No valid config in body"
+          }
+        }
+      }
+    },
+    "/api/config/calibration": {
+      "delete": {
+        "tags": [
+          "Config"
+        ],
+        "summary": "Clear stored calibration",
+        "operationId": "clearCalibration",
+        "responses": {
+          "200": {
+            "description": "Calibration cleared",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Failed to clear calibration"
+          }
+        }
+      }
+    },
+    "/api/presets": {
+      "get": {
+        "tags": [
+          "Config"
+        ],
+        "summary": "List hardware presets",
+        "operationId": "listPresets",
+        "responses": {
+          "200": {
+            "description": "Available presets",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PresetsListResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/presets/load": {
+      "post": {
+        "tags": [
+          "Config"
+        ],
+        "summary": "Load a hardware preset",
+        "operationId": "loadPreset",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoadPresetRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Preset applied; returns resulting configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeviceConfig"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing preset_id"
+          },
+          "404": {
+            "description": "Preset not found"
+          }
+        }
+      }
+    },
+    "/api/schedule": {
+      "get": {
+        "tags": [
+          "Schedule"
+        ],
+        "summary": "Get current schedule",
+        "operationId": "getSchedule",
+        "responses": {
+          "200": {
+            "description": "Current schedule",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Schedule"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "Schedule"
+        ],
+        "summary": "Replace schedule",
+        "description": "Replaces the entire schedule. Change is broadcast to WebSocket clients and synced to the cloud.",
+        "operationId": "putSchedule",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Schedule"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Saved schedule",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Schedule"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed items"
           }
         }
       }
@@ -1438,6 +1758,254 @@
           "color": {
             "type": "string",
             "description": "RGB color in hex format (e.g., '#FF0000')"
+          }
+        }
+      },
+      "SystemInfo": {
+        "type": "object",
+        "properties": {
+          "firmware_version": {
+            "type": "string"
+          },
+          "hardware_model": {
+            "type": "string",
+            "example": "tranquil"
+          },
+          "device_id": {
+            "type": "string"
+          },
+          "hostname": {
+            "type": "string"
+          },
+          "is_homed": {
+            "type": "boolean"
+          },
+          "free_heap": {
+            "type": "integer"
+          }
+        }
+      },
+      "HomeRequest": {
+        "type": "object",
+        "properties": {
+          "force_full_calibration": {
+            "type": "boolean",
+            "default": false
+          }
+        }
+      },
+      "HomeResponse": {
+        "type": "object",
+        "properties": {
+          "success": {
+            "type": "boolean"
+          },
+          "error": {
+            "type": "string"
+          }
+        }
+      },
+      "OkResponse": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          }
+        }
+      },
+      "MotionConfig": {
+        "type": "object",
+        "properties": {
+          "steps_per_rev": {
+            "type": "integer"
+          },
+          "microsteps": {
+            "type": "integer"
+          },
+          "theta_gear_ratio_x100": {
+            "type": "integer"
+          },
+          "pinion_diameter_mm": {
+            "type": "integer"
+          },
+          "theta_max_rpm": {
+            "type": "integer"
+          },
+          "rho_max_rpm": {
+            "type": "integer"
+          },
+          "theta_current_ma": {
+            "type": "integer"
+          },
+          "rho_current_ma": {
+            "type": "integer"
+          },
+          "stallguard_threshold": {
+            "type": "integer"
+          },
+          "default_accel_mm_s2": {
+            "type": "number"
+          },
+          "max_accel_mm_s2": {
+            "type": "number"
+          }
+        }
+      },
+      "LEDHardwareConfig": {
+        "type": "object",
+        "properties": {
+          "has_leds": {
+            "type": "boolean"
+          },
+          "led_count": {
+            "type": "integer"
+          },
+          "is_rgbw": {
+            "type": "boolean"
+          }
+        }
+      },
+      "CalibrationData": {
+        "type": "object",
+        "properties": {
+          "theta_steps_per_rotation": {
+            "type": "integer"
+          },
+          "rho_max_steps": {
+            "type": "integer"
+          },
+          "is_valid": {
+            "type": "boolean"
+          },
+          "timestamp": {
+            "type": "integer",
+            "description": "Epoch seconds"
+          }
+        }
+      },
+      "DeviceConfig": {
+        "type": "object",
+        "properties": {
+          "motion": {
+            "$ref": "#/components/schemas/MotionConfig"
+          },
+          "led": {
+            "$ref": "#/components/schemas/LEDHardwareConfig"
+          },
+          "calibration": {
+            "$ref": "#/components/schemas/CalibrationData"
+          },
+          "active_preset_id": {
+            "type": "string"
+          }
+        }
+      },
+      "DeviceConfigPatch": {
+        "type": "object",
+        "description": "Partial update. Absent or zero-valued fields are left unchanged.",
+        "properties": {
+          "motion": {
+            "$ref": "#/components/schemas/MotionConfig"
+          },
+          "led": {
+            "$ref": "#/components/schemas/LEDHardwareConfig"
+          }
+        }
+      },
+      "PresetInfo": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          }
+        }
+      },
+      "PresetsListResponse": {
+        "type": "object",
+        "properties": {
+          "presets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PresetInfo"
+            }
+          },
+          "active_preset_id": {
+            "type": "string"
+          }
+        }
+      },
+      "LoadPresetRequest": {
+        "type": "object",
+        "required": [
+          "preset_id"
+        ],
+        "properties": {
+          "preset_id": {
+            "type": "string"
+          }
+        }
+      },
+      "ScheduleItem": {
+        "type": "object",
+        "required": [
+          "days_of_week",
+          "time_of_day",
+          "action_type"
+        ],
+        "properties": {
+          "days_of_week": {
+            "type": "integer",
+            "description": "Bitmask, bit 0 = Sunday .. bit 6 = Saturday (0x7F = all days)"
+          },
+          "time_of_day": {
+            "type": "integer",
+            "description": "Seconds since local midnight (0-86399)"
+          },
+          "action_type": {
+            "type": "integer",
+            "description": "0=unspecified, 1=led_off, 2=led_on, 3=play_random_pattern, 4=play_playlist, 5=play_pattern"
+          },
+          "uuid": {
+            "type": "string",
+            "description": "Pattern/playlist UUID for play_pattern / play_playlist"
+          }
+        }
+      },
+      "Schedule": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ScheduleItem"
+            }
+          }
+        }
+      },
+      "UpdatePlaylistRequest": {
+        "type": "object",
+        "description": "Partial update. pattern_uuids, when present, replaces the entire ordered list.",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "featured_pattern": {
+            "type": "string"
+          },
+          "pattern_uuids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           }
         }
       }

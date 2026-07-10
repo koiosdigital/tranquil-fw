@@ -82,7 +82,7 @@ int32_t tee_get_last_result(void);
  * Returns the debug stage counter from the TEE. Useful for
  * diagnosing crashes during TEE calls.
  *
- * @return Debug stage value (0-11, see tee_entry_stub.S)
+ * @return Debug stage value (0-11, see tee_handlers.c)
  */
 uint32_t tee_get_debug_stage(void);
 

@@ -1,5 +1,6 @@
 #include "job_processor.h"
 #include "job_queue.h"
+#include "raii_utils.hpp"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -53,12 +54,14 @@ public:
 
             // Find executor for this job type
             IJobExecutor* executor = nullptr;
-            if (xSemaphoreTake(executorMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                auto it = executors.find(job->type);
-                if (it != executors.end()) {
-                    executor = it->second.get();
+            {
+                raii::MutexGuard guard(executorMutex, pdMS_TO_TICKS(100));
+                if (guard) {
+                    auto it = executors.find(job->type);
+                    if (it != executors.end()) {
+                        executor = it->second.get();
+                    }
                 }
-                xSemaphoreGive(executorMutex);
             }
 
             if (!executor) {

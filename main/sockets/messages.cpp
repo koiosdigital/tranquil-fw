@@ -10,6 +10,7 @@
 #include <kd_common.h>
 #include <ctime>
 #include <kd/v1/common.pb-c.h>
+#include <koios/cloudlink.h>
 
 #include "drm/drm_license.h"
 
@@ -17,7 +18,6 @@ static const char* TAG = "cloud_messages";
 
 namespace {
 
-    QueueHandle_t g_outbox = nullptr;
     bool g_needs_claim = false;
     int64_t g_last_claim_ms = 0;
 
@@ -26,32 +26,14 @@ namespace {
 
 }  // namespace
 
-void cloud_msg_init(QueueHandle_t outbox) {
-    g_outbox = outbox;
-}
-
 bool cloud_msg_queue_raw(const uint8_t* data, size_t len) {
-    if (data == nullptr || len == 0 || g_outbox == nullptr) return false;
-
-    uint8_t* buf = static_cast<uint8_t*>(heap_caps_malloc(len, MALLOC_CAP_SPIRAM));
-    if (buf == nullptr) {
-        ESP_LOGE(TAG, "Failed to alloc %zu bytes", len);
-        return false;
-    }
-
-    memcpy(buf, data, len);
-
-    struct { uint8_t* data; size_t len; } msg = { buf, len };
-    if (xQueueSend(g_outbox, &msg, pdMS_TO_TICKS(100)) != pdTRUE) {
-        ESP_LOGW(TAG, "Outbox full");
-        heap_caps_free(buf);
-        return false;
-    }
-    return true;
+    if (data == nullptr || len == 0) return false;
+    // cloudlink copies the data into its outbox; no need to buffer here.
+    return koios_cloudlink_send(data, len);
 }
 
 bool cloud_msg_queue(const Kd__V1__TranquilMessage* message) {
-    if (message == nullptr || g_outbox == nullptr) return false;
+    if (message == nullptr) return false;
 
     size_t len = kd__v1__tranquil_message__get_packed_size(message);
     auto* buf = static_cast<uint8_t*>(heap_caps_malloc(len, MALLOC_CAP_SPIRAM));
@@ -61,14 +43,10 @@ bool cloud_msg_queue(const Kd__V1__TranquilMessage* message) {
     }
 
     kd__v1__tranquil_message__pack(message, buf);
-
-    struct { uint8_t* data; size_t len; } msg = { buf, len };
-    if (xQueueSend(g_outbox, &msg, pdMS_TO_TICKS(100)) != pdTRUE) {
-        ESP_LOGW(TAG, "Outbox full");
-        heap_caps_free(buf);
-        return false;
-    }
-    return true;
+    bool ok = koios_cloudlink_send(buf, len);  // copies buf
+    heap_caps_free(buf);
+    if (!ok) ESP_LOGW(TAG, "cloudlink outbox full, dropped message");
+    return ok;
 }
 
 void cloud_msg_send_device_info() {

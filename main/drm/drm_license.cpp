@@ -13,6 +13,8 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
+#include "raii_utils.hpp"
+
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -70,8 +72,6 @@ static struct {
 };
 
 // PSA Crypto key storage
-static uint8_t s_server_pubkey_der[512];
-static size_t s_server_pubkey_der_len = 0;
 static psa_key_id_t s_server_key_id = PSA_KEY_ID_NULL;
 
 static esp_err_t load_license_file(void);
@@ -79,53 +79,46 @@ static esp_err_t parse_license_payload(void);
 static drm_license_status_t validate_license(void);
 static void free_license_data(void);
 
-// Convert PEM public key to DER format for PSA import
-static esp_err_t parse_server_key_pem_to_der(void) {
+// Parse the server public key PEM and import it directly into the PSA keystore.
+//
+// We deliberately avoid the manual PEM->DER->psa_import_key() route: PSA's
+// psa_import_key() for PSA_KEY_TYPE_RSA_PUBLIC_KEY expects the bare PKCS#1
+// RSAPublicKey structure (RFC 3279 2.3.1), whereas mbedtls_pk_write_pubkey_der()
+// emits the SubjectPublicKeyInfo wrapper. Feeding the SPKI blob to
+// psa_import_key() is what produced PSA_ERROR_INVALID_ARGUMENT (-135).
+// mbedtls_pk_import_into_psa() takes the parsed pk context and imports the key
+// material in the exact representation PSA expects.
+static esp_err_t import_server_key_to_psa(void) {
     mbedtls_pk_context pk;
     mbedtls_pk_init(&pk);
 
     int ret = mbedtls_pk_parse_public_key(&pk,
         reinterpret_cast<const unsigned char*>(SERVER_PUBLIC_KEY_PEM),
         strlen(SERVER_PUBLIC_KEY_PEM) + 1);
-
     if (ret != 0) {
         ESP_LOGE(TAG, "Failed to parse PEM public key: -0x%04X", -ret);
         mbedtls_pk_free(&pk);
         return ESP_FAIL;
     }
 
-    // mbedtls_pk_write_pubkey_der writes to the END of the buffer
-    int der_len = mbedtls_pk_write_pubkey_der(&pk, s_server_pubkey_der, sizeof(s_server_pubkey_der));
-    mbedtls_pk_free(&pk);
-
-    if (der_len < 0) {
-        ESP_LOGE(TAG, "Failed to write DER: -0x%04X", -der_len);
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    ret = mbedtls_pk_get_psa_attributes(&pk, PSA_KEY_USAGE_VERIFY_HASH, &attributes);
+    if (ret != 0) {
+        ESP_LOGE(TAG, "Failed to derive PSA attributes: -0x%04X", -ret);
+        psa_reset_key_attributes(&attributes);
+        mbedtls_pk_free(&pk);
         return ESP_FAIL;
     }
 
-    // Move from end of buffer to start
-    memmove(s_server_pubkey_der, s_server_pubkey_der + sizeof(s_server_pubkey_der) - der_len, der_len);
-    s_server_pubkey_der_len = der_len;
-
-    ESP_LOGD(TAG, "Server public key parsed: %zu bytes DER", s_server_pubkey_der_len);
-    return ESP_OK;
-}
-
-// Import server public key into PSA keystore
-static esp_err_t import_server_key_to_psa(void) {
-    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
-    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_VERIFY_HASH);
+    // Restrict verification to the algorithm the license signatures actually use.
     psa_set_key_algorithm(&attributes, PSA_ALG_RSA_PKCS1V15_SIGN(PSA_ALG_SHA_256));
-    psa_set_key_type(&attributes, PSA_KEY_TYPE_RSA_PUBLIC_KEY);
-    psa_set_key_bits(&attributes, 2048);
-    psa_set_key_lifetime(&attributes, PSA_KEY_LIFETIME_VOLATILE);
 
-    psa_status_t status = psa_import_key(&attributes, s_server_pubkey_der,
-        s_server_pubkey_der_len, &s_server_key_id);
+    ret = mbedtls_pk_import_into_psa(&pk, &attributes, &s_server_key_id);
     psa_reset_key_attributes(&attributes);
+    mbedtls_pk_free(&pk);
 
-    if (status != PSA_SUCCESS) {
-        ESP_LOGE(TAG, "Failed to import server public key: %d", status);
+    if (ret != 0) {
+        ESP_LOGE(TAG, "Failed to import server public key: -0x%04X", -ret);
         return ESP_FAIL;
     }
 
@@ -152,13 +145,7 @@ esp_err_t drm_license_init(void) {
     }
 
     // Parse and import server public key for signature verification
-    esp_err_t ret = parse_server_key_pem_to_der();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to parse server public key PEM");
-        return ret;
-    }
-
-    ret = import_server_key_to_psa();
+    esp_err_t ret = import_server_key_to_psa();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to import server public key to PSA");
         return ret;
@@ -181,11 +168,8 @@ bool drm_license_is_valid(void) {
         return false;
     }
 
-    xSemaphoreTake(license_state.mutex, portMAX_DELAY);
-    bool valid = (license_state.status == DRM_LICENSE_VALID);
-    xSemaphoreGive(license_state.mutex);
-
-    return valid;
+    raii::MutexGuard guard(license_state.mutex);
+    return (license_state.status == DRM_LICENSE_VALID);
 }
 
 drm_license_status_t drm_license_get_status(void) {
@@ -193,11 +177,8 @@ drm_license_status_t drm_license_get_status(void) {
         return DRM_LICENSE_NOT_FOUND;
     }
 
-    xSemaphoreTake(license_state.mutex, portMAX_DELAY);
-    drm_license_status_t status = license_state.status;
-    xSemaphoreGive(license_state.mutex);
-
-    return status;
+    raii::MutexGuard guard(license_state.mutex);
+    return license_state.status;
 }
 
 uint32_t drm_license_get_max_patterns(void) {
@@ -205,11 +186,8 @@ uint32_t drm_license_get_max_patterns(void) {
         return 0;
     }
 
-    xSemaphoreTake(license_state.mutex, portMAX_DELAY);
-    uint32_t max = license_state.info.max_patterns;
-    xSemaphoreGive(license_state.mutex);
-
-    return max;
+    raii::MutexGuard guard(license_state.mutex);
+    return license_state.info.max_patterns;
 }
 
 bool drm_license_can_download(void) {
@@ -234,9 +212,8 @@ esp_err_t drm_license_get_info(drm_license_info_t* info) {
     }
 
     if (info != nullptr) {
-        xSemaphoreTake(license_state.mutex, portMAX_DELAY);
+        raii::MutexGuard guard(license_state.mutex);
         memcpy(info, &license_state.info, sizeof(drm_license_info_t));
-        xSemaphoreGive(license_state.mutex);
     }
 
     return ESP_OK;
@@ -245,6 +222,7 @@ esp_err_t drm_license_get_info(drm_license_info_t* info) {
 esp_err_t drm_license_save(const uint8_t* payload, size_t payload_len,
     const uint8_t* signature, size_t signature_len) {
     if (!license_state.initialized) {
+        ESP_LOGE(TAG, "License manager not initialized");
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -317,7 +295,8 @@ esp_err_t drm_license_verify_signature(const uint8_t* payload, size_t payload_le
     if (status != PSA_SUCCESS) {
         if (status == PSA_ERROR_INVALID_SIGNATURE) {
             ESP_LOGE(TAG, "Signature verification failed: invalid signature");
-        } else {
+        }
+        else {
             ESP_LOGE(TAG, "Signature verification failed: %d", status);
         }
         return ESP_ERR_INVALID_ARG;
@@ -328,21 +307,23 @@ esp_err_t drm_license_verify_signature(const uint8_t* payload, size_t payload_le
 
 esp_err_t drm_license_reload(void) {
     if (!license_state.initialized) {
+        ESP_LOGE(TAG, "License manager not initialized");
         return ESP_ERR_INVALID_STATE;
     }
 
-    xSemaphoreTake(license_state.mutex, portMAX_DELAY);
+    esp_err_t ret;
+    {
+        raii::MutexGuard guard(license_state.mutex);
 
-    free_license_data();
-    esp_err_t ret = load_license_file();
-    if (ret == ESP_OK) {
-        license_state.status = validate_license();
+        free_license_data();
+        ret = load_license_file();
+        if (ret == ESP_OK) {
+            license_state.status = validate_license();
+        }
+        else {
+            license_state.status = DRM_LICENSE_NOT_FOUND;
+        }
     }
-    else {
-        license_state.status = DRM_LICENSE_NOT_FOUND;
-    }
-
-    xSemaphoreGive(license_state.mutex);
 
     ESP_LOGI(TAG, "License reloaded, status: %d", license_state.status);
     return ret;
@@ -489,13 +470,19 @@ static drm_license_status_t validate_license(void) {
     // Check device binding
     size_t cert_len = 0;
     if (kd_common_get_device_cert(nullptr, &cert_len) == ESP_OK && cert_len > 0) {
-        // Use stack buffer for certificate (cold path, ~2KB typical)
-        constexpr size_t MAX_CERT_SIZE = 2048;
+        // Certificate buffer lives in SPIRAM (cold path, ~4KB typical)
+        constexpr size_t MAX_CERT_SIZE = 4096;
         if (cert_len >= MAX_CERT_SIZE) {
             ESP_LOGE(TAG, "Certificate too large: %zu", cert_len);
             return DRM_LICENSE_INVALID_FORMAT;
         }
-        char cert_pem[MAX_CERT_SIZE];
+        char* cert_pem = static_cast<char*>(
+            heap_caps_malloc(MAX_CERT_SIZE, MALLOC_CAP_SPIRAM)
+            );
+        if (cert_pem == nullptr) {
+            ESP_LOGE(TAG, "Failed to allocate certificate buffer");
+            return DRM_LICENSE_INVALID_FORMAT;
+        }
 
         if (kd_common_get_device_cert(cert_pem, &cert_len) == ESP_OK) {
             // Parse certificate to extract CN
@@ -520,6 +507,7 @@ static drm_license_status_t validate_license(void) {
                             ESP_LOGE(TAG, "Device mismatch: cert='%s', license='%s'",
                                 cn_start, license_state.info.for_device);
                             mbedtls_x509_crt_free(&crt);
+                            heap_caps_free(cert_pem);
                             return DRM_LICENSE_DEVICE_MISMATCH;
                         }
                     }
@@ -527,6 +515,7 @@ static drm_license_status_t validate_license(void) {
             }
             mbedtls_x509_crt_free(&crt);
         }
+        heap_caps_free(cert_pem);
     }
 
     // Check time validity
@@ -578,11 +567,10 @@ esp_err_t drm_license_get_store_token(char* token, size_t* token_len) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    xSemaphoreTake(license_state.mutex, portMAX_DELAY);
+    raii::MutexGuard guard(license_state.mutex);
 
     size_t len = strlen(license_state.info.store_token);
     if (len == 0) {
-        xSemaphoreGive(license_state.mutex);
         return ESP_ERR_NOT_FOUND;
     }
 
@@ -594,7 +582,6 @@ esp_err_t drm_license_get_store_token(char* token, size_t* token_len) {
         *token_len = len;
     }
 
-    xSemaphoreGive(license_state.mutex);
     return ESP_OK;
 }
 
@@ -603,9 +590,6 @@ bool drm_license_has_store_token(void) {
         return false;
     }
 
-    xSemaphoreTake(license_state.mutex, portMAX_DELAY);
-    bool has_token = (strlen(license_state.info.store_token) > 0);
-    xSemaphoreGive(license_state.mutex);
-
-    return has_token;
+    raii::MutexGuard guard(license_state.mutex);
+    return (strlen(license_state.info.store_token) > 0);
 }

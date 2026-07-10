@@ -44,8 +44,17 @@ esp_err_t MessageDispatcher::dispatch(
         ResponseRouter::instance().forwardToCloud(data, len);
     }
 
-    // Route response if there is one
-    if (result.has_response && response.valid()) {
+    // Route response if there is one. A handler that wanted to respond but
+    // produced no payload hit the serialize() size cap — send an explicit
+    // error instead of leaving the client waiting forever.
+    if (result.has_response) {
+        if (!response.valid()) {
+            ESP_LOGE(TAG, "Handler for type %d produced no payload (response too large?)",
+                msg->message_case);
+            response = HandlerBase::makeCommandResult(false, "Response too large");
+            result.broadcast = false;
+            result.send_to_cloud = false;
+        }
         ResponseRouter::instance().route(response, ctx, result);
     }
 
@@ -162,157 +171,41 @@ HandlerBase* MessageDispatcher::findHandler(Kd__V1__TranquilMessage__MessageCase
 #include "system_handler.h"
 #include "playlist_handler.h"
 #include "led_handler.h"
-#include "config_handler.h"
-#include "preset_handler.h"
 #include "schedule_handler.h"
-#include "license_handler.h"
 
+// Non-owning adapter that lets a singleton handler participate in the
+// dispatcher's unique_ptr ownership model without duplicating boilerplate.
+template <typename H>
+class SingletonHandlerWrapper : public HandlerBase {
+public:
+    HandleResult handle(const Kd__V1__TranquilMessage* msg, const MessageContext& ctx, ResponseMessage& response) override {
+        return H::instance().handle(msg, ctx, response);
+    }
+    bool canHandle(Kd__V1__TranquilMessage__MessageCase msg_case) const override {
+        return H::instance().canHandle(msg_case);
+    }
+    std::vector<Kd__V1__TranquilMessage__MessageCase> supportedMessages() const override {
+        return H::instance().supportedMessages();
+    }
+    bool isLocalOnly(Kd__V1__TranquilMessage__MessageCase msg_case) const override {
+        return H::instance().isLocalOnly(msg_case);
+    }
+};
+
+// The local request/response surface lives on the REST API; the dispatcher
+// keeps only what the sockets still need: cloud sync (patterns, playlists,
+// schedule, player control, system) and real-time push to local clients.
+// Config, preset, and license store-token messages were local-only and are
+// now served by /api/config, /api/presets, and /api/license/store-token.
 void dispatcher_register_standard_handlers() {
     auto& dispatcher = MessageDispatcher::instance();
 
-    // Note: Using existing singleton instances via unique_ptr wrapper
-    // This is a bit awkward but allows handlers to be singletons while
-    // still participating in the dispatcher's ownership model
-
-    // Player control handler
-    class PlayerHandlerWrapper : public HandlerBase {
-    public:
-        HandleResult handle(const Kd__V1__TranquilMessage* msg, const MessageContext& ctx, ResponseMessage& response) override {
-            return PlayerHandler::instance().handle(msg, ctx, response);
-        }
-        bool canHandle(Kd__V1__TranquilMessage__MessageCase msg_case) const override {
-            return PlayerHandler::instance().canHandle(msg_case);
-        }
-        std::vector<Kd__V1__TranquilMessage__MessageCase> supportedMessages() const override {
-            return PlayerHandler::instance().supportedMessages();
-        }
-    };
-    dispatcher.registerHandler(std::make_unique<PlayerHandlerWrapper>());
-
-    // Pattern management handler
-    class PatternHandlerWrapper : public HandlerBase {
-    public:
-        HandleResult handle(const Kd__V1__TranquilMessage* msg, const MessageContext& ctx, ResponseMessage& response) override {
-            return PatternHandler::instance().handle(msg, ctx, response);
-        }
-        bool canHandle(Kd__V1__TranquilMessage__MessageCase msg_case) const override {
-            return PatternHandler::instance().canHandle(msg_case);
-        }
-        std::vector<Kd__V1__TranquilMessage__MessageCase> supportedMessages() const override {
-            return PatternHandler::instance().supportedMessages();
-        }
-    };
-    dispatcher.registerHandler(std::make_unique<PatternHandlerWrapper>());
-
-    // System handler
-    class SystemHandlerWrapper : public HandlerBase {
-    public:
-        HandleResult handle(const Kd__V1__TranquilMessage* msg, const MessageContext& ctx, ResponseMessage& response) override {
-            return SystemHandler::instance().handle(msg, ctx, response);
-        }
-        bool canHandle(Kd__V1__TranquilMessage__MessageCase msg_case) const override {
-            return SystemHandler::instance().canHandle(msg_case);
-        }
-        std::vector<Kd__V1__TranquilMessage__MessageCase> supportedMessages() const override {
-            return SystemHandler::instance().supportedMessages();
-        }
-    };
-    dispatcher.registerHandler(std::make_unique<SystemHandlerWrapper>());
-
-    // Playlist handler
-    class PlaylistHandlerWrapper : public HandlerBase {
-    public:
-        HandleResult handle(const Kd__V1__TranquilMessage* msg, const MessageContext& ctx, ResponseMessage& response) override {
-            return PlaylistHandler::instance().handle(msg, ctx, response);
-        }
-        bool canHandle(Kd__V1__TranquilMessage__MessageCase msg_case) const override {
-            return PlaylistHandler::instance().canHandle(msg_case);
-        }
-        std::vector<Kd__V1__TranquilMessage__MessageCase> supportedMessages() const override {
-            return PlaylistHandler::instance().supportedMessages();
-        }
-    };
-    dispatcher.registerHandler(std::make_unique<PlaylistHandlerWrapper>());
-
-    // LED handler
-    class LEDHandlerWrapper : public HandlerBase {
-    public:
-        HandleResult handle(const Kd__V1__TranquilMessage* msg, const MessageContext& ctx, ResponseMessage& response) override {
-            return LEDHandler::instance().handle(msg, ctx, response);
-        }
-        bool canHandle(Kd__V1__TranquilMessage__MessageCase msg_case) const override {
-            return LEDHandler::instance().canHandle(msg_case);
-        }
-        std::vector<Kd__V1__TranquilMessage__MessageCase> supportedMessages() const override {
-            return LEDHandler::instance().supportedMessages();
-        }
-    };
-    dispatcher.registerHandler(std::make_unique<LEDHandlerWrapper>());
-
-    // Config handler (local-only)
-    class ConfigHandlerWrapper : public HandlerBase {
-    public:
-        HandleResult handle(const Kd__V1__TranquilMessage* msg, const MessageContext& ctx, ResponseMessage& response) override {
-            return ConfigHandler::instance().handle(msg, ctx, response);
-        }
-        bool canHandle(Kd__V1__TranquilMessage__MessageCase msg_case) const override {
-            return ConfigHandler::instance().canHandle(msg_case);
-        }
-        std::vector<Kd__V1__TranquilMessage__MessageCase> supportedMessages() const override {
-            return ConfigHandler::instance().supportedMessages();
-        }
-        bool isLocalOnly(Kd__V1__TranquilMessage__MessageCase) const override { return true; }
-    };
-    dispatcher.registerHandler(std::make_unique<ConfigHandlerWrapper>());
-
-    // Preset handler (local-only)
-    class PresetHandlerWrapper : public HandlerBase {
-    public:
-        HandleResult handle(const Kd__V1__TranquilMessage* msg, const MessageContext& ctx, ResponseMessage& response) override {
-            return PresetHandler::instance().handle(msg, ctx, response);
-        }
-        bool canHandle(Kd__V1__TranquilMessage__MessageCase msg_case) const override {
-            return PresetHandler::instance().canHandle(msg_case);
-        }
-        std::vector<Kd__V1__TranquilMessage__MessageCase> supportedMessages() const override {
-            return PresetHandler::instance().supportedMessages();
-        }
-        bool isLocalOnly(Kd__V1__TranquilMessage__MessageCase) const override { return true; }
-    };
-    dispatcher.registerHandler(std::make_unique<PresetHandlerWrapper>());
-
-    // Schedule handler
-    class ScheduleHandlerWrapper : public HandlerBase {
-    public:
-        HandleResult handle(const Kd__V1__TranquilMessage* msg, const MessageContext& ctx, ResponseMessage& response) override {
-            return ScheduleHandler::instance().handle(msg, ctx, response);
-        }
-        bool canHandle(Kd__V1__TranquilMessage__MessageCase msg_case) const override {
-            return ScheduleHandler::instance().canHandle(msg_case);
-        }
-        std::vector<Kd__V1__TranquilMessage__MessageCase> supportedMessages() const override {
-            return ScheduleHandler::instance().supportedMessages();
-        }
-    };
-    dispatcher.registerHandler(std::make_unique<ScheduleHandlerWrapper>());
-
-    // License handler (local-only for store token requests)
-    class LicenseHandlerWrapper : public HandlerBase {
-    public:
-        HandleResult handle(const Kd__V1__TranquilMessage* msg, const MessageContext& ctx, ResponseMessage& response) override {
-            return LicenseHandler::instance().handle(msg, ctx, response);
-        }
-        bool canHandle(Kd__V1__TranquilMessage__MessageCase msg_case) const override {
-            return LicenseHandler::instance().canHandle(msg_case);
-        }
-        std::vector<Kd__V1__TranquilMessage__MessageCase> supportedMessages() const override {
-            return LicenseHandler::instance().supportedMessages();
-        }
-        bool isLocalOnly(Kd__V1__TranquilMessage__MessageCase msg_case) const override {
-            return LicenseHandler::instance().isLocalOnly(msg_case);
-        }
-    };
-    dispatcher.registerHandler(std::make_unique<LicenseHandlerWrapper>());
+    dispatcher.registerHandler(std::make_unique<SingletonHandlerWrapper<PlayerHandler>>());
+    dispatcher.registerHandler(std::make_unique<SingletonHandlerWrapper<PatternHandler>>());
+    dispatcher.registerHandler(std::make_unique<SingletonHandlerWrapper<SystemHandler>>());
+    dispatcher.registerHandler(std::make_unique<SingletonHandlerWrapper<PlaylistHandler>>());
+    dispatcher.registerHandler(std::make_unique<SingletonHandlerWrapper<LEDHandler>>());
+    dispatcher.registerHandler(std::make_unique<SingletonHandlerWrapper<ScheduleHandler>>());
 
     ESP_LOGI(TAG, "Registered standard message handlers");
 }

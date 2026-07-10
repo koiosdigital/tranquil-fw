@@ -1,132 +1,116 @@
 #include "esp_http_server.h"
 #include "cJSON.h"
 #include "ManifestDatabase.h"
+#include "api_common.h"
 #include <string.h>
 #include <stdlib.h>
 #include <vector>
 
+using namespace api_common;
+
 namespace {
 
-// Helper: create pagination JSON object
-cJSON* createPaginationJson(const PaginationInfo& info) {
-    cJSON* pagination = cJSON_CreateObject();
-    cJSON_AddNumberToObject(pagination, "page", info.page);
-    cJSON_AddNumberToObject(pagination, "per_page", info.per_page);
-    cJSON_AddNumberToObject(pagination, "total_pages", info.total_pages);
-    cJSON_AddNumberToObject(pagination, "total_items", info.total_items);
-    return pagination;
+// Stream a playlist object. Pattern IDs are resolved to external UUIDs one at
+// a time so the full list never has to sit in a JSON tree on the heap.
+void write_playlist_json(ChunkBuf* cb, const Playlist& pl) {
+    chunk_buf_write_str(cb, "{\"uuid\":");
+    chunk_buf_write_json_string(cb, pl.external_uuid.c_str());
+    chunk_buf_printf(cb, ",\"id\":%lu,\"name\":", (unsigned long)pl.id);
+    chunk_buf_write_json_string(cb, pl.name.c_str());
+    chunk_buf_write_str(cb, ",\"description\":");
+    chunk_buf_write_json_string(cb, pl.description.c_str());
+
+    chunk_buf_write_str(cb, ",\"featured_pattern\":");
+    std::string featured;
+    if (pl.featured_pattern_id != 0) {
+        auto fp = ManifestDatabase::instance().getPattern(pl.featured_pattern_id);
+        if (fp) featured = fp->external_uuid;
+    }
+    chunk_buf_write_json_string(cb, featured.c_str());
+
+    chunk_buf_write_str(cb, ",\"date\":");
+    chunk_buf_write_json_string(cb, pl.date.c_str());
+    if (!pl.created_at.empty()) {
+        chunk_buf_write_str(cb, ",\"created_at\":");
+        chunk_buf_write_json_string(cb, pl.created_at.c_str());
+    }
+    if (!pl.updated_at.empty()) {
+        chunk_buf_write_str(cb, ",\"updated_at\":");
+        chunk_buf_write_json_string(cb, pl.updated_at.c_str());
+    }
+
+    chunk_buf_write_str(cb, ",\"pattern_uuids\":[");
+    bool first = true;
+    for (uint32_t pid : pl.pattern_ids) {
+        auto p = ManifestDatabase::instance().getPattern(pid);
+        if (!p) continue;
+        if (!first) chunk_buf_write(cb, ",", 1);
+        chunk_buf_write_json_string(cb, p->external_uuid.c_str());
+        first = false;
+    }
+    chunk_buf_write_str(cb, "]}");
 }
 
-// Helper: parse pagination query params
-void parsePaginationParams(httpd_req_t* req, int& page, int& per_page) {
-    page = 0;
-    per_page = 20;
-
-    char query[128] = {0};
-    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
-        char param[16] = {0};
-        if (httpd_query_key_value(query, "page", param, sizeof(param)) == ESP_OK) {
-            page = atoi(param);
-            if (page < 0) page = 0;
-        }
-        if (httpd_query_key_value(query, "per_page", param, sizeof(param)) == ESP_OK) {
-            per_page = atoi(param);
-            if (per_page < 1) per_page = 1;
-            if (per_page > 100) per_page = 100;
-        }
-    }
-}
-
-// Helper: extract UUID from URI like /api/playlists/{uuid} or /api/playlists/{uuid}/order
-std::string extractUuid(const char* uri, const char* base) {
-    if (strncmp(uri, base, strlen(base)) != 0) {
-        return "";
-    }
-    const char* uuid_start = uri + strlen(base);
-    const char* slash = strchr(uuid_start, '/');
-    size_t uuid_len = slash ? static_cast<size_t>(slash - uuid_start) : strlen(uuid_start);
-    if (uuid_len == 0 || uuid_len > 64) {
-        return "";
-    }
-    return std::string(uuid_start, uuid_len);
+esp_err_t send_playlist(httpd_req_t* req, const Playlist& pl) {
+    httpd_resp_set_type(req, "application/json");
+    ChunkBuf cb;
+    chunk_buf_init(&cb, req);
+    write_playlist_json(&cb, pl);
+    chunk_buf_finish(&cb);
+    return ESP_OK;
 }
 
 } // anonymous namespace
 
-// GET /api/playlists - paginated list
+// GET /api/playlists - paginated list (streamed)
 static esp_err_t playlists_list_handler(httpd_req_t* req) {
     int page, per_page;
-    parsePaginationParams(req, page, per_page);
+    parse_pagination(req, page, per_page);
 
     auto result = ManifestDatabase::instance().getPlaylists(page, per_page);
 
-    cJSON* response = cJSON_CreateObject();
-    cJSON_AddItemToObject(response, "pagination", createPaginationJson(result.pagination));
-
-    cJSON* playlistsArray = cJSON_CreateArray();
-    for (const auto& playlist : result.items) {
-        cJSON_AddItemToArray(playlistsArray, ManifestDatabase::playlistToJson(playlist));
-    }
-    cJSON_AddItemToObject(response, "playlists", playlistsArray);
-
-    char* json_str = cJSON_PrintUnformatted(response);
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, json_str, strlen(json_str));
+    ChunkBuf cb;
+    chunk_buf_init(&cb, req);
 
-    free(json_str);
-    cJSON_Delete(response);
+    chunk_buf_printf(&cb,
+        "{\"pagination\":{\"page\":%d,\"per_page\":%d,\"total_pages\":%d,\"total_items\":%d},\"playlists\":[",
+        result.pagination.page, result.pagination.per_page,
+        result.pagination.total_pages, result.pagination.total_items);
+
+    bool first = true;
+    for (const auto& playlist : result.items) {
+        if (!first) chunk_buf_write(&cb, ",", 1);
+        write_playlist_json(&cb, playlist);
+        first = false;
+    }
+
+    chunk_buf_write_str(&cb, "]}");
+    chunk_buf_finish(&cb);
     return ESP_OK;
 }
 
 // GET /api/playlists/{uuid}
 static esp_err_t playlists_detail_handler(httpd_req_t* req) {
-    std::string uuid = extractUuid(req->uri, "/api/playlists/");
+    std::string uuid = extract_uuid(req->uri, "/api/playlists/");
     if (uuid.empty()) {
         httpd_resp_send_404(req);
         return ESP_FAIL;
     }
 
-    // uuid is external_uuid
     auto playlist = ManifestDatabase::instance().getPlaylistByExternalUuid(uuid);
     if (!playlist) {
         httpd_resp_send_404(req);
         return ESP_FAIL;
     }
 
-    cJSON* json = ManifestDatabase::playlistToJson(*playlist);
-    char* json_str = cJSON_PrintUnformatted(json);
-
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, json_str, strlen(json_str));
-
-    free(json_str);
-    cJSON_Delete(json);
-    return ESP_OK;
+    return send_playlist(req, *playlist);
 }
 
 // POST /api/playlists - create playlist
 static esp_err_t playlists_create_handler(httpd_req_t* req) {
-    // Use stack buffer for JSON (cold path, small payloads)
-    static constexpr size_t MAX_PLAYLIST_JSON = 4096;
-    int len = req->content_len;
-    if (len <= 0 || static_cast<size_t>(len) >= MAX_PLAYLIST_JSON) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid content length");
-        return ESP_FAIL;
-    }
-
-    char buf[MAX_PLAYLIST_JSON];
-    int received = httpd_req_recv(req, buf, len);
-    if (received <= 0) {
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
-    buf[len] = '\0';
-
-    cJSON* json = cJSON_Parse(buf);
-    if (!json) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
-        return ESP_FAIL;
-    }
+    cJSON* json = parse_json_body(req, 4096);
+    if (!json) return ESP_FAIL;
 
     Playlist playlist = ManifestDatabase::jsonToPlaylist(json);
     cJSON_Delete(json);
@@ -145,60 +129,22 @@ static esp_err_t playlists_create_handler(httpd_req_t* req) {
         return ESP_FAIL;
     }
 
-    cJSON* response = ManifestDatabase::playlistToJson(playlist);
-    char* response_str = cJSON_PrintUnformatted(response);
-
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, response_str, strlen(response_str));
-
-    free(response_str);
-    cJSON_Delete(response);
-    return ESP_OK;
+    return send_playlist(req, playlist);
 }
 
 // POST /api/playlists/{uuid} - add/remove pattern
-static esp_err_t playlists_modify_handler(httpd_req_t* req) {
-    std::string uuid = extractUuid(req->uri, "/api/playlists/");
-    if (uuid.empty()) {
-        httpd_resp_send_404(req);
-        return ESP_FAIL;
-    }
+static esp_err_t playlists_modify_handler(httpd_req_t* req, const Playlist& playlist) {
+    cJSON* json = parse_json_body(req, 4096);
+    if (!json) return ESP_FAIL;
 
-    // uuid is external_uuid - look up to get internal ID
-    auto playlist = ManifestDatabase::instance().getPlaylistByExternalUuid(uuid);
-    if (!playlist) {
-        httpd_resp_send_404(req);
-        return ESP_FAIL;
-    }
-
-    // Use stack buffer for JSON (cold path, small payloads)
-    static constexpr size_t MAX_PLAYLIST_JSON = 4096;
-    int len = req->content_len;
-    if (len <= 0 || static_cast<size_t>(len) >= MAX_PLAYLIST_JSON) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid request size");
-        return ESP_FAIL;
-    }
-
-    char buf[MAX_PLAYLIST_JSON];
-    int received = httpd_req_recv(req, buf, len);
-    if (received <= 0) {
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
-    buf[len] = '\0';
-
-    cJSON* json = cJSON_Parse(buf);
-    if (!json) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
-        return ESP_FAIL;
-    }
-
-    cJSON* pattern_json = cJSON_GetObjectItem(json, "pattern");
+    // "pattern_uuid" per swagger; "pattern" kept for older clients
+    cJSON* pattern_json = cJSON_GetObjectItem(json, "pattern_uuid");
+    if (!pattern_json) pattern_json = cJSON_GetObjectItem(json, "pattern");
     cJSON* action = cJSON_GetObjectItem(json, "action");
 
     if (!pattern_json || !cJSON_IsString(pattern_json) || !action || !cJSON_IsString(action)) {
         cJSON_Delete(json);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing pattern or action");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing pattern_uuid or action");
         return ESP_FAIL;
     }
 
@@ -212,9 +158,9 @@ static esp_err_t playlists_modify_handler(httpd_req_t* req) {
 
     esp_err_t result = ESP_FAIL;
     if (strcmp(action->valuestring, "add") == 0) {
-        result = ManifestDatabase::instance().addPatternToPlaylist(playlist->id, *pattern_id);
-    } else if (strcmp(action->valuestring, "delete") == 0) {
-        result = ManifestDatabase::instance().removePatternFromPlaylist(playlist->id, *pattern_id);
+        result = ManifestDatabase::instance().addPatternToPlaylist(playlist.id, *pattern_id);
+    } else if (strcmp(action->valuestring, "remove") == 0 || strcmp(action->valuestring, "delete") == 0) {
+        result = ManifestDatabase::instance().removePatternFromPlaylist(playlist.id, *pattern_id);
     }
 
     cJSON_Delete(json);
@@ -225,66 +171,32 @@ static esp_err_t playlists_modify_handler(httpd_req_t* req) {
     }
 
     // Re-fetch updated playlist
-    auto updated = ManifestDatabase::instance().getPlaylist(playlist->id);
+    auto updated = ManifestDatabase::instance().getPlaylist(playlist.id);
     if (!updated) {
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
 
-    cJSON* response = ManifestDatabase::playlistToJson(*updated);
-    char* response_str = cJSON_PrintUnformatted(response);
-
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, response_str, strlen(response_str));
-
-    free(response_str);
-    cJSON_Delete(response);
-    return ESP_OK;
+    return send_playlist(req, *updated);
 }
 
 // POST /api/playlists/{uuid}/order - reorder playlist
-static esp_err_t playlists_order_handler(httpd_req_t* req) {
-    std::string uuid = extractUuid(req->uri, "/api/playlists/");
-    if (uuid.empty()) {
-        httpd_resp_send_404(req);
-        return ESP_FAIL;
-    }
+static esp_err_t playlists_order_handler(httpd_req_t* req, const Playlist& playlist) {
+    cJSON* json = parse_json_body(req, 4096);
+    if (!json) return ESP_FAIL;
 
-    // uuid is external_uuid - look up to get internal ID
-    auto playlist = ManifestDatabase::instance().getPlaylistByExternalUuid(uuid);
-    if (!playlist) {
-        httpd_resp_send_404(req);
-        return ESP_FAIL;
-    }
-
-    // Use stack buffer for JSON (cold path, small payloads)
-    static constexpr size_t MAX_PLAYLIST_JSON = 4096;
-    int len = req->content_len;
-    if (len <= 0 || static_cast<size_t>(len) >= MAX_PLAYLIST_JSON) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid request size");
-        return ESP_FAIL;
-    }
-
-    char buf[MAX_PLAYLIST_JSON];
-    int received = httpd_req_recv(req, buf, len);
-    if (received <= 0) {
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
-    buf[len] = '\0';
-
-    cJSON* json = cJSON_Parse(buf);
-
-    if (!json || !cJSON_IsArray(json)) {
-        if (json) cJSON_Delete(json);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Expected array of UUIDs");
+    // Swagger shape is {"pattern_uuids":[...]}; a bare array is also accepted
+    cJSON* array = cJSON_IsObject(json) ? cJSON_GetObjectItem(json, "pattern_uuids") : json;
+    if (!array || !cJSON_IsArray(array)) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Expected pattern_uuids array");
         return ESP_FAIL;
     }
 
     // Convert pattern external UUIDs to internal IDs
     std::vector<uint32_t> newOrder;
     cJSON* item;
-    cJSON_ArrayForEach(item, json) {
+    cJSON_ArrayForEach(item, array) {
         if (cJSON_IsString(item)) {
             auto pattern_id = ManifestDatabase::instance().findPatternIdByExternalUuid(item->valuestring);
             if (pattern_id) {
@@ -294,38 +206,118 @@ static esp_err_t playlists_order_handler(httpd_req_t* req) {
     }
     cJSON_Delete(json);
 
-    if (ManifestDatabase::instance().reorderPlaylist(playlist->id, newOrder) != ESP_OK) {
+    if (ManifestDatabase::instance().reorderPlaylist(playlist.id, newOrder) != ESP_OK) {
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
 
     // Re-fetch updated playlist
-    auto updated = ManifestDatabase::instance().getPlaylist(playlist->id);
+    auto updated = ManifestDatabase::instance().getPlaylist(playlist.id);
     if (!updated) {
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
 
-    cJSON* response = ManifestDatabase::playlistToJson(*updated);
-    char* response_str = cJSON_PrintUnformatted(response);
-
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, response_str, strlen(response_str));
-
-    free(response_str);
-    cJSON_Delete(response);
-    return ESP_OK;
+    return send_playlist(req, *updated);
 }
 
-// DELETE /api/playlists/{uuid}
-static esp_err_t playlists_delete_handler(httpd_req_t* req) {
-    std::string uuid = extractUuid(req->uri, "/api/playlists/");
+// POST /api/playlists/{uuid}[/order] - router.
+// ESP-IDF wildcards only match at the END of a template, so
+// "/api/playlists/*/order" can never be registered/matched as its own URI —
+// both modify and reorder share the "/api/playlists/*" template and are
+// dispatched here by suffix.
+static esp_err_t playlists_post_router(httpd_req_t* req) {
+    std::string uuid = extract_uuid(req->uri, "/api/playlists/");
     if (uuid.empty()) {
         httpd_resp_send_404(req);
         return ESP_FAIL;
     }
 
-    // uuid is external_uuid - look up to get internal ID
+    auto playlist = ManifestDatabase::instance().getPlaylistByExternalUuid(uuid);
+    if (!playlist) {
+        httpd_resp_send_404(req);
+        return ESP_FAIL;
+    }
+
+    const char* rest = req->uri + strlen("/api/playlists/") + uuid.size();
+    if (strncmp(rest, "/order", 6) == 0) {
+        return playlists_order_handler(req, *playlist);
+    }
+    return playlists_modify_handler(req, *playlist);
+}
+
+// PATCH /api/playlists/{uuid} - update metadata and/or replace pattern list
+// Body (all optional): {"name","description","featured_pattern","pattern_uuids":[...]}
+static esp_err_t playlists_patch_handler(httpd_req_t* req) {
+    std::string uuid = extract_uuid(req->uri, "/api/playlists/");
+    if (uuid.empty()) {
+        httpd_resp_send_404(req);
+        return ESP_FAIL;
+    }
+
+    auto existing = ManifestDatabase::instance().getPlaylistByExternalUuid(uuid);
+    if (!existing) {
+        httpd_resp_send_404(req);
+        return ESP_FAIL;
+    }
+
+    cJSON* json = parse_json_body(req, 4096);
+    if (!json) return ESP_FAIL;
+
+    Playlist updated = *existing;
+
+    cJSON* name = cJSON_GetObjectItem(json, "name");
+    if (name && cJSON_IsString(name) && strlen(name->valuestring) > 0) {
+        updated.name = name->valuestring;
+    }
+    cJSON* description = cJSON_GetObjectItem(json, "description");
+    if (description && cJSON_IsString(description)) {
+        updated.description = description->valuestring;
+    }
+    cJSON* featured = cJSON_GetObjectItem(json, "featured_pattern");
+    if (featured && cJSON_IsString(featured) && strlen(featured->valuestring) > 0) {
+        auto pattern_id = ManifestDatabase::instance().findPatternIdByExternalUuid(featured->valuestring);
+        if (pattern_id) updated.featured_pattern_id = *pattern_id;
+    }
+
+    // Replace pattern list if provided
+    cJSON* pattern_uuids = cJSON_GetObjectItem(json, "pattern_uuids");
+    if (pattern_uuids && cJSON_IsArray(pattern_uuids)) {
+        updated.pattern_ids.clear();
+        cJSON* item;
+        cJSON_ArrayForEach(item, pattern_uuids) {
+            if (cJSON_IsString(item)) {
+                auto pattern_id = ManifestDatabase::instance().findPatternIdByExternalUuid(item->valuestring);
+                if (pattern_id) updated.pattern_ids.push_back(*pattern_id);
+            }
+        }
+    }
+    cJSON_Delete(json);
+
+    updated.updated_at = ManifestDatabase::currentTimestamp();
+
+    if (ManifestDatabase::instance().updatePlaylist(existing->id, updated) != ESP_OK) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    auto refreshed = ManifestDatabase::instance().getPlaylist(existing->id);
+    if (!refreshed) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    return send_playlist(req, *refreshed);
+}
+
+// DELETE /api/playlists/{uuid}
+static esp_err_t playlists_delete_handler(httpd_req_t* req) {
+    std::string uuid = extract_uuid(req->uri, "/api/playlists/");
+    if (uuid.empty()) {
+        httpd_resp_send_404(req);
+        return ESP_FAIL;
+    }
+
     auto playlist = ManifestDatabase::instance().getPlaylistByExternalUuid(uuid);
     if (!playlist) {
         httpd_resp_send_404(req);
@@ -349,7 +341,7 @@ void playlists_api_register_handlers(httpd_handle_t server) {
         .handler = playlists_list_handler,
         .user_ctx = nullptr
     };
-    httpd_register_uri_handler(server, &playlists_list_uri);
+    kd_common_api_register_uri_handler(server, &playlists_list_uri);
 
     static httpd_uri_t playlists_create_uri = {
         .uri = "/api/playlists",
@@ -357,7 +349,7 @@ void playlists_api_register_handlers(httpd_handle_t server) {
         .handler = playlists_create_handler,
         .user_ctx = nullptr
     };
-    httpd_register_uri_handler(server, &playlists_create_uri);
+    kd_common_api_register_uri_handler(server, &playlists_create_uri);
 
     static httpd_uri_t playlists_detail_uri = {
         .uri = "/api/playlists/*",
@@ -365,23 +357,23 @@ void playlists_api_register_handlers(httpd_handle_t server) {
         .handler = playlists_detail_handler,
         .user_ctx = nullptr
     };
-    httpd_register_uri_handler(server, &playlists_detail_uri);
+    kd_common_api_register_uri_handler(server, &playlists_detail_uri);
 
-    static httpd_uri_t playlists_modify_uri = {
+    static httpd_uri_t playlists_post_uri = {
         .uri = "/api/playlists/*",
         .method = HTTP_POST,
-        .handler = playlists_modify_handler,
+        .handler = playlists_post_router,
         .user_ctx = nullptr
     };
-    httpd_register_uri_handler(server, &playlists_modify_uri);
+    kd_common_api_register_uri_handler(server, &playlists_post_uri);
 
-    static httpd_uri_t playlists_order_uri = {
-        .uri = "/api/playlists/*/order",
-        .method = HTTP_POST,
-        .handler = playlists_order_handler,
+    static httpd_uri_t playlists_patch_uri = {
+        .uri = "/api/playlists/*",
+        .method = HTTP_PATCH,
+        .handler = playlists_patch_handler,
         .user_ctx = nullptr
     };
-    httpd_register_uri_handler(server, &playlists_order_uri);
+    kd_common_api_register_uri_handler(server, &playlists_patch_uri);
 
     static httpd_uri_t playlists_delete_uri = {
         .uri = "/api/playlists/*",
@@ -389,5 +381,5 @@ void playlists_api_register_handlers(httpd_handle_t server) {
         .handler = playlists_delete_handler,
         .user_ctx = nullptr
     };
-    httpd_register_uri_handler(server, &playlists_delete_uri);
+    kd_common_api_register_uri_handler(server, &playlists_delete_uri);
 }

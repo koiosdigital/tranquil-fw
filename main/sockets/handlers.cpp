@@ -1,5 +1,6 @@
 // Message handlers for incoming cloud WebSocket messages
 #include "handlers.h"
+#include "sockets.h"
 #include "messages.h"
 #include "PatternDownloader.h"
 #include "message_dispatcher.h"
@@ -115,16 +116,6 @@ namespace {
         }
     }
 
-    void handle_factory_reset(Kd__V1__FactoryResetRequest* request) {
-        const char* reason = (request && request->reason) ? request->reason : nullptr;
-        ESP_LOGI(TAG, "Factory reset requested%s%s",
-            reason ? ": " : "", reason ? reason : "");
-
-        // Erase NVS and reboot
-        //kd_common_factory_reset();
-        esp_restart();
-    }
-
     void handle_cert_renew_required(Kd__V1__CertRenewRequired* request) {
         if (request != nullptr && request->reason != nullptr) {
             ESP_LOGI(TAG, "Cert renewal required: %s", request->reason);
@@ -182,7 +173,10 @@ namespace {
         }
 
         ESP_LOGI(TAG, "Certificate renewed successfully");
-        // Server will disconnect us to reconnect with new cert
+        // cloudlink caches the device cert for the process lifetime, so a plain
+        // reconnect would re-present the OLD cert. Force a deinit+reinit so the
+        // next connection fetches the freshly stored one.
+        sockets_invalidate_cert_cache();
     }
 
     void handle_sync_purchases_response(Kd__V1__SyncPurchasesResponse* response) {
@@ -298,4 +292,17 @@ void cloud_handle_message(Kd__V1__TranquilMessage* message) {
 
     // Unhandled message
     ESP_LOGD(TAG, "Unhandled cloud message: %d", message->message_case);
+}
+
+void handlers_on_connected() {
+    // Report identity, upload any pending coredump, then request the license
+    // and purchase receipts. Claim is device-initiated on the vn path (the
+    // backend only answers ClaimDevice — it never pushes an unsolicited
+    // JoinResponse), so drive it here too.
+    cloud_msg_send_device_info();
+    cloud_msg_upload_coredump();
+    cloud_msg_send_cert_report();
+    cloud_msg_send_license_request();
+    cloud_msg_send_sync_purchases_request();
+    cloud_msg_send_claim_if_needed();
 }

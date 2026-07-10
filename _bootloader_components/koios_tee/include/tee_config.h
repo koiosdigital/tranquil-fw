@@ -205,16 +205,14 @@ void tee_wcl_clear_write_buffer(uint32_t core);
 /* tee_pms.c - Permission Management System */
 void tee_configure_pms(void);
 
-/* tee_handlers.c - C handlers */
-int32_t tee_dispatch(uint32_t service_id, volatile tee_api_t* api);
+/* tee_entry.S + tee_handlers.c - TEE entry and handlers (linked at 0x600FE300) */
+void tee_entry(void);  /* Assembly entry stub - world switch lands here */
+uint32_t tee_handler_main(uint32_t service_id, volatile tee_api_t* api);  /* Main C handler */
 int32_t tee_handle_nop(volatile tee_api_t* api);
 int32_t tee_handle_test(volatile tee_api_t* api);
 int32_t tee_handle_get_info(volatile tee_api_t* api);
 
-/* Assembly stubs - symbols for copying */
-void tee_entry_stub_start(void);
-extern void tee_entry_stub_end(void);
-
+/* Assembly stubs - symbols for copying (exit stub and trampoline only) */
 void tee_exit_stub_start(void);
 extern void tee_exit_stub_end(void);
 

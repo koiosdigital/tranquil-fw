@@ -7,3 +7,6 @@
 [submodule "components/protobufs"]
 	path = components/protobufs
 	url = https://github.com/koiosdigital/protobufs
+[submodule "components/koios_sdk"]
+	path = components/koios_sdk
+	url = https://github.com/koiosdigital/koios-sdk

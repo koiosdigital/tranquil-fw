@@ -1,5 +1,6 @@
 #include "api_player.h"
 #include "SandTablePlayer.h"
+#include "api_common.h"
 #include "esp_log.h"
 #include "cJSON.h"
 #include "esp_http_server.h"
@@ -287,9 +288,9 @@ static httpd_uri_t player_skip_uri = {
 };
 
 void api_player_register_endpoints(httpd_handle_t server) {
-    httpd_register_uri_handler(server, &player_state_uri);
-    httpd_register_uri_handler(server, &player_patch_uri);
-    httpd_register_uri_handler(server, &player_play_uri);
-    httpd_register_uri_handler(server, &player_stop_uri);
-    httpd_register_uri_handler(server, &player_skip_uri);
+    kd_common_api_register_uri_handler(server, &player_state_uri);
+    kd_common_api_register_uri_handler(server, &player_patch_uri);
+    kd_common_api_register_uri_handler(server, &player_play_uri);
+    kd_common_api_register_uri_handler(server, &player_stop_uri);
+    kd_common_api_register_uri_handler(server, &player_skip_uri);
 }

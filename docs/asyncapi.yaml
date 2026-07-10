@@ -8,6 +8,12 @@ info:
     Connect to `/ws` endpoint for binary protobuf messaging. All messages use the
     `kd.v1.TranquilMessage` wrapper with a oneof field for the specific message type.
 
+    The WebSocket carries real-time traffic: state broadcasts (player state,
+    download/conversion progress, schedule changes) and cloud sync. Request/response
+    operations (configuration, presets, calibration, store token) live on the REST
+    API — see `swagger.json`. Local clients should use REST for CRUD and subscribe
+    here for live updates.
+
     ## Protocol
     - Binary WebSocket frames containing serialized protobuf messages
     - Max frame size: 8KB
@@ -61,13 +67,6 @@ channels:
           - $ref: '#/components/messages/LEDConfigRequest'
           - $ref: '#/components/messages/SetLEDChannel'
           - $ref: '#/components/messages/GetLEDEffects'
-          # Configuration (Local-Only)
-          - $ref: '#/components/messages/GetConfigRequest'
-          - $ref: '#/components/messages/SetConfigRequest'
-          - $ref: '#/components/messages/ClearCalibrationRequest'
-          # Presets (Local-Only)
-          - $ref: '#/components/messages/ListPresetsRequest'
-          - $ref: '#/components/messages/LoadPresetRequest'
           # Schedule
           - $ref: '#/components/messages/ScheduleRequest'
           - $ref: '#/components/messages/Schedule'
@@ -76,8 +75,6 @@ channels:
           - $ref: '#/components/messages/GetSystemInfo'
           - $ref: '#/components/messages/HomeRequest'
           - $ref: '#/components/messages/FactoryResetRequest'
-          # License (Local-Only)
-          - $ref: '#/components/messages/GetStoreTokenRequest'
 
     subscribe:
       operationId: receiveMessage
@@ -100,21 +97,12 @@ channels:
           # LED
           - $ref: '#/components/messages/LEDConfig'
           - $ref: '#/components/messages/LEDEffectsList'
-          # Configuration
-          - $ref: '#/components/messages/GetConfigResponse'
-          - $ref: '#/components/messages/SetConfigResponse'
-          - $ref: '#/components/messages/ClearCalibrationResponse'
-          # Presets
-          - $ref: '#/components/messages/ListPresetsResponse'
-          - $ref: '#/components/messages/LoadPresetResponse'
           # Schedule
           - $ref: '#/components/messages/Schedule'
           # System
           - $ref: '#/components/messages/Pong'
           - $ref: '#/components/messages/SystemInfo'
           - $ref: '#/components/messages/HomeResponse'
-          # License
-          - $ref: '#/components/messages/StoreTokenResponse'
 
 components:
   messages:
@@ -346,84 +334,6 @@ components:
         $ref: '#/components/schemas/LEDEffectsList'
 
     # ==========================================================================
-    # Configuration Messages (Local-Only)
-    # ==========================================================================
-    GetConfigRequest:
-      name: GetConfigRequest
-      title: Get Config (Local Only)
-      summary: Request full device configuration
-      description: Only available from local WebSocket, not cloud.
-      payload:
-        $ref: '#/components/schemas/GetConfigRequest'
-
-    GetConfigResponse:
-      name: GetConfigResponse
-      title: Get Config Response
-      summary: Full device configuration
-      payload:
-        $ref: '#/components/schemas/GetConfigResponse'
-
-    SetConfigRequest:
-      name: SetConfigRequest
-      title: Set Config (Local Only)
-      summary: Update device configuration
-      description: Only available from local WebSocket, not cloud.
-      payload:
-        $ref: '#/components/schemas/SetConfigRequest'
-
-    SetConfigResponse:
-      name: SetConfigResponse
-      title: Set Config Response
-      summary: Configuration update result
-      payload:
-        $ref: '#/components/schemas/SetConfigResponse'
-
-    ClearCalibrationRequest:
-      name: ClearCalibrationRequest
-      title: Clear Calibration (Local Only)
-      summary: Clear stored calibration data
-      payload:
-        $ref: '#/components/schemas/ClearCalibrationRequest'
-
-    ClearCalibrationResponse:
-      name: ClearCalibrationResponse
-      title: Clear Calibration Response
-      summary: Calibration clear result
-      payload:
-        $ref: '#/components/schemas/ClearCalibrationResponse'
-
-    # ==========================================================================
-    # Preset Messages (Local-Only)
-    # ==========================================================================
-    ListPresetsRequest:
-      name: ListPresetsRequest
-      title: List Presets (Local Only)
-      summary: Request list of hardware presets
-      payload:
-        $ref: '#/components/schemas/ListPresetsRequest'
-
-    ListPresetsResponse:
-      name: ListPresetsResponse
-      title: List Presets Response
-      summary: List of available hardware presets
-      payload:
-        $ref: '#/components/schemas/ListPresetsResponse'
-
-    LoadPresetRequest:
-      name: LoadPresetRequest
-      title: Load Preset (Local Only)
-      summary: Load a hardware preset
-      payload:
-        $ref: '#/components/schemas/LoadPresetRequest'
-
-    LoadPresetResponse:
-      name: LoadPresetResponse
-      title: Load Preset Response
-      summary: Preset load result
-      payload:
-        $ref: '#/components/schemas/LoadPresetResponse'
-
-    # ==========================================================================
     # Schedule Messages
     # ==========================================================================
     ScheduleRequest:
@@ -491,23 +401,6 @@ components:
       summary: Trigger factory reset (device will restart)
       payload:
         $ref: '#/components/schemas/FactoryResetRequest'
-
-    # ==========================================================================
-    # License Messages (Local-Only)
-    # ==========================================================================
-    GetStoreTokenRequest:
-      name: GetStoreTokenRequest
-      title: Get Store Token (Local Only)
-      summary: Request the store authentication token
-      payload:
-        $ref: '#/components/schemas/GetStoreTokenRequest'
-
-    StoreTokenResponse:
-      name: StoreTokenResponse
-      title: Store Token Response
-      summary: Store authentication token
-      payload:
-        $ref: '#/components/schemas/StoreTokenResponse'
 
     # ==========================================================================
     # Generic Response
@@ -890,145 +783,6 @@ components:
               name:
                 type: string
 
-    # Configuration
-    GetConfigRequest:
-      type: object
-      description: "Protobuf: kd.v1.GetConfigRequest"
-      properties: {}
-
-    GetConfigResponse:
-      type: object
-      description: "Protobuf: kd.v1.GetConfigResponse"
-      properties:
-        motion:
-          $ref: '#/components/schemas/MotionConfigProto'
-        led:
-          $ref: '#/components/schemas/LEDConfigProto'
-        calibration:
-          $ref: '#/components/schemas/CalibrationDataProto'
-        active_preset_id:
-          type: string
-
-    SetConfigRequest:
-      type: object
-      description: "Protobuf: kd.v1.SetConfigRequest"
-      properties:
-        motion:
-          $ref: '#/components/schemas/MotionConfigProto'
-        led:
-          $ref: '#/components/schemas/LEDConfigProto'
-
-    SetConfigResponse:
-      type: object
-      description: "Protobuf: kd.v1.SetConfigResponse"
-      properties:
-        success:
-          type: boolean
-        error:
-          type: string
-
-    MotionConfigProto:
-      type: object
-      properties:
-        steps_per_rev:
-          type: integer
-        microsteps:
-          type: integer
-        theta_gear_ratio_x100:
-          type: integer
-        pinion_diameter_mm:
-          type: integer
-        theta_max_rpm:
-          type: integer
-        rho_max_rpm:
-          type: integer
-        theta_current_ma:
-          type: integer
-        rho_current_ma:
-          type: integer
-        stallguard_threshold:
-          type: integer
-        default_accel_mm_s2:
-          type: number
-          format: float
-        max_accel_mm_s2:
-          type: number
-          format: float
-
-    LEDConfigProto:
-      type: object
-      properties:
-        has_leds:
-          type: boolean
-        led_count:
-          type: integer
-        is_rgbw:
-          type: boolean
-
-    CalibrationDataProto:
-      type: object
-      properties:
-        theta_steps_per_rotation:
-          type: integer
-        rho_max_steps:
-          type: integer
-        is_valid:
-          type: boolean
-        timestamp:
-          type: integer
-
-    ClearCalibrationRequest:
-      type: object
-      description: "Protobuf: kd.v1.ClearCalibrationRequest"
-      properties: {}
-
-    ClearCalibrationResponse:
-      type: object
-      description: "Protobuf: kd.v1.ClearCalibrationResponse"
-      properties:
-        success:
-          type: boolean
-
-    # Presets
-    ListPresetsRequest:
-      type: object
-      description: "Protobuf: kd.v1.ListPresetsRequest"
-      properties: {}
-
-    ListPresetsResponse:
-      type: object
-      description: "Protobuf: kd.v1.ListPresetsResponse"
-      properties:
-        presets:
-          type: array
-          items:
-            type: object
-            properties:
-              id:
-                type: string
-              name:
-                type: string
-              description:
-                type: string
-        active_preset_id:
-          type: string
-
-    LoadPresetRequest:
-      type: object
-      description: "Protobuf: kd.v1.LoadPresetRequest"
-      properties:
-        preset_id:
-          type: string
-
-    LoadPresetResponse:
-      type: object
-      description: "Protobuf: kd.v1.LoadPresetResponse"
-      properties:
-        success:
-          type: boolean
-        error:
-          type: string
-
     # Schedule
     TranquilScheduleRequest:
       type: object
@@ -1127,24 +881,6 @@ components:
         reason:
           type: string
           description: "Optional reason for logging"
-
-    # License
-    GetStoreTokenRequest:
-      type: object
-      description: "Protobuf: kd.v1.GetStoreTokenRequest"
-      properties: {}
-
-    StoreTokenResponse:
-      type: object
-      description: "Protobuf: kd.v1.StoreTokenResponse"
-      properties:
-        success:
-          type: boolean
-        store_token:
-          type: string
-          description: "JWT token for store authentication"
-        error:
-          type: string
 
     # Generic
     CommandResult:

@@ -14,6 +14,7 @@
 #include "esp_task_wdt.h"
 
 #include "kd_common.h"
+#include "kd_api.h"
 #include "kdc_heap_tracing.h"
 #include "kd_pixdriver.h"
 
@@ -34,82 +35,24 @@
 #include "storage/jobs/thumbnail_executor.h"
 #include "storage/jobs/download_executor.h"
 
-#include "tee_client.h"
+#include <koios/ota.h>
 
 static const char* TAG = "main";
 
 static sand_table::MotionController* g_motion_controller = nullptr;
 
-static void print_world(const char* tag) {
-    // Read WCL_CORE_0_World_IRam0_REG
-    uint32_t wcl0_val = *(volatile uint32_t*)0x600D0000 + 0x150;
-    uint32_t world0_bit = wcl0_val & 0x1;  // Extract bit 0
-
-    uint32_t wcl1_val = *(volatile uint32_t*)0x600D0000 + 0x550;
-    uint32_t world1_bit = wcl1_val & 0x1;  // Extract bit 0
-
-    // Per TRM: bit 0 indicates IRAM world - 0=non-secure(W1), 1=secure(W0)
-    // Note: W0=secure, W1=non-secure
-    const char* world0_name = world0_bit ? "secure" : "non-secure";
-    const char* world1_name = world1_bit ? "secure" : "non-secure";
-    ESP_LOGE(TAG, "%s: core 0: %s, core 1: %s", tag, world0_name, world1_name);
-}
-
 extern "C" void app_main(void)
 {
-    print_world("app_main_start");
-
-    // Dump what's at the hardcoded TEE_ENTRY_ADDR (0x600FE100)
-    uint32_t* tee_ws_entry = (uint32_t*)0x600FE100;
-    ESP_LOGI(TAG, "TEE world switch entry @ 0x600FE100:");
-    ESP_LOGI(TAG, "  [0x00] %08x %08x %08x %08x",
-        tee_ws_entry[0], tee_ws_entry[1], tee_ws_entry[2], tee_ws_entry[3]);
-
-    // Dump handlers at 0x600FE300
-    uint32_t* tee_handlers = (uint32_t*)0x600FE300;
-    ESP_LOGI(TAG, "TEE handlers @ 0x600FE300:");
-    ESP_LOGI(TAG, "  [0x00] %08x %08x %08x %08x",
-        tee_handlers[0], tee_handlers[1], tee_handlers[2], tee_handlers[3]);
-    // Expected for minimal handler: 020c f00d (movi.n a2,0; ret.n)
-    // In little-endian 32-bit: 0x0df00c02
-
-    // Verify TEE was initialized by bootloader
-    tee_error_t tee_ret = tee_client_init();
-    ESP_LOGI(TAG, "tee_client_init() returned: %d", tee_ret);
-
-    if (tee_ret == TEE_OK) {
-        while (1) {
-            // Check debug_stage before call (should be 0 or previous value)
-            volatile tee_api_t* api_pre = TEE_API();
-            ESP_LOGI(TAG, "Before TEE: debug_stage=0x%lx", (unsigned long)api_pre->debug_stage);
-
-            // Test World 1 -> World 0 -> World 1 round-trip
-            ESP_LOGI(TAG, "Testing TEE call...");
-            int32_t test_result = tee_call(TEE_SVC_TEST);
-            ESP_LOGI(TAG, "tee_call(TEE_SVC_TEST) returned: %ld", (long)test_result);
-            ESP_LOGI(TAG, "TEE call_count: %lu", (unsigned long)tee_get_call_count());
-
-            volatile tee_api_t* api = TEE_API();
-            ESP_LOGI(TAG, "api->result: %ld, api->debug_stage: %lu",
-                (long)api->result, (unsigned long)api->debug_stage);
-
-
-            print_world("post_tee_call");
-            vTaskDelay(pdMS_TO_TICKS(1000));
-        }
-    }
-
-    vTaskSuspend(NULL);
-
-    // Disable watchdogs for slow integrity checking
-    esp_task_wdt_deinit();
-
     esp_event_loop_create_default();
 
     stusb_init();
 
-    kd_common_set_provisioning_srp_password_format(PROVISIONING_SRP_FORMAT_STATIC);
     kd_common_init();
+    kd_common_set_device_info("tranquil", FIRMWARE_VARIANT);
+
+    // Cloud OTA (koios-sdk). Self-schedules once the cloudlink session is up
+    // and the device JWT is available; NULL config uses the default OTA host.
+    koios_ota_init(nullptr);
 
     // Initialize ConfigManager early (before components that need config)
     auto cfg_err = sand_table::ConfigManager::instance().init();
@@ -118,10 +61,7 @@ extern "C" void app_main(void)
     }
 
     ManifestDatabase::instance().initialize();
-    ManifestDatabase::instance().selfTest();
-
-
-    /*
+    drm_license_init();
 
     // Initialize job processing system
     jobs::JobQueue::instance().initialize();
@@ -131,8 +71,6 @@ extern "C" void app_main(void)
     executors[jobs::JobType::Download] = std::make_unique<jobs::DownloadExecutor>();
     jobs::JobProcessor::instance().init(std::move(executors));
     ESP_LOGI(TAG, "Job processing system initialized");
-
-    */
 
     // Initialize motion controller
     g_motion_controller = new sand_table::MotionController();
@@ -164,11 +102,15 @@ extern "C" void app_main(void)
         PixelDriver::setCurrentLimit(1750);
         PixelDriver::start();
 
-        kd_common_api_register_handlers(PixelDriver::attach_api);
+        // Route registration through the kd_common wrapper so the CORS
+        // pre-handler applies to the LED routes too.
+        kd_common_api_register_handlers([](httpd_handle_t server) {
+            PixelDriver::attach_api(server, kd_common_api_register_uri_handler);
+            });
     }
 
     tranquil_api_init();
-    //cloud_sockets_init();
+    cloud_sockets_init();
 
     auto ret = g_motion_controller->home();
     if (ret.is_err()) {

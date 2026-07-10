@@ -1,5 +1,6 @@
 #include "license_api.h"
 #include "drm/drm_license.h"
+#include "api_common.h"
 #include "cJSON.h"
 #include "esp_log.h"
 #include <cstring>
@@ -64,7 +65,7 @@ void license_api_register_handlers(httpd_handle_t server) {
         .handler = handle_get_store_token,
         .user_ctx = nullptr
     };
-    httpd_register_uri_handler(server, &store_token_uri);
+    kd_common_api_register_uri_handler(server, &store_token_uri);
 
     ESP_LOGI(TAG, "License API handlers registered");
 }

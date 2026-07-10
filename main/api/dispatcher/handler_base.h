@@ -17,23 +17,23 @@ struct HandleResult {
     bool send_to_cloud;     // Send response to cloud (in addition to local)
 
     static HandleResult ok(bool broadcast_to_locals = false, bool also_send_to_cloud = false) {
-        return {true, true, broadcast_to_locals, false, also_send_to_cloud};
+        return { true, true, broadcast_to_locals, false, also_send_to_cloud };
     }
 
     static HandleResult noResponse() {
-        return {true, false, false, false, false};
+        return { true, false, false, false, false };
     }
 
     static HandleResult forwardToCloud() {
-        return {true, false, false, true, false};
+        return { true, false, false, true, false };
     }
 
     static HandleResult notHandled() {
-        return {false, false, false, false, false};
+        return { false, false, false, false, false };
     }
 
     static HandleResult error() {
-        return {true, true, false, false, false};
+        return { true, true, false, false, false };
     }
 };
 
@@ -145,7 +145,7 @@ protected:
         size_t len = kd__v1__tranquil_message__get_packed_size(msg);
 
         // Enforce max response size for local API
-        static constexpr size_t MAX_RESPONSE = 8 * 1024;
+        static constexpr size_t MAX_RESPONSE = 16 * 1024;
         if (len > MAX_RESPONSE) {
             ESP_LOGE("HandlerBase", "Response exceeds %zu bytes: %zu", MAX_RESPONSE, len);
             return ResponseMessage();

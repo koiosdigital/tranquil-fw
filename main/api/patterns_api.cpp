@@ -3,6 +3,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "cJSON.h"
+#include "api_common.h"
 #include "ManifestDatabase.h"
 #include "PatternReader.h"
 #include "jobs/job_queue.h"
@@ -60,34 +61,54 @@ namespace {
         return 0;
     }
 
-    // Helper: create pagination JSON object
-    cJSON* createPaginationJson(const PaginationInfo& info) {
-        cJSON* pagination = cJSON_CreateObject();
-        cJSON_AddNumberToObject(pagination, "page", info.page);
-        cJSON_AddNumberToObject(pagination, "per_page", info.per_page);
-        cJSON_AddNumberToObject(pagination, "total_pages", info.total_pages);
-        cJSON_AddNumberToObject(pagination, "total_items", info.total_items);
-        return pagination;
-    }
-
-    // Helper: parse pagination query params
-    void parsePaginationParams(httpd_req_t* req, int& page, int& per_page) {
-        page = 0;
-        per_page = 20;
-
-        char query[128] = { 0 };
-        if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
-            char param[16] = { 0 };
-            if (httpd_query_key_value(query, "page", param, sizeof(param)) == ESP_OK) {
-                page = atoi(param);
-                if (page < 0) page = 0;
-            }
-            if (httpd_query_key_value(query, "per_page", param, sizeof(param)) == ESP_OK) {
-                per_page = atoi(param);
-                if (per_page < 1) per_page = 1;
-                if (per_page > 100) per_page = 100;
+    // Stream a pattern object without building a cJSON tree. Field set
+    // mirrors ManifestDatabase::patternToJson.
+    void write_pattern_json(api_common::ChunkBuf* cb, const Pattern& p) {
+        using namespace api_common;
+        chunk_buf_write_str(cb, "{\"uuid\":");
+        chunk_buf_write_json_string(cb, p.external_uuid.c_str());
+        chunk_buf_printf(cb, ",\"id\":%lu,\"name\":", (unsigned long)p.id);
+        chunk_buf_write_json_string(cb, p.name.c_str());
+        chunk_buf_write_str(cb, ",\"creator\":");
+        chunk_buf_write_json_string(cb, p.creator.c_str());
+        chunk_buf_write_str(cb, ",\"date\":");
+        chunk_buf_write_json_string(cb, p.date.c_str());
+        chunk_buf_printf(cb, ",\"popularity\":%d,\"reversible\":%s,\"start_point\":%u,\"encrypted\":%s,\"size_bytes\":%lu",
+            p.popularity,
+            p.reversible ? "true" : "false",
+            (unsigned)p.start_point,
+            p.encrypted ? "true" : "false",
+            (unsigned long)p.size_bytes);
+        // URLs per the swagger contract (download only for unencrypted patterns)
+        chunk_buf_write_str(cb, ",\"thumb_url\":\"/api/pattern_thumbs/");
+        chunk_buf_write_str(cb, p.external_uuid.c_str());
+        chunk_buf_write_str(cb, ".png\",\"download_url\":\"");
+        if (!p.encrypted) {
+            chunk_buf_write_str(cb, "/api/pattern_download/");
+            chunk_buf_write_str(cb, p.external_uuid.c_str());
+        }
+        chunk_buf_write(cb, "\"", 1);
+        if (!p.created_at.empty()) {
+            chunk_buf_write_str(cb, ",\"created_at\":");
+            chunk_buf_write_json_string(cb, p.created_at.c_str());
+        }
+        if (!p.last_played_at.empty()) {
+            chunk_buf_write_str(cb, ",\"last_played_at\":");
+            chunk_buf_write_json_string(cb, p.last_played_at.c_str());
+        }
+        if (!p.downloaded_at.empty()) {
+            chunk_buf_write_str(cb, ",\"downloaded_at\":");
+            chunk_buf_write_json_string(cb, p.downloaded_at.c_str());
+        }
+        chunk_buf_printf(cb, ",\"is_owned\":%s", p.purchased ? "true" : "false");
+        if (p.purchased) {
+            chunk_buf_printf(cb, ",\"purchased_at\":%lld", (long long)p.purchased_at);
+            if (!p.receipt_id.empty()) {
+                chunk_buf_write_str(cb, ",\"receipt_id\":");
+                chunk_buf_write_json_string(cb, p.receipt_id.c_str());
             }
         }
+        chunk_buf_write(cb, "}", 1);
     }
 
     // Extract boundary from Content-Type header
@@ -166,32 +187,37 @@ namespace {
 
 } // anonymous namespace
 
-// GET /api/patterns - paginated list
+// GET /api/patterns - paginated list (streamed, no JSON tree)
 static esp_err_t patterns_list_handler(httpd_req_t* req) {
+    using namespace api_common;
+
     int page, per_page;
-    parsePaginationParams(req, page, per_page);
+    parse_pagination(req, page, per_page);
 
     auto result = ManifestDatabase::instance().getPatterns(page, per_page);
 
-    cJSON* response = cJSON_CreateObject();
-    cJSON_AddItemToObject(response, "pagination", createPaginationJson(result.pagination));
+    httpd_resp_set_type(req, "application/json");
+    ChunkBuf cb;
+    chunk_buf_init(&cb, req);
 
-    cJSON* patternsArray = cJSON_CreateArray();
+    chunk_buf_printf(&cb,
+        "{\"pagination\":{\"page\":%d,\"per_page\":%d,\"total_pages\":%d,\"total_items\":%d},\"patterns\":[",
+        result.pagination.page, result.pagination.per_page,
+        result.pagination.total_pages, result.pagination.total_items);
+
+    bool first = true;
     for (auto& pattern : result.items) {
         // Update size from disk if not set
         if (pattern.size_bytes == 0) {
             pattern.size_bytes = getPatternFileSize(pattern.external_uuid, pattern.encrypted);
         }
-        cJSON_AddItemToArray(patternsArray, ManifestDatabase::patternToJson(pattern));
+        if (!first) chunk_buf_write(&cb, ",", 1);
+        write_pattern_json(&cb, pattern);
+        first = false;
     }
-    cJSON_AddItemToObject(response, "patterns", patternsArray);
 
-    char* json_str = cJSON_PrintUnformatted(response);
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, json_str, strlen(json_str));
-
-    free(json_str);
-    cJSON_Delete(response);
+    chunk_buf_write_str(&cb, "]}");
+    chunk_buf_finish(&cb);
     return ESP_OK;
 }
 
@@ -478,14 +504,11 @@ static esp_err_t patterns_detail_handler(httpd_req_t* req) {
         pattern->size_bytes = getPatternFileSize(pattern->external_uuid, pattern->encrypted);
     }
 
-    cJSON* json = ManifestDatabase::patternToJson(*pattern);
-    char* json_str = cJSON_PrintUnformatted(json);
-
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, json_str, strlen(json_str));
-
-    free(json_str);
-    cJSON_Delete(json);
+    api_common::ChunkBuf cb;
+    api_common::chunk_buf_init(&cb, req);
+    write_pattern_json(&cb, *pattern);
+    api_common::chunk_buf_finish(&cb);
     return ESP_OK;
 }
 
@@ -715,7 +738,7 @@ void patterns_api_register_handlers(httpd_handle_t server) {
         .handler = patterns_list_handler,
         .user_ctx = nullptr
     };
-    httpd_register_uri_handler(server, &patterns_list_uri);
+    kd_common_api_register_uri_handler(server, &patterns_list_uri);
 
     static httpd_uri_t patterns_upload_uri = {
         .uri = "/api/patterns",
@@ -723,7 +746,7 @@ void patterns_api_register_handlers(httpd_handle_t server) {
         .handler = patterns_upload_handler,
         .user_ctx = nullptr
     };
-    httpd_register_uri_handler(server, &patterns_upload_uri);
+    kd_common_api_register_uri_handler(server, &patterns_upload_uri);
 
     static httpd_uri_t patterns_download_uri = {
         .uri = "/api/pattern_download/*",
@@ -731,7 +754,7 @@ void patterns_api_register_handlers(httpd_handle_t server) {
         .handler = patterns_download_handler,
         .user_ctx = nullptr
     };
-    httpd_register_uri_handler(server, &patterns_download_uri);
+    kd_common_api_register_uri_handler(server, &patterns_download_uri);
 
     static httpd_uri_t pattern_thumbs_uri = {
         .uri = "/api/pattern_thumbs/*",
@@ -739,7 +762,7 @@ void patterns_api_register_handlers(httpd_handle_t server) {
         .handler = pattern_thumb_handler,
         .user_ctx = nullptr
     };
-    httpd_register_uri_handler(server, &pattern_thumbs_uri);
+    kd_common_api_register_uri_handler(server, &pattern_thumbs_uri);
 
     static httpd_uri_t patterns_detail_uri = {
         .uri = "/api/patterns/*",
@@ -747,7 +770,7 @@ void patterns_api_register_handlers(httpd_handle_t server) {
         .handler = patterns_detail_handler,
         .user_ctx = nullptr
     };
-    httpd_register_uri_handler(server, &patterns_detail_uri);
+    kd_common_api_register_uri_handler(server, &patterns_detail_uri);
 
     static httpd_uri_t patterns_delete_uri = {
         .uri = "/api/patterns/*",
@@ -755,5 +778,5 @@ void patterns_api_register_handlers(httpd_handle_t server) {
         .handler = patterns_delete_handler,
         .user_ctx = nullptr
     };
-    httpd_register_uri_handler(server, &patterns_delete_uri);
+    kd_common_api_register_uri_handler(server, &patterns_delete_uri);
 }

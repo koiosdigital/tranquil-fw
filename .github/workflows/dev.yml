@@ -10,6 +10,6 @@ jobs:
   build:
     uses: acvigue/.github/.github/workflows/idf_build.yaml@main
     with:
-      idf_version: v5.5.2
+      idf_version: v6.0.0
       project_name: tranquil-fw
       create_release: false

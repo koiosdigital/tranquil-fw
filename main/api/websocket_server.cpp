@@ -1,5 +1,6 @@
 #include "websocket_server.h"
 #include "message_dispatcher.h"
+#include "raii_utils.hpp"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -11,8 +12,8 @@ static const char* TAG = "ws_server";
 // Maximum concurrent WebSocket clients (memory constrained)
 static constexpr size_t MAX_CLIENTS = 4;
 
-// Maximum incoming frame size (8KB sufficient for local API)
-static constexpr size_t MAX_FRAME_SIZE = 8192;
+// Maximum incoming frame size (16KB sufficient for local API)
+static constexpr size_t MAX_FRAME_SIZE = 1024 * 16;
 
 // Connected client socket file descriptors
 static int connected_clients[MAX_CLIENTS] = { -1, -1, -1, -1 };
@@ -21,7 +22,8 @@ static httpd_handle_t ws_server = nullptr;
 
 // Add client to tracking list
 static bool add_client(int fd) {
-    if (xSemaphoreTake(clients_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+    raii::MutexGuard guard(clients_mutex, pdMS_TO_TICKS(100));
+    if (!guard) {
         return false;
     }
 
@@ -29,19 +31,18 @@ static bool add_client(int fd) {
         if (connected_clients[i] == -1) {
             connected_clients[i] = fd;
             ESP_LOGI(TAG, "Client connected: fd=%d (slot %zu)", fd, i);
-            xSemaphoreGive(clients_mutex);
             return true;
         }
     }
 
-    xSemaphoreGive(clients_mutex);
     ESP_LOGW(TAG, "Max clients reached, rejecting fd=%d", fd);
     return false;
 }
 
 // Remove client from tracking list
 static void remove_client(int fd) {
-    if (xSemaphoreTake(clients_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+    raii::MutexGuard guard(clients_mutex, pdMS_TO_TICKS(100));
+    if (!guard) {
         return;
     }
 
@@ -52,8 +53,6 @@ static void remove_client(int fd) {
             break;
         }
     }
-
-    xSemaphoreGive(clients_mutex);
 }
 
 // WebSocket handler
@@ -255,7 +254,11 @@ esp_err_t websocket_send(int fd, const uint8_t* data, size_t len) {
 }
 
 esp_err_t websocket_broadcast(const uint8_t* data, size_t len) {
-    if (xSemaphoreTake(clients_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+    // Server not started yet (e.g. WiFi not connected, still provisioning)
+    if (!clients_mutex) return ESP_ERR_INVALID_STATE;
+
+    raii::MutexGuard guard(clients_mutex, pdMS_TO_TICKS(100));
+    if (!guard) {
         return ESP_ERR_TIMEOUT;
     }
 
@@ -269,12 +272,14 @@ esp_err_t websocket_broadcast(const uint8_t* data, size_t len) {
         }
     }
 
-    xSemaphoreGive(clients_mutex);
     return last_err;
 }
 
 size_t websocket_client_count() {
-    if (xSemaphoreTake(clients_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+    if (!clients_mutex) return 0;
+
+    raii::MutexGuard guard(clients_mutex, pdMS_TO_TICKS(100));
+    if (!guard) {
         return 0;
     }
 
@@ -285,6 +290,5 @@ size_t websocket_client_count() {
         }
     }
 
-    xSemaphoreGive(clients_mutex);
     return count;
 }

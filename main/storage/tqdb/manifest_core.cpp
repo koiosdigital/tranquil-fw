@@ -40,7 +40,7 @@ esp_err_t ManifestDatabase::initialize() {
     if (impl_->initialized) return ESP_OK;
 
     init_sd();
-    format_sd();
+    //format_sd();
 
     struct stat st = { 0 };
     if (stat("/sd/patterns", &st) == -1) {
@@ -87,7 +87,8 @@ esp_err_t ManifestDatabase::initialize() {
         cfg.wal_mem_buf = impl_->wal_buf;
         cfg.wal_mem_buf_size = Impl::WAL_BUF_SIZE;
         cfg.wal_flush_threshold = Impl::WAL_FLUSH_THRESHOLD;
-    } else {
+    }
+    else {
         cfg.enable_wal = false;
     }
 

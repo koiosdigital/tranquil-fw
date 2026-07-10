@@ -150,8 +150,10 @@ Playlist ManifestDatabase::jsonToPlaylist(const cJSON* json) {
     pl.created_at = getText("created_at");
     pl.updated_at = getText("updated_at");
 
-    // Convert pattern UUIDs to internal IDs
-    const cJSON* patterns = cJSON_GetObjectItem(json, "patterns");
+    // Convert pattern UUIDs to internal IDs.
+    // "pattern_uuids" per the swagger contract; "patterns" kept for older payloads.
+    const cJSON* patterns = cJSON_GetObjectItem(json, "pattern_uuids");
+    if (!patterns) patterns = cJSON_GetObjectItem(json, "patterns");
     if (patterns && cJSON_IsArray(patterns)) {
         const cJSON* item;
         cJSON_ArrayForEach(item, patterns) {

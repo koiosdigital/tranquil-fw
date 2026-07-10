@@ -171,6 +171,7 @@ static void continue_boot_in_w1(void)
     print_world("continue_boot_in_w1");
 
     /* Copy C handlers binary to RTC FAST (linked at 0x600FE300) */
+    /* tee_entry() is now the first function - no separate entry stub needed */
     size_t handlers_size = _tee_handlers_bin_len;
     if (handlers_size > TEE_HANDLERS_SIZE) {
         ESP_LOGW(TAG, "Handlers size %u exceeds max %u, truncating",
@@ -185,25 +186,16 @@ static void continue_boot_in_w1(void)
     for (size_t i = 0; i < words; i++) {
         dst[i] = src[i];
     }
-    ESP_LOGI(TAG, "Handlers binary copied to 0x%08x (%u bytes)",
+    ESP_LOGI(TAG, "TEE handlers (with entry) copied to 0x%08x (%u bytes)",
         TEE_HANDLERS_ADDR, (unsigned)handlers_size);
-
-    /* Copy entry stub for app TEE calls */
-    size_t entry_size = copy_to_rtc(
-        (void*)TEE_ENTRY_STUB,
-        (const void*)tee_entry_stub_start,
-        (const void*)tee_entry_stub_end,
-        0x100  /* Max 256 bytes */
-    );
-    ESP_LOGI(TAG, "Entry stub copied to 0x%08x (%u bytes)",
-        TEE_ENTRY_STUB, (unsigned)entry_size);
 
     sync_icache();
 
     /* Configure WCL entry points for app W1->W0 calls */
-    tee_wcl_configure(0, TEE_ENTRY_STUB);
-    tee_wcl_configure(1, TEE_ENTRY_STUB);
-    ESP_LOGI(TAG, "WCL configured: entry at 0x%08x", TEE_ENTRY_STUB);
+    /* WCL now monitors handlers address directly (tee_entry at 0x600FE300) */
+    tee_wcl_configure(0, TEE_HANDLERS_ADDR);
+    tee_wcl_configure(1, TEE_HANDLERS_ADDR);
+    ESP_LOGI(TAG, "WCL configured: entry at 0x%08x", TEE_HANDLERS_ADDR);
 
     /* Initialize shared memory API table and state */
     tee_api_init();

@@ -1,6 +1,7 @@
 #include "SandTablePlayer.h"
 #include "drm/drm_license.h"
 #include "drm/drm_purchase.h"
+#include "raii_utils.hpp"
 #include "esp_log.h"
 #include <cstdio>
 #include <cstdlib>
@@ -122,7 +123,8 @@ esp_err_t SandTablePlayer::playPattern(const char* pattern_uuid) {
         }
     }
 
-    if (xSemaphoreTake(state_mutex_, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    raii::MutexGuard guard(state_mutex_, pdMS_TO_TICKS(1000));
+    if (!guard) {
         ESP_LOGE(TAG, "Failed to acquire state mutex");
         return ESP_ERR_TIMEOUT;
     }
@@ -135,7 +137,6 @@ esp_err_t SandTablePlayer::playPattern(const char* pattern_uuid) {
     // Load the pattern file
     esp_err_t ret = loadPatternFile(pattern_uuid);
     if (ret != ESP_OK) {
-        xSemaphoreGive(state_mutex_);
         return ret;
     }
 
@@ -144,7 +145,6 @@ esp_err_t SandTablePlayer::playPattern(const char* pattern_uuid) {
     if (!current_pattern_.has_value()) {
         ESP_LOGE(TAG, "Pattern not found in manifest: %s", pattern_uuid);
         unloadPatternFile();
-        xSemaphoreGive(state_mutex_);
         return ESP_ERR_NOT_FOUND;
     }
 
@@ -157,8 +157,6 @@ esp_err_t SandTablePlayer::playPattern(const char* pattern_uuid) {
     play_mode_ = PlayMode::SINGLE_PATTERN;
     playback_state_ = PlaybackState::PLAYING;
     motion_controller_->resume();  // Ensure not paused
-
-    xSemaphoreGive(state_mutex_);
 
     ESP_LOGI(TAG, "Started playing pattern: %s (%s)",
         current_pattern_->name.c_str(), pattern_uuid);
@@ -173,7 +171,8 @@ esp_err_t SandTablePlayer::playPlaylist(const char* playlist_uuid, bool shuffle,
     if (!initialized_) return ESP_ERR_INVALID_STATE;
     if (!motion_controller_->is_homed()) return ESP_ERR_INVALID_STATE;
 
-    if (xSemaphoreTake(state_mutex_, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    raii::MutexGuard guard(state_mutex_, pdMS_TO_TICKS(1000));
+    if (!guard) {
         return ESP_ERR_TIMEOUT;
     }
 
@@ -187,7 +186,6 @@ esp_err_t SandTablePlayer::playPlaylist(const char* playlist_uuid, bool shuffle,
     loadPlaylist(playlist_uuid);
     if (playlist_patterns_.empty()) {
         ESP_LOGE(TAG, "Playlist is empty or not found: %s", playlist_uuid);
-        xSemaphoreGive(state_mutex_);
         return ESP_ERR_NOT_FOUND;
     }
 
@@ -208,8 +206,6 @@ esp_err_t SandTablePlayer::playPlaylist(const char* playlist_uuid, bool shuffle,
 
     startCurrentPattern();
 
-    xSemaphoreGive(state_mutex_);
-
     ESP_LOGI(TAG, "Started playlist: %s (shuffle=%d, loop=%d)",
         playlist_uuid, (int)shuffle, (int)loop);
     return ESP_OK;
@@ -219,7 +215,8 @@ esp_err_t SandTablePlayer::playPlaylistFromPattern(const char* playlist_uuid, co
     if (!initialized_) return ESP_ERR_INVALID_STATE;
     if (!motion_controller_->is_homed()) return ESP_ERR_INVALID_STATE;
 
-    if (xSemaphoreTake(state_mutex_, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    raii::MutexGuard guard(state_mutex_, pdMS_TO_TICKS(1000));
+    if (!guard) {
         return ESP_ERR_TIMEOUT;
     }
 
@@ -233,7 +230,6 @@ esp_err_t SandTablePlayer::playPlaylistFromPattern(const char* playlist_uuid, co
     loadPlaylist(playlist_uuid);
     if (playlist_patterns_.empty()) {
         ESP_LOGE(TAG, "Playlist is empty or not found: %s", playlist_uuid);
-        xSemaphoreGive(state_mutex_);
         return ESP_ERR_NOT_FOUND;
     }
 
@@ -256,7 +252,6 @@ esp_err_t SandTablePlayer::playPlaylistFromPattern(const char* playlist_uuid, co
 
     if (!found) {
         ESP_LOGE(TAG, "Pattern %s not found in playlist %s", pattern_uuid, playlist_uuid);
-        xSemaphoreGive(state_mutex_);
         return ESP_ERR_NOT_FOUND;
     }
 
@@ -294,8 +289,6 @@ esp_err_t SandTablePlayer::playPlaylistFromPattern(const char* playlist_uuid, co
 
     startCurrentPattern();
 
-    xSemaphoreGive(state_mutex_);
-
     ESP_LOGI(TAG, "Started playlist: %s from pattern %s (shuffle=%d, loop=%d)",
         playlist_uuid, pattern_uuid, (int)shuffle, (int)loop);
     return ESP_OK;
@@ -308,7 +301,8 @@ esp_err_t SandTablePlayer::playPlaylistFromPattern(const char* playlist_uuid, co
 esp_err_t SandTablePlayer::pause() {
     if (!initialized_) return ESP_ERR_INVALID_STATE;
 
-    if (xSemaphoreTake(state_mutex_, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    raii::MutexGuard guard(state_mutex_, pdMS_TO_TICKS(1000));
+    if (!guard) {
         return ESP_ERR_TIMEOUT;
     }
 
@@ -318,14 +312,14 @@ esp_err_t SandTablePlayer::pause() {
         ESP_LOGI(TAG, "Playback paused");
     }
 
-    xSemaphoreGive(state_mutex_);
     return ESP_OK;
 }
 
 esp_err_t SandTablePlayer::resume() {
     if (!initialized_) return ESP_ERR_INVALID_STATE;
 
-    if (xSemaphoreTake(state_mutex_, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    raii::MutexGuard guard(state_mutex_, pdMS_TO_TICKS(1000));
+    if (!guard) {
         return ESP_ERR_TIMEOUT;
     }
 
@@ -335,14 +329,14 @@ esp_err_t SandTablePlayer::resume() {
         ESP_LOGI(TAG, "Playback resumed");
     }
 
-    xSemaphoreGive(state_mutex_);
     return ESP_OK;
 }
 
 esp_err_t SandTablePlayer::stop() {
     if (!initialized_) return ESP_ERR_INVALID_STATE;
 
-    if (xSemaphoreTake(state_mutex_, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    raii::MutexGuard guard(state_mutex_, pdMS_TO_TICKS(1000));
+    if (!guard) {
         return ESP_ERR_TIMEOUT;
     }
 
@@ -362,7 +356,7 @@ esp_err_t SandTablePlayer::stop() {
     is_shuffle_ = false;
     is_loop_ = false;
 
-    xSemaphoreGive(state_mutex_);
+    guard.release();
 
     ESP_LOGI(TAG, "Playback stopped");
 
@@ -378,19 +372,21 @@ esp_err_t SandTablePlayer::emergencyStop() {
     motion_controller_->emergency_stop();
 
     // Now acquire mutex to update state
-    if (xSemaphoreTake(state_mutex_, pdMS_TO_TICKS(100)) == pdTRUE) {
-        playback_state_ = PlaybackState::STOPPED;
-        play_mode_ = PlayMode::SINGLE_PATTERN;
-        unloadPatternFile();
-        memset(current_pattern_uuid_, 0, sizeof(current_pattern_uuid_));
-        current_pattern_ = std::nullopt;
-        memset(current_playlist_uuid_, 0, sizeof(current_playlist_uuid_));
-        playlist_patterns_.clear();
-        playlist_order_.clear();
-        playlist_index_ = 0;
-        is_shuffle_ = false;
-        is_loop_ = false;
-        xSemaphoreGive(state_mutex_);
+    {
+        raii::MutexGuard guard(state_mutex_, pdMS_TO_TICKS(100));
+        if (guard) {
+            playback_state_ = PlaybackState::STOPPED;
+            play_mode_ = PlayMode::SINGLE_PATTERN;
+            unloadPatternFile();
+            memset(current_pattern_uuid_, 0, sizeof(current_pattern_uuid_));
+            current_pattern_ = std::nullopt;
+            memset(current_playlist_uuid_, 0, sizeof(current_playlist_uuid_));
+            playlist_patterns_.clear();
+            playlist_order_.clear();
+            playlist_index_ = 0;
+            is_shuffle_ = false;
+            is_loop_ = false;
+        }
     }
 
     motion_controller_->clear_emergency_stop();
@@ -401,13 +397,13 @@ esp_err_t SandTablePlayer::emergencyStop() {
 esp_err_t SandTablePlayer::skip() {
     if (!initialized_) return ESP_ERR_INVALID_STATE;
 
-    if (xSemaphoreTake(state_mutex_, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    raii::MutexGuard guard(state_mutex_, pdMS_TO_TICKS(1000));
+    if (!guard) {
         return ESP_ERR_TIMEOUT;
     }
 
     // Only works in playlist mode
     if (play_mode_ == PlayMode::SINGLE_PATTERN || playlist_patterns_.empty()) {
-        xSemaphoreGive(state_mutex_);
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -416,8 +412,6 @@ esp_err_t SandTablePlayer::skip() {
 
     // Advance to next
     advanceToNextPattern();
-
-    xSemaphoreGive(state_mutex_);
 
     ESP_LOGI(TAG, "Skipped to next pattern");
     return ESP_OK;
@@ -441,7 +435,8 @@ double SandTablePlayer::getFeedRate() {
 esp_err_t SandTablePlayer::setShuffle(bool shuffle) {
     if (!initialized_) return ESP_ERR_INVALID_STATE;
 
-    if (xSemaphoreTake(state_mutex_, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    raii::MutexGuard guard(state_mutex_, pdMS_TO_TICKS(1000));
+    if (!guard) {
         return ESP_ERR_TIMEOUT;
     }
 
@@ -451,7 +446,7 @@ esp_err_t SandTablePlayer::setShuffle(bool shuffle) {
             (is_shuffle_ ? PlayMode::PLAYLIST_SHUFFLE : PlayMode::PLAYLIST);
     }
 
-    xSemaphoreGive(state_mutex_);
+    guard.release();
     ESP_LOGI(TAG, "Set shuffle: %d", (int)shuffle);
     return ESP_OK;
 }
@@ -463,7 +458,8 @@ bool SandTablePlayer::isShuffle() {
 esp_err_t SandTablePlayer::setLoop(bool loop) {
     if (!initialized_) return ESP_ERR_INVALID_STATE;
 
-    if (xSemaphoreTake(state_mutex_, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    raii::MutexGuard guard(state_mutex_, pdMS_TO_TICKS(1000));
+    if (!guard) {
         return ESP_ERR_TIMEOUT;
     }
 
@@ -473,7 +469,7 @@ esp_err_t SandTablePlayer::setLoop(bool loop) {
             (is_shuffle_ ? PlayMode::PLAYLIST_SHUFFLE : PlayMode::PLAYLIST);
     }
 
-    xSemaphoreGive(state_mutex_);
+    guard.release();
     ESP_LOGI(TAG, "Set loop: %d", (int)loop);
     return ESP_OK;
 }
@@ -648,7 +644,8 @@ void SandTablePlayer::serviceTask() {
 // =============================================================================
 
 esp_err_t SandTablePlayer::loadPatternFile(const char* pattern_uuid) {
-    if (xSemaphoreTake(file_mutex_, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    raii::MutexGuard guard(file_mutex_, pdMS_TO_TICKS(1000));
+    if (!guard) {
         ESP_LOGE(TAG, "Failed to acquire file mutex");
         return ESP_ERR_TIMEOUT;
     }
@@ -674,7 +671,6 @@ esp_err_t SandTablePlayer::loadPatternFile(const char* pattern_uuid) {
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to open pattern: %s (err=%s)", pattern_uuid, esp_err_to_name(ret));
         pattern_reader_.reset();
-        xSemaphoreGive(file_mutex_);
         return ret;  // Propagates ESP_ERR_NOT_ALLOWED for license issues
     }
 
@@ -685,12 +681,12 @@ esp_err_t SandTablePlayer::loadPatternFile(const char* pattern_uuid) {
     ESP_LOGI(TAG, "Loaded pattern: %s (%zu points, encrypted=%d)",
         pattern_uuid, total_lines_, is_encrypted);
 
-    xSemaphoreGive(file_mutex_);
     return ESP_OK;
 }
 
 void SandTablePlayer::unloadPatternFile() {
-    if (xSemaphoreTake(file_mutex_, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    raii::MutexGuard guard(file_mutex_, pdMS_TO_TICKS(1000));
+    if (!guard) {
         ESP_LOGE(TAG, "Failed to acquire file mutex");
         return;
     }
@@ -702,21 +698,21 @@ void SandTablePlayer::unloadPatternFile() {
     current_line_index_ = 0;
     total_lines_ = 0;
     file_loaded_ = false;
-
-    xSemaphoreGive(file_mutex_);
 }
 
 PatternLine SandTablePlayer::peekNextLine() {
     if (!file_loaded_ || !pattern_reader_) return PatternLine();
 
-    if (xSemaphoreTake(file_mutex_, pdMS_TO_TICKS(1000)) != pdTRUE) {
-        ESP_LOGE(TAG, "Failed to acquire file mutex");
-        return PatternLine();
+    PatternPoint point;
+    {
+        raii::MutexGuard guard(file_mutex_, pdMS_TO_TICKS(1000));
+        if (!guard) {
+            ESP_LOGE(TAG, "Failed to acquire file mutex");
+            return PatternLine();
+        }
+
+        point = pattern_reader_->peekNext();
     }
-
-    PatternPoint point = pattern_reader_->peekNext();
-
-    xSemaphoreGive(file_mutex_);
 
     if (!point.valid) {
         return PatternLine();

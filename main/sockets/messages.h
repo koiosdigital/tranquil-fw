@@ -3,14 +3,10 @@
 
 #include <stdint.h>
 #include <stddef.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/queue.h>
 #include <kd/v1/tranquil.pb-c.h>
 
-// Initialize message system with outbox queue
-void cloud_msg_init(QueueHandle_t outbox);
-
-// Queue a protobuf message for sending
+// Queue a protobuf message for sending (via cloudlink's outbox; the data is
+// copied, and queued messages survive a reconnect).
 bool cloud_msg_queue_raw(const uint8_t* data, size_t len);
 bool cloud_msg_queue(const Kd__V1__TranquilMessage* message);
 

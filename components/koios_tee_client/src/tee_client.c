@@ -37,10 +37,10 @@ static int32_t __attribute__((noinline, section(".iram1"))) tee_invoke(void)
      * Inline assembly to:
      * 1. Get address of return label
      * 2. Store it in api->return_addr
-     * 3. Jump to TEE entry stub
+     * 3. Jump to TEE entry (tee_entry at 0x600FE300)
      * 4. Return label: read result
      *
-     * The entry stub is at TEE_ENTRY_STUB (0x600FE100).
+     * WCL monitors TEE_HANDLERS_ADDR (0x600FE300) where tee_entry() lives.
      * When CPU executes this address, WCL switches to World 0.
      * After handler completes, WCL switches back to World 1
      * and execution continues at the return label.
@@ -56,14 +56,14 @@ static int32_t __attribute__((noinline, section(".iram1"))) tee_invoke(void)
         "s32i   a2, %[api], 28\n"           /* api->return_addr offset */
         "memw\n"
 
-        /* Build TEE entry address (0x600FE100) without literal pool */
+        /* Build TEE entry address (0x600FE300) without literal pool */
         "movi   a2, 0x600\n"
         "slli   a2, a2, 20\n"               /* a2 = 0x60000000 */
         "movi   a3, 0xFE\n"
         "slli   a3, a3, 12\n"               /* a3 = 0x000FE000 */
         "or     a2, a2, a3\n"               /* a2 = 0x600FE000 */
-        "movi   a3, 0x100\n"
-        "or     a2, a2, a3\n"               /* a2 = 0x600FE100 */
+        "movi   a3, 0x300\n"
+        "or     a2, a2, a3\n"               /* a2 = 0x600FE300 */
 
         /* Jump to TEE entry - WCL will switch to W0 */
         "jx     a2\n"
