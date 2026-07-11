@@ -80,13 +80,16 @@ namespace sand_table {
         // =========================================================================
 
         /// Move to a polar position using direct polar motion (arcs in XY space)
-        /// @param target Target position (theta in radians 0-2π, rho normalized 0-1)
-        /// @param feedrate Speed in RPM
+        /// @param target Target position (theta in radians, unbounded for
+        ///        continuous rotation; rho normalized 0-1)
+        /// @param feedrate Constant path speed in normalized table units per
+        ///        minute (1.0 = table radius). NOT motor RPM — angular speed
+        ///        varies with radius so the ball's surface speed is uniform.
         [[nodiscard]] Result<void> move_to(const PolarPosition& target, float feedrate = 0);
 
         /// Move to a polar position using Cartesian interpolation (straight lines in XY space)
         /// @param target Target position (theta in radians 0-2π, rho normalized 0-1)
-        /// @param feedrate Speed in RPM
+        /// @param feedrate Constant path speed, same units as move_to()
         [[nodiscard]] Result<void> move_linear(const PolarPosition& target, float feedrate = 0);
 
         // =========================================================================
@@ -98,6 +101,14 @@ namespace sand_table {
 
         /// Resume paused motion
         void resume();
+
+        /// Normal stop: abort the in-flight segment, discard everything
+        /// queued (segment queue + velocity planner), and resync the
+        /// planner position from the physical motor position. Blocks until
+        /// the stepper task acknowledges the drain (bounded wait).
+        /// Use this for user-initiated stops; emergency_stop() is for
+        /// safety stops and leaves the controller in the EStop state.
+        void halt_and_drain();
 
         /// Emergency stop - immediately halt all motion
         void emergency_stop();
@@ -142,6 +153,7 @@ namespace sand_table {
             uint32_t current_segment_steps_total;  // Steps in current segment
             uint32_t current_segment_steps_done;   // Steps done in current segment
             size_t segments_queued;      // Segments in execution queue
+            size_t planner_pending;      // Segments still in the velocity planner
             bool is_executing;           // Whether a segment is currently executing
 
             /// Get progress as a fraction (0.0 to 1.0)
@@ -192,6 +204,21 @@ namespace sand_table {
         std::atomic<bool> emergency_stop_{ false };
         std::atomic<bool> paused_{ false };
         std::atomic<bool> running_{ false };
+
+        // halt_and_drain() handshake: the stepper task owns the segment
+        // queue's consumer side, so it performs the actual drain and clears
+        // this flag as the acknowledgement.
+        std::atomic<bool> drain_requested_{ false };
+        // While set, enqueue_segment() refuses new segments (returns false)
+        // so a task blocked mid-plan unwinds instead of refilling the
+        // planner that is being drained.
+        std::atomic<bool> abort_planning_{ false };
+
+        // Guards velocity_planner_: it is mutated from the planning task
+        // (enqueue_segment via move_to) AND the stepper task
+        // (transfer_ready_segments / drain / e-stop clear) — its internals
+        // are not atomic. mutable: locked in const progress getters.
+        mutable SemaphoreHandle_t planner_mutex_ = nullptr;
 
         // Progress tracking
         std::atomic<uint64_t> total_steps_queued_{ 0 };

@@ -63,19 +63,16 @@ HandleResult PlaylistHandler::handlePlaylistsRequest(ResponseMessage& response) 
 
     ESP_LOGI(TAG, "PlaylistsRequest: returning %zu playlists", playlists.size());
 
-    // Build response - use static storage for protobuf data
-    static Kd__V1__Playlists playlists_msg = KD__V1__PLAYLISTS__INIT;
-    static std::vector<Kd__V1__PlaylistInfo*> playlist_ptrs;
-    static std::vector<Kd__V1__PlaylistInfo> playlist_infos;
-    static std::vector<std::vector<char*>> pattern_uuid_ptrs;
-    static std::vector<std::vector<std::string>> pattern_uuid_strs;  // Storage for converted UUIDs
-    static std::vector<std::string> featured_pattern_strs;  // Storage for featured pattern UUIDs
+    // Build response. Locals, not statics: httpd and the cloudlink task can
+    // run this concurrently; two tasks resizing the same static vectors
+    // double-free their backing stores.
+    Kd__V1__Playlists playlists_msg = KD__V1__PLAYLISTS__INIT;
+    std::vector<Kd__V1__PlaylistInfo*> playlist_ptrs;
+    std::vector<Kd__V1__PlaylistInfo> playlist_infos;
+    std::vector<std::vector<char*>> pattern_uuid_ptrs;
+    std::vector<std::vector<std::string>> pattern_uuid_strs;  // Storage for converted UUIDs
+    std::vector<std::string> featured_pattern_strs;  // Storage for featured pattern UUIDs
 
-    playlist_ptrs.clear();
-    playlist_infos.clear();
-    pattern_uuid_ptrs.clear();
-    pattern_uuid_strs.clear();
-    featured_pattern_strs.clear();
     playlist_infos.resize(playlists.size());
     pattern_uuid_ptrs.resize(playlists.size());
     pattern_uuid_strs.resize(playlists.size());

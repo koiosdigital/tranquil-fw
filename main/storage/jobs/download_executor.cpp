@@ -1,12 +1,14 @@
 #include "download_executor.h"
 #include "job_queue.h"
 #include "ManifestDatabase.h"
+#include "PatternReader.h"
+#include "EncryptedPatternReader.h"
 #include "drm/drm_license.h"
 #include "drm/drm_purchase.h"
 
 #include <esp_log.h>
-#include <esp_http_client.h>
-#include <esp_crt_bundle.h>
+#include <esp_timer.h>
+#include <kd_http.h>
 #include <mbedtls/base64.h>
 
 #include <cstdio>
@@ -15,8 +17,12 @@
 
 static const char* TAG = "DownloadExecutor";
 
-static constexpr size_t HTTP_BUFFER_SIZE = 4096;
 static constexpr const char* PATTERNS_PATH = "/sd/patterns";
+
+// How long to wait for the shared kd_http client if another user (OTA
+// check, TZ fetch, a concurrent download job) currently holds it. Failed
+// jobs are retried by the processor, so giving up here is not fatal.
+static constexpr int HTTP_LOCK_TIMEOUT_MS = 30000;
 
 namespace jobs {
 
@@ -65,51 +71,6 @@ private:
     FILE* file_ = nullptr;
 };
 
-class HttpClient {
-public:
-    HttpClient() = default;
-    explicit HttpClient(const esp_http_client_config_t* config) {
-        client_ = esp_http_client_init(config);
-    }
-    ~HttpClient() { cleanup(); }
-
-    HttpClient(HttpClient&& other) noexcept : client_(other.client_) {
-        other.client_ = nullptr;
-    }
-    HttpClient& operator=(HttpClient&& other) noexcept {
-        if (this != &other) {
-            cleanup();
-            client_ = other.client_;
-            other.client_ = nullptr;
-        }
-        return *this;
-    }
-
-    HttpClient(const HttpClient&) = delete;
-    HttpClient& operator=(const HttpClient&) = delete;
-
-    bool isValid() const { return client_ != nullptr; }
-    esp_http_client_handle_t get() const { return client_; }
-
-    void cleanup() {
-        if (client_) {
-            esp_http_client_cleanup(client_);
-            client_ = nullptr;
-        }
-    }
-
-    esp_err_t perform() {
-        return client_ ? esp_http_client_perform(client_) : ESP_ERR_INVALID_STATE;
-    }
-
-    int getStatusCode() const {
-        return client_ ? esp_http_client_get_status_code(client_) : -1;
-    }
-
-private:
-    esp_http_client_handle_t client_ = nullptr;
-};
-
 //------------------------------------------------------------------------------
 // Implementation
 //------------------------------------------------------------------------------
@@ -127,10 +88,10 @@ JobResult DownloadExecutor::execute(const Job& job) {
 
 JobResult DownloadExecutor::performDownload(const std::string& pattern_uuid,
                                              const DownloadJobData& data) {
-    ESP_LOGD(TAG, "Starting download: %s", pattern_uuid.c_str());
-    ESP_LOGD(TAG, "  URL: %s", data.download_url.c_str());
-    ESP_LOGD(TAG, "  Encrypted: %s", data.encrypted ? "yes" : "no");
-    ESP_LOGD(TAG, "  Purchased: %s", data.hasPurchaseReceipt() ? "yes" : "no");
+    ESP_LOGI(TAG, "Starting download: %s (encrypted=%d, purchased=%d, expected=%lld bytes)",
+        pattern_uuid.c_str(), data.encrypted, data.hasPurchaseReceipt(),
+        (long long)data.size_bytes);
+    ESP_LOGI(TAG, "  URL: %s", data.download_url.c_str());
 
     // For subscription patterns (no receipt), check license validity and limits
     // For purchased patterns (has receipt), we can download without a valid subscription
@@ -144,15 +105,13 @@ JobResult DownloadExecutor::performDownload(const std::string& pattern_uuid,
         }
     }
 
-    // Determine output file path
+    // Download to a neutral temp path first. The final location and the
+    // processing pipeline are decided by sniffing the file's magic bytes —
+    // the server's encrypted flag has been observed wrong (KDEP payloads
+    // announced as unencrypted), and the content is authoritative.
     char file_path[256];
-    if (data.encrypted) {
-        snprintf(file_path, sizeof(file_path), "%s/%s.dat",
-                 PATTERNS_PATH, pattern_uuid.c_str());
-    } else {
-        snprintf(file_path, sizeof(file_path), "%s/%s.thr",
-                 PATTERNS_PATH, pattern_uuid.c_str());
-    }
+    snprintf(file_path, sizeof(file_path), "%s/%s.tmp",
+             PATTERNS_PATH, pattern_uuid.c_str());
 
     // Open output file
     FileHandle file(file_path, "wb");
@@ -165,6 +124,7 @@ JobResult DownloadExecutor::performDownload(const std::string& pattern_uuid,
     struct DownloadContext {
         FileHandle* file;
         size_t bytes_written = 0;
+        size_t next_progress_log = 0;
         esp_err_t error = ESP_OK;
     };
 
@@ -176,6 +136,9 @@ JobResult DownloadExecutor::performDownload(const std::string& pattern_uuid,
         if (!ctx || !ctx->file) return ESP_FAIL;
 
         switch (evt->event_id) {
+            case HTTP_EVENT_ON_CONNECTED:
+                ESP_LOGI(TAG, "HTTP connected");
+                break;
             case HTTP_EVENT_ON_DATA:
                 if (evt->data && evt->data_len > 0) {
                     size_t written = ctx->file->write(evt->data, evt->data_len);
@@ -185,7 +148,17 @@ JobResult DownloadExecutor::performDownload(const std::string& pattern_uuid,
                         return ESP_FAIL;
                     }
                     ctx->bytes_written += written;
+                    if (ctx->bytes_written >= ctx->next_progress_log) {
+                        ESP_LOGI(TAG, "  received %zu bytes", ctx->bytes_written);
+                        ctx->next_progress_log = ctx->bytes_written + 65536;
+                    }
                 }
+                break;
+            case HTTP_EVENT_ERROR:
+                ESP_LOGW(TAG, "HTTP transport error event");
+                break;
+            case HTTP_EVENT_DISCONNECTED:
+                ESP_LOGI(TAG, "HTTP disconnected (%zu bytes received)", ctx->bytes_written);
                 break;
             default:
                 break;
@@ -193,23 +166,39 @@ JobResult DownloadExecutor::performDownload(const std::string& pattern_uuid,
         return ESP_OK;
     };
 
-    esp_http_client_config_t config = {};
-    config.url = data.download_url.c_str();
-    config.event_handler = event_handler;
-    config.user_data = &ctx;
-    config.crt_bundle_attach = esp_crt_bundle_attach;
-    config.buffer_size = HTTP_BUFFER_SIZE;
-    config.timeout_ms = 30000;
-
-    HttpClient client(&config);
-    if (!client.isValid()) {
+    // Use the app-wide shared HTTP client: serializes TLS with the other
+    // HTTP users (OTA check, TZ fetch) and reuses the kept-alive connection
+    // across back-to-back downloads from the same host.
+    int64_t t_acquire = esp_timer_get_time();
+    esp_http_client_handle_t client = kd_http_acquire(
+        data.download_url.c_str(), event_handler, &ctx, HTTP_LOCK_TIMEOUT_MS);
+    if (client == nullptr) {
+        ESP_LOGE(TAG, "kd_http busy for %dms, giving up (job will retry)",
+            HTTP_LOCK_TIMEOUT_MS);
         file.close();
         remove(file_path);
-        return JobResult::fail("Failed to init HTTP client");
+        return JobResult::fail("HTTP client busy");
+    }
+
+    int64_t t_start = esp_timer_get_time();
+    if (t_start - t_acquire > 100000) {
+        ESP_LOGI(TAG, "Waited %lldms for shared HTTP client",
+            (long long)((t_start - t_acquire) / 1000));
     }
 
     // Perform download
-    esp_err_t err = client.perform();
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    int64_t elapsed_ms = (esp_timer_get_time() - t_start) / 1000;
+    ESP_LOGI(TAG, "HTTP perform: err=%s status=%d bytes=%zu elapsed=%lldms",
+        esp_err_to_name(err), status, ctx.bytes_written, (long long)elapsed_ms);
+    if (err != ESP_OK) {
+        // Transport-level failure: drop the possibly-poisoned connection
+        // so the next acquire starts clean.
+        kd_http_invalidate();
+    }
+    kd_http_release();
+
     if (err != ESP_OK || ctx.error != ESP_OK) {
         ESP_LOGE(TAG, "HTTP request failed: %s", esp_err_to_name(err));
         file.close();
@@ -217,16 +206,69 @@ JobResult DownloadExecutor::performDownload(const std::string& pattern_uuid,
         return JobResult::fail("Download failed: " + std::string(esp_err_to_name(err)));
     }
 
-    int status = client.getStatusCode();
     if (status != 200) {
         ESP_LOGE(TAG, "HTTP status: %d", status);
         file.close();
         remove(file_path);
+        // Auth/not-found responses never resolve on retry — fail permanently
+        if (status == 401 || status == 403 || status == 404) {
+            return JobResult::fail_permanent("HTTP error: " + std::to_string(status));
+        }
         return JobResult::fail("HTTP error: " + std::to_string(status));
     }
 
     file.close();
-    ESP_LOGD(TAG, "Downloaded %zu bytes", ctx.bytes_written);
+
+    // Validate against the server-announced size: a short body means the
+    // transfer was truncated mid-stream (retryable).
+    if (data.size_bytes > 0 &&
+        ctx.bytes_written != static_cast<size_t>(data.size_bytes)) {
+        ESP_LOGE(TAG, "Size mismatch: got %zu bytes, expected %lld",
+            ctx.bytes_written, (long long)data.size_bytes);
+        remove(file_path);
+        return JobResult::fail("Download size mismatch");
+    }
+
+    ESP_LOGI(TAG, "Downloaded %zu bytes -> %s", ctx.bytes_written, file_path);
+
+    // Sniff the actual format from the file's magic bytes.
+    enum class PatternFormat { Kdep, Thrb, Text };
+    PatternFormat format = PatternFormat::Text;
+    {
+        FileHandle sniff(file_path, "rb");
+        uint32_t magic = 0;
+        if (!sniff.isOpen() ||
+            fread(&magic, 1, sizeof(magic), sniff.get()) != sizeof(magic)) {
+            ESP_LOGE(TAG, "Downloaded file unreadable: %s", file_path);
+            remove(file_path);
+            return JobResult::fail("Downloaded file unreadable");
+        }
+        if (magic == ENCRYPTED_PATTERN_MAGIC) {
+            format = PatternFormat::Kdep;
+        } else if (magic == BINARY_PATTERN_MAGIC) {
+            format = PatternFormat::Thrb;
+        }
+    }
+
+    const bool is_encrypted = (format == PatternFormat::Kdep);
+    if (is_encrypted != data.encrypted) {
+        ESP_LOGW(TAG, "Server metadata said encrypted=%d but content is %s — trusting content",
+            data.encrypted,
+            format == PatternFormat::Kdep ? "KDEP" :
+            format == PatternFormat::Thrb ? "THRB" : "text");
+    }
+
+    // Move to the final location: binary formats (KDEP/THRB) live at
+    // <uuid>.dat; raw .thr text keeps a .thr name as conversion input.
+    char final_path[256];
+    snprintf(final_path, sizeof(final_path), "%s/%s.%s",
+             PATTERNS_PATH, pattern_uuid.c_str(),
+             format == PatternFormat::Text ? "thr" : "dat");
+    if (rename(file_path, final_path) != 0) {
+        ESP_LOGE(TAG, "Failed to move %s -> %s", file_path, final_path);
+        remove(file_path);
+        return JobResult::fail("Failed to finalize downloaded file");
+    }
 
     // Build pattern info for database
     Pattern pattern_info;
@@ -234,7 +276,7 @@ JobResult DownloadExecutor::performDownload(const std::string& pattern_uuid,
     pattern_info.external_uuid = pattern_uuid;  // Server UUID for linking
     pattern_info.name = data.pattern_name;
     pattern_info.creator = data.pattern_creator;
-    pattern_info.encrypted = data.encrypted;
+    pattern_info.encrypted = is_encrypted;
     pattern_info.size_bytes = data.size_bytes;
     pattern_info.reversible = data.reversible;
     pattern_info.start_point = data.start_point;
@@ -253,7 +295,7 @@ JobResult DownloadExecutor::performDownload(const std::string& pattern_uuid,
             reinterpret_cast<const unsigned char*>(data.receipt_payload_b64.c_str()),
             data.receipt_payload_b64.size()) != 0) {
             ESP_LOGE(TAG, "Failed to decode receipt payload");
-            remove(file_path);
+            remove(final_path);
             return JobResult::fail("Failed to decode receipt payload");
         }
 
@@ -268,7 +310,7 @@ JobResult DownloadExecutor::performDownload(const std::string& pattern_uuid,
             reinterpret_cast<const unsigned char*>(data.receipt_signature_b64.c_str()),
             data.receipt_signature_b64.size()) != 0) {
             ESP_LOGE(TAG, "Failed to decode receipt signature");
-            remove(file_path);
+            remove(final_path);
             return JobResult::fail("Failed to decode receipt signature");
         }
 
@@ -292,10 +334,23 @@ JobResult DownloadExecutor::performDownload(const std::string& pattern_uuid,
         }
     }
 
-    // Add pattern to manifest database
-    if (ManifestDatabase::instance().addPattern(pattern_info) != ESP_OK) {
+    // Add pattern to manifest database. A row may already exist for this
+    // UUID (e.g. a reboot after addPattern but before markCompleted re-ran
+    // the job) — reuse/update it instead of inserting a duplicate.
+    auto existing = ManifestDatabase::instance().getPatternByExternalUuid(pattern_uuid);
+    if (existing) {
+        ESP_LOGW(TAG, "Pattern %s already in manifest (id=%u), updating instead of duplicating",
+            pattern_uuid.c_str(), existing->id);
+        pattern_info.id = existing->id;
+        if (ManifestDatabase::instance().updatePattern(existing->id, pattern_info) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to update existing pattern in manifest");
+            remove(final_path);
+            return JobResult::fail("Failed to update manifest");
+        }
+    }
+    else if (ManifestDatabase::instance().addPattern(pattern_info) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to add pattern to manifest");
-        remove(file_path);
+        remove(final_path);
         return JobResult::fail("Failed to add to manifest");
     }
 
@@ -303,17 +358,31 @@ JobResult DownloadExecutor::performDownload(const std::string& pattern_uuid,
     auto created_pattern = ManifestDatabase::instance().getPatternByExternalUuid(pattern_uuid);
     if (!created_pattern) {
         ESP_LOGE(TAG, "Failed to find newly created pattern");
-        remove(file_path);
+        remove(final_path);
         return JobResult::fail("Failed to find created pattern");
     }
 
-    // Enqueue thumbnail generation job using internal ID
-    ThumbnailJobData thumb_data;
-    thumb_data.encrypted = data.encrypted;
-    thumb_data.output_path = "/sd/previews/" + pattern_uuid + ".png";
-    JobQueue::instance().enqueueThumbnail(created_pattern->id, thumb_data, -1);
-
-    ESP_LOGD(TAG, "Download complete: %s -> %s", pattern_uuid.c_str(), file_path);
+    if (format == PatternFormat::Text) {
+        // Raw .thr text: the player and thumbnail renderer both read THRB
+        // binary from <uuid>.dat, so convert first — the conversion job
+        // chains the thumbnail itself and deletes the .thr input on success.
+        ConversionJobData conv_data;
+        conv_data.temp_path = final_path;
+        conv_data.name = data.pattern_name;
+        conv_data.encrypted = false;
+        JobQueue::instance().enqueueConversion(created_pattern->id, conv_data, -1);
+        ESP_LOGI(TAG, "Download complete: %s (pattern id=%u, conversion queued)",
+            pattern_uuid.c_str(), created_pattern->id);
+    } else {
+        // Already in final binary form (KDEP or THRB) — thumbnail directly.
+        ThumbnailJobData thumb_data;
+        thumb_data.encrypted = is_encrypted;
+        thumb_data.output_path = "/sd/previews/" + pattern_uuid + ".png";
+        JobQueue::instance().enqueueThumbnail(created_pattern->id, thumb_data, -1);
+        ESP_LOGI(TAG, "Download complete: %s (pattern id=%u, %s, thumbnail queued)",
+            pattern_uuid.c_str(), created_pattern->id,
+            is_encrypted ? "KDEP" : "THRB");
+    }
     return JobResult::ok();
 }
 

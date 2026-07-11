@@ -284,9 +284,23 @@ void cloud_handle_message(Kd__V1__TranquilMessage* message) {
 
     esp_err_t ret = MessageDispatcher::instance().dispatch(message, ctx, &response, &result);
 
+    // Route the handler's response ourselves: the (msg, ctx, out, out)
+    // dispatch overload only fills the out-params — unlike the raw-bytes
+    // overload it does NOT invoke ResponseRouter, so without this the cloud
+    // never receives command results (and local clients miss broadcasts of
+    // cloud-triggered state changes).
+    if (result.has_response) {
+        if (response.valid()) {
+            ResponseRouter::instance().route(response, ctx, result);
+        }
+        else {
+            ESP_LOGE(TAG, "Cloud handler for type %d produced no payload (response too large?)",
+                message->message_case);
+        }
+    }
+
     if (ret == ESP_OK && result.handled) {
         ESP_LOGD(TAG, "Cloud message %d handled by dispatcher", message->message_case);
-        // Response routing is handled by the dispatcher
         return;
     }
 

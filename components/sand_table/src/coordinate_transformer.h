@@ -17,6 +17,13 @@ namespace sand_table {
         void set_calibration(int32_t steps_per_theta_rot, int32_t rho_max_steps) noexcept {
             steps_per_theta_rot_ = steps_per_theta_rot;
             rho_max_steps_ = rho_max_steps;
+            // Snapshot the runtime-configurable gear ratio here rather than
+            // baking in the compile-time default — a user-configured ratio
+            // otherwise silently diverges from the coupling math.
+            gear_ratio_ = MechanicalConfig::theta_gear_ratio();
+            if (gear_ratio_ <= 0.0) {
+                gear_ratio_ = MechanicalConfig::THETA_GEAR_RATIO;
+            }
         }
 
         /// Check if calibration values are set
@@ -51,7 +58,7 @@ namespace sand_table {
             double rho_base_exact = delta_rho_norm * static_cast<double>(rho_max_steps_);
 
             // Coupling compensation: counteract mechanical rho movement from theta rotation
-            double rho_counteract = static_cast<double>(theta_motor_steps) / kGearRatio;
+            double rho_counteract = static_cast<double>(theta_motor_steps) / gear_ratio_;
 
             // Add to rho accumulator (base movement + coupling counteraction)
             rho_fractional_accumulator_ += rho_base_exact + rho_counteract;
@@ -73,7 +80,7 @@ namespace sand_table {
             theta = normalize_angle(theta);
 
             // Account for coupling when calculating displayed rho
-            double rho_counteract_steps = static_cast<double>(theta_steps) / kGearRatio;
+            double rho_counteract_steps = static_cast<double>(theta_steps) / gear_ratio_;
             double effective_rho_steps = static_cast<double>(rho_steps) - rho_counteract_steps;
             double rho = effective_rho_steps / static_cast<double>(rho_max_steps_);
 
@@ -112,7 +119,8 @@ namespace sand_table {
         double theta_fractional_accumulator_ = 0.0;
         double rho_fractional_accumulator_ = 0.0;
 
-        static constexpr double kGearRatio = MechanicalConfig::THETA_GEAR_RATIO;
+        // Refreshed from runtime config in set_calibration()
+        double gear_ratio_ = MechanicalConfig::THETA_GEAR_RATIO;
     };
 
 } // namespace sand_table

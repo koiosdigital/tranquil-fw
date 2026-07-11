@@ -66,12 +66,6 @@ esp_err_t drm_remove_oaep_sha256(const uint8_t* decrypted, size_t decrypted_len,
         return ESP_ERR_INVALID_ARG;
     }
 
-    // Check leading byte
-    if (decrypted[0] != 0x00) {
-        ESP_LOGE(TAG, "OAEP: Invalid leading byte 0x%02x", decrypted[0]);
-        return ESP_ERR_INVALID_ARG;
-    }
-
     constexpr size_t hash_len = DRM_SHA256_BYTES;  // 32 for SHA-256
     const size_t db_len = decrypted_len - 1 - hash_len;  // 479 for RSA-4096
 
@@ -85,7 +79,14 @@ esp_err_t drm_remove_oaep_sha256(const uint8_t* decrypted, size_t decrypted_len,
     uint8_t db_mask[MAX_DB_LEN] = { 0 };
     uint8_t db[MAX_DB_LEN] = { 0 };
 
-    esp_err_t ret = ESP_OK;
+    // Best-effort constant-time unpadding (padding-oracle hardening): every
+    // check accumulates into a single flag inspected once at the end, all
+    // steps always run, and the failure log never reveals which check
+    // failed or any padding byte values/positions.
+    uint32_t bad = 0;
+
+    // Leading byte must be 0x00
+    bad |= (decrypted[0] != 0x00);
 
     // Step 1: seedMask = MGF1(maskedDB, hash_len)
     drm_mgf1_sha256(masked_db, db_len, seed_mask, hash_len);
@@ -103,54 +104,58 @@ esp_err_t drm_remove_oaep_sha256(const uint8_t* decrypted, size_t decrypted_len,
         db[i] = masked_db[i] ^ db_mask[i];
     }
 
-    // Step 5: Verify lHash = SHA256("")
+    // Step 5: Verify lHash = SHA256("") without early exit
     // DB structure: lHash (32) || PS (0x00 bytes) || 0x01 || M
-    if (memcmp(db, OAEP_LHASH_SHA256, hash_len) != 0) {
-        ESP_LOGE(TAG, "OAEP: lHash mismatch");
-        ret = ESP_ERR_INVALID_ARG;
-        goto cleanup;
-    }
-
-    // Step 6: Find 0x01 separator after padding zeros
     {
-        int msg_start = -1;
-        for (size_t i = hash_len; i < db_len; i++) {
-            if (db[i] == 0x01) {
-                msg_start = i + 1;
-                break;
-            }
-            else if (db[i] != 0x00) {
-                ESP_LOGE(TAG, "OAEP: Invalid padding byte 0x%02x at position %zu", db[i], i);
-                ret = ESP_ERR_INVALID_ARG;
-                goto cleanup;
-            }
+        uint8_t diff = 0;
+        for (size_t i = 0; i < hash_len; i++) {
+            diff |= db[i] ^ OAEP_LHASH_SHA256[i];
         }
-
-        if (msg_start < 0) {
-            ESP_LOGE(TAG, "OAEP: No 0x01 separator found");
-            ret = ESP_ERR_INVALID_ARG;
-            goto cleanup;
-        }
-
-        size_t msg_len = db_len - msg_start;
-
-        if (*output_len < msg_len) {
-            ESP_LOGE(TAG, "OAEP: Output buffer too small (%zu < %zu)", *output_len, msg_len);
-            ret = ESP_ERR_INVALID_SIZE;
-            goto cleanup;
-        }
-
-        memcpy(output, &db[msg_start], msg_len);
-        *output_len = msg_len;
+        bad |= (diff != 0);
     }
 
-cleanup:
+    // Step 6: Scan the full DB for the 0x01 separator after the zero
+    // padding, without early exit
+    size_t msg_start = 0;
+    {
+        uint32_t in_padding = 1;  // still scanning PS
+        uint32_t found = 0;       // separator located
+        for (size_t i = hash_len; i < db_len; i++) {
+            const uint32_t is_one = (db[i] == 0x01);
+            const uint32_t is_zero = (db[i] == 0x00);
+            if (in_padding && is_one) {
+                found = 1;
+                msg_start = i + 1;
+                in_padding = 0;
+            }
+            bad |= (in_padding & ~is_zero & 1);
+        }
+        bad |= (found == 0);
+    }
+
+    // Copy out the message only if everything above passed
+    if (!bad) {
+        size_t msg_len = db_len - msg_start;
+        if (*output_len < msg_len) {
+            bad = 1;
+        }
+        else {
+            memcpy(output, &db[msg_start], msg_len);
+            *output_len = msg_len;
+        }
+    }
+
     mbedtls_platform_zeroize(seed_mask, hash_len);
     mbedtls_platform_zeroize(seed, hash_len);
     mbedtls_platform_zeroize(db_mask, db_len);
     mbedtls_platform_zeroize(db, db_len);
 
-    return ret;
+    if (bad) {
+        ESP_LOGE(TAG, "OAEP unpad failed");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    return ESP_OK;
 }
 
 esp_err_t drm_rsa_decrypt(const uint8_t* ciphertext, uint8_t* plaintext) {

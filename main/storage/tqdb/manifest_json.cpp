@@ -75,13 +75,20 @@ cJSON* ManifestDatabase::playlistToJson(const Playlist& pl) {
 
     // Convert pattern_ids to external UUIDs for API
     cJSON* patterns = cJSON_CreateArray();
-    for (uint32_t pid : pl.pattern_ids) {
-        Pattern p;
-        if (tqdb_get(impl->db, "Pattern", pid, &p) == TQDB_OK) {
-            cJSON_AddItemToArray(patterns, cJSON_CreateString(p.external_uuid.c_str()));
+    if (patterns) {
+        for (uint32_t pid : pl.pattern_ids) {
+            Pattern p;
+            if (tqdb_get(impl->db, "Pattern", pid, &p) == TQDB_OK) {
+                cJSON* entry = cJSON_CreateString(p.external_uuid.c_str());
+                // cJSON_AddItemToArray does NOT free the item on failure —
+                // an unchecked add leaks the node under OOM.
+                if (entry && !cJSON_AddItemToArray(patterns, entry)) {
+                    cJSON_Delete(entry);
+                }
+            }
         }
+        cJSON_AddItemToObject(json, "patterns", patterns);
     }
-    cJSON_AddItemToObject(json, "patterns", patterns);
 
     return json;
 }

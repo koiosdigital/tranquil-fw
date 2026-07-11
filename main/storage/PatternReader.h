@@ -119,6 +119,10 @@ private:
     UnencryptedPatternHeader header_;
     size_t current_point_ = 0;
 
+    // Terminal read failure (truncated/corrupt file): once set, hasMore()
+    // returns false so playback ends cleanly instead of spinning.
+    bool read_failed_ = false;
+
     // Peek support
     bool has_peeked_ = false;
     PatternPoint peeked_point_;

@@ -2,6 +2,7 @@
 #include "config_manager.h"
 #include "stepper_driver.h"
 #include "esp_log.h"
+#include <cmath>
 #include <ctime>
 
 namespace sand_table {
@@ -170,16 +171,24 @@ namespace sand_table {
             return result;
         }
 
-        // Clear stall flag and set direction outward
-        rho_stall_triggered_ = false;
+        // Set direction outward; keep both sensor ISRs off for the blanking
+        // move below
         rho_.set_direction(true);
-
-        // Only enable stallguard ISR for this phase
         disable_hall_isr();
-        enable_diag_isr();
+        disable_diag_isr();
 
-        // Record starting position
+        // Record starting position (before blanking so it counts as travel)
         int32_t rho_before = rho_.position();
+
+        // Blanking: StallGuard is invalid at standstill/spin-up and DIAG can
+        // still be asserted from a previous stall, which fired the ISR
+        // instantly and reported a stall after ~0 steps. Move a short
+        // distance blind before arming stall detection.
+        (void)stepper_controller_->execute_constant_speed(
+            0, kStallBlankingSteps, kRhoHomingIntervalUs);
+
+        rho_stall_triggered_ = false;
+        enable_diag_isr();
 
         // Execute a single large move - ISR will stop when stall detected
         (void)stepper_controller_->execute_constant_speed(
@@ -223,19 +232,27 @@ namespace sand_table {
             return result;
         }
 
-        // Clear stall flag and set direction inward
-        rho_stall_triggered_ = false;
+        // Set direction inward; keep both sensor ISRs off for the blanking
+        // move below
         rho_.set_direction(false);
-
-        // Only enable stallguard ISR for this phase
         disable_hall_isr();
-        enable_diag_isr();
+        disable_diag_isr();
 
         // Brief pause to let StallGuard clear from previous stall
         vTaskDelay(pdMS_TO_TICKS(100));
 
-        // Record starting position
+        // Record starting position (before blanking so it counts as travel)
         int32_t rho_before = rho_.position();
+
+        // Blanking: this seek starts pressed against the max hard stop with
+        // DIAG potentially still asserted and StallGuard invalid at spin-up.
+        // Without it the "stall" fired immediately and rho_max was measured
+        // as ~0 steps of travel (and then saved as valid calibration).
+        (void)stepper_controller_->execute_constant_speed(
+            0, -kStallBlankingSteps, kRhoHomingIntervalUs);
+
+        rho_stall_triggered_ = false;
+        enable_diag_isr();
 
         // Execute a single large move inward - ISR will stop when stall detected
         (void)stepper_controller_->execute_constant_speed(
@@ -254,6 +271,17 @@ namespace sand_table {
 
         // Check if stall was detected
         if (rho_stall_triggered_) {
+            // A stall this early is a false trigger, not the inner hard
+            // stop - saving it would calibrate rho_max to ~0 and disable
+            // all rho motion.
+            if (steps_moved < kMinRhoTravelSteps) {
+                ESP_LOGE(TAG, "Rho min stall after only %ld steps (min %ld) - "
+                    "false trigger, calibration rejected", steps_moved,
+                    kMinRhoTravelSteps);
+                HomingResult result;
+                result.error = MotionError::HomingFailed;
+                return result;
+            }
             ESP_LOGI(TAG, "Rho min found - total travel: %ld steps", steps_moved);
             HomingResult result;
             result.success = true;
@@ -295,7 +323,8 @@ namespace sand_table {
             // Move backward a moderate amount (hall field is small)
             // Use ~5000 theta steps with coupled rho compensation
             constexpr int32_t kBackoffSteps = 5000;
-            int32_t rho_backoff = kBackoffSteps / static_cast<int32_t>(kGearRatio);
+            int32_t rho_backoff = static_cast<int32_t>(std::lround(
+                kBackoffSteps / MechanicalConfig::theta_gear_ratio()));
 
             (void)stepper_controller_->execute_constant_speed(
                 -kBackoffSteps, -rho_backoff, kThetaHomingIntervalUs);
@@ -326,7 +355,8 @@ namespace sand_table {
         rho_.set_direction(true);     // Rho follows theta
 
         int32_t theta_before = theta_.position();
-        int32_t rho_steps_for_full_rotation = static_cast<int32_t>(kMaxHomingSteps) / static_cast<int32_t>(kGearRatio);
+        int32_t rho_steps_for_full_rotation = static_cast<int32_t>(std::lround(
+            static_cast<double>(kMaxHomingSteps) / MechanicalConfig::theta_gear_ratio()));
 
         // Execute large forward move - ISR stops at first edge
         (void)stepper_controller_->execute_constant_speed(
@@ -680,7 +710,8 @@ namespace sand_table {
 
             // Move backward a moderate amount (hall field is small)
             constexpr int32_t kBackoffSteps = 5000;
-            int32_t rho_backoff = kBackoffSteps / static_cast<int32_t>(kGearRatio);
+            int32_t rho_backoff = static_cast<int32_t>(std::lround(
+                kBackoffSteps / MechanicalConfig::theta_gear_ratio()));
 
             (void)stepper_controller_->execute_constant_speed(
                 -kBackoffSteps, -rho_backoff, kThetaHomingIntervalUs);
@@ -711,7 +742,8 @@ namespace sand_table {
         rho_.set_direction(true);     // Rho follows theta
 
         int32_t theta_before = theta_.position();
-        int32_t rho_steps_for_full_rotation = static_cast<int32_t>(kMaxHomingSteps) / static_cast<int32_t>(kGearRatio);
+        int32_t rho_steps_for_full_rotation = static_cast<int32_t>(std::lround(
+            static_cast<double>(kMaxHomingSteps) / MechanicalConfig::theta_gear_ratio()));
 
         // Execute large forward move - ISR stops at hall edge
         (void)stepper_controller_->execute_constant_speed(

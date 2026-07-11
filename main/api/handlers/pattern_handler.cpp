@@ -2,6 +2,7 @@
 #include "pattern_handler.h"
 #include "ManifestDatabase.h"
 #include "download_tracker.h"
+#include "websocket_server.h"
 
 #include <esp_log.h>
 #include <cstring>
@@ -63,17 +64,15 @@ std::vector<Kd__V1__TranquilMessage__MessageCase> PatternHandler::supportedMessa
     };
 }
 
-HandleResult PatternHandler::handleDownloadedPatternsRequest(ResponseMessage& response) {
+ResponseMessage PatternHandler::buildPatternListMessage() {
     auto patterns = ManifestDatabase::instance().getAllPatterns();
 
-    // Use static storage for the response (protobuf lifetime)
-    static Kd__V1__DownloadedPatterns downloaded = KD__V1__DOWNLOADED_PATTERNS__INIT;
-    static std::vector<Kd__V1__PatternInfo*> pattern_ptrs;
-    static std::vector<Kd__V1__PatternInfo> pattern_infos;
-
-    // Clear previous data
-    pattern_ptrs.clear();
-    pattern_infos.clear();
+    // Local storage is sufficient: serialize() packs the message into its
+    // own buffer before this scope ends. (This is also called from the job
+    // worker task, so statics here would race with the dispatcher.)
+    Kd__V1__DownloadedPatterns downloaded = KD__V1__DOWNLOADED_PATTERNS__INIT;
+    std::vector<Kd__V1__PatternInfo*> pattern_ptrs;
+    std::vector<Kd__V1__PatternInfo> pattern_infos;
 
     // Limit to 100 patterns to avoid excessive memory usage
     size_t count = std::min(patterns.size(), static_cast<size_t>(100));
@@ -102,10 +101,31 @@ HandleResult PatternHandler::handleDownloadedPatternsRequest(ResponseMessage& re
     resp.message_case = KD__V1__TRANQUIL_MESSAGE__MESSAGE_DOWNLOADED_PATTERNS;
     resp.downloaded_patterns = &downloaded;
 
-    response = serialize(&resp);
-
     ESP_LOGI(TAG, "DownloadedPatterns: returning %zu patterns", count);
+    return serialize(&resp);
+}
+
+HandleResult PatternHandler::handleDownloadedPatternsRequest(ResponseMessage& response) {
+    response = buildPatternListMessage();
     return HandleResult::ok(false, false);
+}
+
+void PatternHandler::notifyPatternDownloadComplete(const std::string& pattern_uuid, bool success) {
+    DownloadTracker::instance().removeDownload(pattern_uuid);
+
+    if (!success) return;
+
+    // Push the refreshed pattern list so clients see the new pattern without
+    // polling. The requester is included, so no separate unicast is needed.
+    ResponseMessage msg = buildPatternListMessage();
+    if (msg.valid()) {
+        esp_err_t err = websocket_broadcast(msg.data(), msg.len());
+        ESP_LOGI(TAG, "Broadcast pattern list after download of %s: %s",
+            pattern_uuid.c_str(), esp_err_to_name(err));
+    } else {
+        ESP_LOGW(TAG, "Failed to build pattern list broadcast for %s",
+            pattern_uuid.c_str());
+    }
 }
 
 HandleResult PatternHandler::handleDeletePattern(
@@ -194,10 +214,12 @@ HandleResult PatternHandler::handleGetPatternRequest(
         return HandleResult::ok();
     }
 
-    // Build PatternInfo response
-    static Kd__V1__PatternInfo info = KD__V1__PATTERN_INFO__INIT;
-    static char uuid_buf[64], name_buf[128], creator_buf[64];
-    static char created_buf[32], played_buf[32];
+    // Build PatternInfo response. Locals, not statics: httpd and the
+    // cloudlink task can run this concurrently, and shared static buffers
+    // raced between get_packed_size() and pack().
+    Kd__V1__PatternInfo info = KD__V1__PATTERN_INFO__INIT;
+    char uuid_buf[64] = {0}, name_buf[128] = {0}, creator_buf[64] = {0};
+    char created_buf[32] = {0}, played_buf[32] = {0};
 
     // Use external_uuid as "uuid" for API compatibility
     strncpy(uuid_buf, pattern->external_uuid.c_str(), sizeof(uuid_buf) - 1);

@@ -14,6 +14,8 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
+#include <atomic>
+
 #include <koios/cloudlink.h>
 #include <kd/v1/tranquil.pb-c.h>
 
@@ -84,7 +86,7 @@ namespace {
     // client's own event task); deinit there would destroy the client from
     // inside its own event handler. So spawn a short task, let the dispatch
     // unwind, then bounce the link.
-    bool cert_reload_pending = false;
+    std::atomic<bool> cert_reload_pending{ false };
 
     void cert_reload_task(void*) {
         vTaskDelay(pdMS_TO_TICKS(1000));
@@ -120,9 +122,14 @@ bool cloud_sockets_is_connected() {
     return koios_cloudlink_is_connected();
 }
 
+size_t cloud_sockets_max_msg_size() {
+    return MAX_MSG_SIZE;
+}
+
 void sockets_invalidate_cert_cache() {
-    if (cert_reload_pending) return;
-    cert_reload_pending = true;
+    // Atomic test-and-set: two renew handlers racing here must not spawn
+    // two reload tasks (each would deinit/reinit cloudlink concurrently).
+    if (cert_reload_pending.exchange(true)) return;
     if (xTaskCreate(cert_reload_task, "cert_reload", 6144, nullptr, 5, nullptr) != pdPASS) {
         ESP_LOGE(TAG, "Failed to spawn cert reload task");
         cert_reload_pending = false;

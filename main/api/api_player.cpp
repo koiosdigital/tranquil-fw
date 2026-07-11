@@ -15,11 +15,17 @@ cJSON* api_player_get_state_json() {
 
 // GET /api/player - get state
 static esp_err_t handle_get_state(httpd_req_t* req) {
+    // Shared response path for GET/PATCH/play/stop/skip — both the JSON
+    // build and the print can fail under heap pressure.
     cJSON* state = api_player_get_state_json();
-    char* resp = cJSON_PrintUnformatted(state);
+    char* resp = state ? cJSON_PrintUnformatted(state) : nullptr;
+    cJSON_Delete(state);
+    if (!resp) {
+        httpd_resp_send_500(req);
+        return ESP_ERR_NO_MEM;
+    }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, resp);
-    cJSON_Delete(state);
     free(resp);
     return ESP_OK;
 }

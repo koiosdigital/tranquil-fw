@@ -29,6 +29,13 @@ namespace sand_table {
             current_position_ = pos;
         }
 
+        /// Set calibrated step scales (from homing) so segment splitting is
+        /// computed against the real machine, not compile-time defaults.
+        void set_calibration(int32_t steps_per_theta_rot, int32_t rho_max_steps) noexcept {
+            if (steps_per_theta_rot > 0) steps_per_theta_rot_ = steps_per_theta_rot;
+            if (rho_max_steps > 0) rho_max_steps_ = rho_max_steps;
+        }
+
         /// Get the current position maintained by the path planner
         [[nodiscard]] const PolarPosition& current_position() const noexcept {
             return current_position_;
@@ -39,7 +46,7 @@ namespace sand_table {
         ///
         /// @param current Current polar position (theta: radians, rho: 0-1)
         /// @param target Target polar position (theta: radians, rho: 0-1)
-        /// @param feedrate_rpm Speed in RPM
+        /// @param feedrate_rpm Speed in normalized units/min (see MotionController::move_to)
         /// @return Error if move could not be planned
         [[nodiscard]] Result<void> plan_linear_move(
             const PolarPosition& current,
@@ -52,7 +59,7 @@ namespace sand_table {
         ///
         /// @param current Current polar position (theta: radians, rho: 0-1)
         /// @param target Target polar position (theta: radians, rho: 0-1)
-        /// @param feedrate_rpm Speed in RPM
+        /// @param feedrate_rpm Speed in normalized units/min (see MotionController::move_to)
         /// @return Error if move could not be planned
         [[nodiscard]] Result<void> plan_polar_move(
             const PolarPosition& current,
@@ -64,8 +71,77 @@ namespace sand_table {
         SegmentCallback callback_;
         PolarPosition current_position_{ 0.0, 0.0 };
 
+        // Calibrated step scales (defaults match nominal mechanics; homing overrides)
+        int32_t steps_per_theta_rot_ = MechanicalConfig::STEPS_PER_THETA_ROTATION;
+        int32_t rho_max_steps_ = 20000;
+
         // Segment length in normalized units (~1% of table)
         static constexpr double kSegmentLength = 0.01;
+
+        // Hard per-segment step budget. Must stay comfortably below
+        // CoordinatedStepperController::kMaxIntervalsPerSegment (which rejects,
+        // not truncates, oversized segments). 75% leaves headroom for rho
+        // coupling compensation and accumulator variance.
+        static constexpr uint32_t kMaxStepsPerSegment =
+            (MotionConfig::MAX_SEGMENT_STEPS * 3) / 4;
+
+        /// Estimate the major-axis motor steps a (delta_theta, delta_rho) move needs,
+        /// including the rho coupling compensation contribution.
+        [[nodiscard]] uint32_t estimate_steps(double delta_theta_rad, double delta_rho_norm) const {
+            const double theta_steps = std::fabs(delta_theta_rad) / (2.0 * M_PI) *
+                static_cast<double>(steps_per_theta_rot_);
+            // Rho motor moves for the commanded rho delta plus coupling counteraction
+            const double rho_steps = std::fabs(delta_rho_norm) * static_cast<double>(rho_max_steps_) +
+                theta_steps / MechanicalConfig::THETA_GEAR_RATIO;
+            const double major = std::fmax(theta_steps, rho_steps);
+            return static_cast<uint32_t>(std::ceil(major));
+        }
+
+        /// Emit a delta move, splitting it into as many segments as needed to
+        /// respect kMaxStepsPerSegment. Updates current_position_ incrementally
+        /// per emitted segment so a mid-move failure leaves the planner position
+        /// consistent with what was actually queued.
+        /// @param end_position Absolute position after the full delta (assigned
+        ///        exactly on full success to avoid accumulation error).
+        [[nodiscard]] Result<void> emit_split(
+            double delta_theta_rad,
+            double delta_rho_norm,
+            double distance_norm,
+            float feedrate_rpm,
+            const PolarPosition& end_position)
+        {
+            const uint32_t est = estimate_steps(delta_theta_rad, delta_rho_norm);
+            const uint32_t num_segments = (est > 0)
+                ? std::max<uint32_t>(1u, (est + kMaxStepsPerSegment - 1) / kMaxStepsPerSegment)
+                : 1u;
+
+            const double theta_per_seg = delta_theta_rad / num_segments;
+            const double rho_per_seg = delta_rho_norm / num_segments;
+            const float dist_per_seg = static_cast<float>(
+                std::fmax(distance_norm / num_segments, 0.001));
+
+            for (uint32_t i = 0; i < num_segments; ++i) {
+                MotionSegment segment;
+                segment.delta_theta_rad = theta_per_seg;
+                segment.delta_rho_norm = rho_per_seg;
+                segment.distance = dist_per_seg;
+                segment.nominal_velocity = feedrate_rpm;
+                segment.delta_theta_steps = 0;  // Calculated later by transformer
+                segment.delta_rho_steps = 0;
+
+                if (!callback_(segment)) {
+                    return Result<void>::err(MotionError::QueueFull);
+                }
+
+                // Advance planner position by what was actually queued
+                current_position_.theta += theta_per_seg;
+                current_position_.rho += rho_per_seg;
+            }
+
+            // Snap to the exact target to avoid floating-point drift
+            current_position_ = end_position;
+            return Result<void>::ok();
+        }
     };
 
     // =============================================================================
@@ -88,20 +164,9 @@ namespace sand_table {
 
         if (target.rho < kCenterThreshold) {
             // Moving TO center: just retract rho, no theta
-            MotionSegment segment;
-            segment.delta_theta_rad = 0.0;
-            segment.delta_rho_norm = -current.rho;
-            segment.distance = static_cast<float>(current.rho);
-            segment.nominal_velocity = feedrate_rpm;
-            segment.delta_theta_steps = 0;
-            segment.delta_rho_steps = 0;
-
-            if (std::fabs(segment.delta_rho_norm) > 0.001) {
-                if (!callback_(segment)) {
-                    return Result<void>::err(MotionError::QueueFull);
-                }
+            if (std::fabs(current.rho) > 0.001) {
+                return emit_split(0.0, -current.rho, current.rho, feedrate_rpm, target);
             }
-
             current_position_ = target;
             return Result<void>::ok();
         }
@@ -109,20 +174,12 @@ namespace sand_table {
         if (current.rho < kCenterThreshold) {
             // Moving FROM center: direct polar move to target (theta + rho)
             // Current theta is meaningless at center, so we move to target theta directly.
-            MotionSegment segment;
-            segment.delta_theta_rad = calculate_min_rotation(target.theta, current.theta);
-            segment.delta_rho_norm = target.rho;  // From ~0 to target
-            segment.distance = static_cast<float>(target.rho);  // Distance dominated by rho
-            segment.nominal_velocity = feedrate_rpm;
-            segment.delta_theta_steps = 0;
-            segment.delta_rho_steps = 0;
-
-            if (!callback_(segment)) {
-                return Result<void>::err(MotionError::QueueFull);
-            }
-
-            current_position_ = target;
-            return Result<void>::ok();
+            return emit_split(
+                calculate_min_rotation(target.theta, current.theta),
+                target.rho,  // From ~0 to target
+                target.rho,  // Distance dominated by rho
+                feedrate_rpm,
+                target);
         }
 
         // Convert polar to Cartesian for linear interpolation
@@ -167,20 +224,17 @@ namespace sand_table {
             // Normalize to [0, 2π] for consistency
             const double seg_theta_norm = (seg_theta < 0) ? seg_theta + 2.0 * M_PI : seg_theta;
 
-            MotionSegment segment;
+            // Use min-rotation for theta delta (shortest path). A piece passing
+            // near the center can flip theta by up to π in one interpolation
+            // step (a real half-turn of the arm) — emit_split subdivides it so
+            // no single segment exceeds the step budget.
+            const double d_theta = calculate_min_rotation(seg_theta_norm, prev_pos.theta);
+            const double d_rho = seg_rho - prev_pos.rho;
 
-            // Use min-rotation for theta delta (shortest path)
-            segment.delta_theta_rad = calculate_min_rotation(seg_theta_norm, prev_pos.theta);
-            segment.delta_rho_norm = seg_rho - prev_pos.rho;
-            segment.distance = dist_per_seg;
-            segment.nominal_velocity = feedrate_rpm;
-
-            // Motor steps will be calculated at execution time
-            segment.delta_theta_steps = 0;
-            segment.delta_rho_steps = 0;
-
-            if (!callback_(segment)) {
-                return Result<void>::err(MotionError::QueueFull);
+            auto result = emit_split(d_theta, d_rho, dist_per_seg, feedrate_rpm,
+                { current_position_.theta + d_theta, seg_rho });
+            if (result.is_err()) {
+                return result;
             }
 
             // Update prev_pos for next segment
@@ -201,20 +255,14 @@ namespace sand_table {
             return Result<void>::err(MotionError::InvalidState);
         }
 
-        // Calculate delta theta with direction preference
-        // - For multi-rotation moves (>= 2π), preserve full rotation count
-        // - For sub-rotation moves (< 2π), pick the shorter direction
-        const double raw_delta = target.theta - current.theta;
-        double delta_theta;
-        if (std::fabs(raw_delta) >= 2.0 * M_PI) {
-            // Multi-rotation: preserve full intent (e.g., 0 to 20π = 10 rotations)
-            delta_theta = raw_delta;
-        } else {
-            // Sub-rotation: pick shorter direction (e.g., 1.9π to 0.1π = +0.2π not -1.8π)
-            delta_theta = std::fmod(raw_delta, 2.0 * M_PI);
-            if (delta_theta > M_PI) delta_theta -= 2.0 * M_PI;
-            else if (delta_theta < -M_PI) delta_theta += 2.0 * M_PI;
-        }
+        // Theta is CONTINUOUS in pattern space (theta-rho files wind theta
+        // monotonically past 2π), so the delta between consecutive points is
+        // meant literally — direction and magnitude included. Folding deltas
+        // in (π, 2π) to the "shorter direction" reverses any sweep longer
+        // than half a turn: the table draws the complementary arc backwards
+        // while the thumbnail (which interpolates through the authored
+        // points) shows the intended path. Take the raw delta unchanged.
+        const double delta_theta = target.theta - current.theta;
         const double delta_rho = target.rho - current.rho;
 
         // Skip negligible moves
@@ -223,51 +271,12 @@ namespace sand_table {
             return Result<void>::ok();
         }
 
-        // Estimate total motor steps to determine if segmentation is needed
-        // RMT driver has kMaxIntervalsPerSegment = 32768 limit
-        // Use 75% of limit to leave headroom for rho coupling and accumulator variance
-        constexpr double kStepsPerThetaRotation = 25760.0;  // 200 * 16 * 8.05 (default config)
-        constexpr uint32_t kMaxStepsPerSegment = 24576;     // 75% of 32768
-
-        const double theta_rotations = std::fabs(delta_theta) / (2.0 * M_PI);
-        const uint32_t estimated_theta_steps = static_cast<uint32_t>(
-            theta_rotations * kStepsPerThetaRotation);
-
-        // Calculate number of segments needed
-        const uint32_t num_segments = std::max<uint32_t>(
-            1u,
-            static_cast<uint32_t>(std::ceil(
-                static_cast<double>(estimated_theta_steps) / kMaxStepsPerSegment))
-        );
-
-        // Calculate per-segment deltas
-        const double theta_per_segment = delta_theta / num_segments;
-        const double rho_per_segment = delta_rho / num_segments;
-
         // Calculate distance for velocity planning (arc length approximation)
         const double avg_rho = (current.rho + target.rho) / 2.0;
         const double arc_component = avg_rho * std::fabs(delta_theta);
         const double total_distance = std::sqrt(arc_component * arc_component + delta_rho * delta_rho);
-        const float dist_per_segment = static_cast<float>(
-            std::max(total_distance / num_segments, 0.001));
 
-        // Emit segments
-        for (uint32_t i = 0; i < num_segments; ++i) {
-            MotionSegment segment;
-            segment.delta_theta_rad = theta_per_segment;
-            segment.delta_rho_norm = rho_per_segment;
-            segment.distance = dist_per_segment;
-            segment.nominal_velocity = feedrate_rpm;
-            segment.delta_theta_steps = 0;  // Calculated later by transformer
-            segment.delta_rho_steps = 0;
-
-            if (!callback_(segment)) {
-                return Result<void>::err(MotionError::QueueFull);
-            }
-        }
-
-        current_position_ = target;
-        return Result<void>::ok();
+        return emit_split(delta_theta, delta_rho, total_distance, feedrate_rpm, target);
     }
 
 } // namespace sand_table

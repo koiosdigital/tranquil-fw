@@ -190,6 +190,33 @@ public:
         return { DownloadStatus::Queued, pattern_uuid, "Waiting for server response" };
     }
 
+    void notifyDownloadComplete(const std::string& pattern_uuid,
+        bool success, const std::string& error) {
+        ESP_LOGI(TAG, "Download job finished: %s (success=%d%s%s)",
+            pattern_uuid.c_str(), success,
+            error.empty() ? "" : ", error=", error.c_str());
+
+        DownloadCallback callback;
+        {
+            MutexGuard lock(mutex_);
+            auto it = pending_callbacks_.find(pattern_uuid);
+            if (it == pending_callbacks_.end()) {
+                ESP_LOGI(TAG, "No completion callback registered for %s",
+                    pattern_uuid.c_str());
+                return;
+            }
+            callback = std::move(it->second);
+            pending_callbacks_.erase(it);
+        }
+
+        if (callback) {
+            DownloadResult result{
+                success ? DownloadStatus::Success : DownloadStatus::NetworkError,
+                pattern_uuid, error };
+            callback(result);
+        }
+    }
+
     bool cancelDownload(const std::string& pattern_uuid) {
         // Cancel via job queue (using external UUID variant)
         esp_err_t err = jobs::JobQueue::instance().cancelJobsForExternalUuid(pattern_uuid);
@@ -243,6 +270,11 @@ DownloadResult PatternDownloader::queueDownloadByUuid(
     const std::string& pattern_uuid,
     DownloadCallback callback) {
     return impl_->queueDownloadByUuid(pattern_uuid, std::move(callback));
+}
+
+void PatternDownloader::notifyDownloadComplete(const std::string& pattern_uuid,
+    bool success, const std::string& error) {
+    impl_->notifyDownloadComplete(pattern_uuid, success, error);
 }
 
 bool PatternDownloader::cancelDownload(const std::string& pattern_uuid) {

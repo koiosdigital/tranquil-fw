@@ -56,11 +56,12 @@ HandleResult ScheduleHandler::handleScheduleRequest(
 
     auto& mgr = ScheduleManager::instance();
 
-    // Build protobuf response using static storage
-    static Kd__V1__TranquilSchedule schedule_proto;
-    static std::vector<Kd__V1__TranquilScheduleItem> items_storage;
-    static std::vector<Kd__V1__TranquilScheduleItem*> item_ptrs;
-    static std::vector<Kd__V1__ScheduleAction> actions_storage;
+    // Build protobuf response. Locals, not statics: concurrent handler tasks
+    // mutating shared static vectors double-free their backing stores.
+    Kd__V1__TranquilSchedule schedule_proto;
+    std::vector<Kd__V1__TranquilScheduleItem> items_storage;
+    std::vector<Kd__V1__TranquilScheduleItem*> item_ptrs;
+    std::vector<Kd__V1__ScheduleAction> actions_storage;
 
     mgr.toProto(&schedule_proto, items_storage, item_ptrs, actions_storage);
 
@@ -111,10 +112,10 @@ HandleResult ScheduleHandler::handleSetSchedule(
     // Return the updated schedule as confirmation
     auto& mgr = ScheduleManager::instance();
 
-    static Kd__V1__TranquilSchedule schedule_proto;
-    static std::vector<Kd__V1__TranquilScheduleItem> items_storage;
-    static std::vector<Kd__V1__TranquilScheduleItem*> item_ptrs;
-    static std::vector<Kd__V1__ScheduleAction> actions_storage;
+    Kd__V1__TranquilSchedule schedule_proto;
+    std::vector<Kd__V1__TranquilScheduleItem> items_storage;
+    std::vector<Kd__V1__TranquilScheduleItem*> item_ptrs;
+    std::vector<Kd__V1__ScheduleAction> actions_storage;
 
     mgr.toProto(&schedule_proto, items_storage, item_ptrs, actions_storage);
 

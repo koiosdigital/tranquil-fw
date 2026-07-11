@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stddef.h>
+
 // Cloud WebSocket client (vn-sec.koios.sh), a thin layer over koios-sdk's
 // cloudlink. Cloudlink owns the connection lifecycle end to end: waits for
 // network + identity, connects with mTLS (device cert from kd_common crypto
@@ -21,6 +23,10 @@ void cloud_sockets_deinit();
 
 // Check if connected to cloud server
 bool cloud_sockets_is_connected();
+
+// Largest message (bytes) cloudlink will accept for send/receive. Senders of
+// variable-size payloads (coredumps, bundles) should check before packing.
+size_t cloud_sockets_max_msg_size();
 
 // Make the next connection present the freshly stored device cert instead of
 // cloudlink's process-lifetime cached copy. Call after a successful cert

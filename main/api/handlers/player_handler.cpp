@@ -241,10 +241,12 @@ HandleResult PlayerHandler::handleGetPlayerState(ResponseMessage& response) {
 }
 
 ResponseMessage PlayerHandler::buildPlayerStateResponse() {
-    // Use static storage to avoid allocation issues
-    static Kd__V1__PlayerState state = KD__V1__PLAYER_STATE__INIT;
-    static char pattern_uuid[MAX_UUID_LEN] = {0};
-    static char playlist_uuid[MAX_UUID_LEN] = {0};
+    // Locals, not statics: this runs concurrently from the broadcaster timer,
+    // httpd, and the cloudlink task. Shared static buffers raced between
+    // get_packed_size() and pack(), overflowing the serialize buffer.
+    Kd__V1__PlayerState state = KD__V1__PLAYER_STATE__INIT;
+    char pattern_uuid[MAX_UUID_LEN] = {0};
+    char playlist_uuid[MAX_UUID_LEN] = {0};
 
     PlaybackStatus status = SandTablePlayer::getStatus();
 

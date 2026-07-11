@@ -3,10 +3,40 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
+#include <utility>
+
 // Scope-based guards for FreeRTOS mutexes/semaphores. Prefer these over raw
 // xSemaphoreTake/xSemaphoreGive pairs so the give can never be skipped by an
 // early return or thrown exception.
 namespace raii {
+
+// Runs a callable on scope exit. Use for cleanup (free/fclose/unlink) that
+// must happen on every return path. Call cancel() to skip the cleanup.
+template <typename F>
+class ScopeGuard {
+public:
+    explicit ScopeGuard(F fn) : fn_(std::move(fn)) {}
+
+    ~ScopeGuard() {
+        if (armed_) {
+            fn_();
+        }
+    }
+
+    ScopeGuard(const ScopeGuard&) = delete;
+    ScopeGuard& operator=(const ScopeGuard&) = delete;
+
+    void cancel() { armed_ = false; }
+
+private:
+    F fn_;
+    bool armed_ = true;
+};
+
+template <typename F>
+ScopeGuard<F> make_scope_guard(F fn) {
+    return ScopeGuard<F>(std::move(fn));
+}
 
 // Takes the mutex in the constructor and gives it back in the destructor.
 // Check operator bool() before touching guarded state when a finite timeout is

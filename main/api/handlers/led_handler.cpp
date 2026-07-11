@@ -55,8 +55,10 @@ std::vector<Kd__V1__TranquilMessage__MessageCase> LEDHandler::supportedMessages(
 }
 
 HandleResult LEDHandler::handleLEDConfigRequest(ResponseMessage& response) {
-    static Kd__V1__LEDConfig config = KD__V1__LEDCONFIG__INIT;
-    static char version[32] = "1.0";
+    // Locals, not statics: httpd and the cloudlink task can run handlers
+    // concurrently; shared static protobuf state races during serialize.
+    Kd__V1__LEDConfig config = KD__V1__LEDCONFIG__INIT;
+    char version[32] = "1.0";
 
     std::vector<int32_t> channel_ids = PixelDriver::getChannelIds();
     bool has_leds = !channel_ids.empty();
@@ -138,12 +140,12 @@ HandleResult LEDHandler::handleGetLEDEffects(ResponseMessage& response) {
 
     ESP_LOGI(TAG, "GetLEDEffects: returning %zu effects", effects.size());
 
-    static Kd__V1__LEDEffectsList effects_list = KD__V1__LEDEFFECTS_LIST__INIT;
-    static std::vector<Kd__V1__LEDEffectInfo*> effect_ptrs;
-    static std::vector<Kd__V1__LEDEffectInfo> effect_infos;
+    // Locals, not statics: concurrent handler tasks resizing shared static
+    // vectors double-free their backing stores.
+    Kd__V1__LEDEffectsList effects_list = KD__V1__LEDEFFECTS_LIST__INIT;
+    std::vector<Kd__V1__LEDEffectInfo*> effect_ptrs;
+    std::vector<Kd__V1__LEDEffectInfo> effect_infos;
 
-    effect_ptrs.clear();
-    effect_infos.clear();
     effect_infos.resize(effects.size());
 
     for (size_t i = 0; i < effects.size(); i++) {

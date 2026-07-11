@@ -34,6 +34,8 @@
 #include "storage/jobs/conversion_executor.h"
 #include "storage/jobs/thumbnail_executor.h"
 #include "storage/jobs/download_executor.h"
+#include "PatternDownloader.h"
+#include "pattern_handler.h"
 
 #include <koios/ota.h>
 
@@ -69,8 +71,23 @@ extern "C" void app_main(void)
     executors[jobs::JobType::Conversion] = std::make_unique<jobs::ConversionExecutor>();
     executors[jobs::JobType::Thumbnail] = std::make_unique<jobs::ThumbnailExecutor>();
     executors[jobs::JobType::Download] = std::make_unique<jobs::DownloadExecutor>();
-    jobs::JobProcessor::instance().init(std::move(executors));
-    ESP_LOGI(TAG, "Job processing system initialized");
+    jobs::JobProcessorConfig job_config;
+    job_config.on_job_complete = [](const jobs::Job& job, const jobs::JobResult& result) {
+        if (job.type == jobs::JobType::Download) {
+            PatternDownloader::instance().notifyDownloadComplete(
+                job.pattern_external_uuid, result.success, result.error);
+            PatternHandler::instance().notifyPatternDownloadComplete(
+                job.pattern_external_uuid, result.success);
+        }
+    };
+    esp_err_t job_err = jobs::JobProcessor::instance().init(std::move(executors), job_config);
+    if (job_err != ESP_OK) {
+        ESP_LOGE(TAG, "JobProcessor init FAILED: %s - background jobs will not run",
+            esp_err_to_name(job_err));
+    }
+    else {
+        ESP_LOGI(TAG, "Job processing system initialized");
+    }
 
     // Initialize motion controller
     g_motion_controller = new sand_table::MotionController();

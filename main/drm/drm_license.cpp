@@ -21,6 +21,7 @@
 #include <sys/stat.h>
 
 #include "ManifestDatabase.h"
+#include "storage/EncryptedPatternReader.h"
 
 static const char* TAG = "drm_license";
 
@@ -148,6 +149,9 @@ esp_err_t drm_license_init(void) {
     esp_err_t ret = import_server_key_to_psa();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to import server public key to PSA");
+        // Clean up so a retry doesn't leak a second mutex
+        vSemaphoreDelete(license_state.mutex);
+        license_state.mutex = nullptr;
         return ret;
     }
 
@@ -182,11 +186,17 @@ drm_license_status_t drm_license_get_status(void) {
 }
 
 uint32_t drm_license_get_max_patterns(void) {
-    if (!license_state.initialized || license_state.status != DRM_LICENSE_VALID) {
+    // initialized is set once at startup and never cleared, so it may be
+    // checked before the mutex (which doesn't exist until init); the
+    // mutable status/info fields are only read under the lock.
+    if (!license_state.initialized) {
         return 0;
     }
 
     raii::MutexGuard guard(license_state.mutex);
+    if (license_state.status != DRM_LICENSE_VALID) {
+        return 0;
+    }
     return license_state.info.max_patterns;
 }
 
@@ -207,12 +217,16 @@ bool drm_license_can_download(void) {
 }
 
 esp_err_t drm_license_get_info(drm_license_info_t* info) {
-    if (!license_state.initialized || !license_state.loaded) {
+    if (!license_state.initialized) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    raii::MutexGuard guard(license_state.mutex);
+    if (!license_state.loaded) {
         return ESP_ERR_NOT_FOUND;
     }
 
     if (info != nullptr) {
-        raii::MutexGuard guard(license_state.mutex);
         memcpy(info, &license_state.info, sizeof(drm_license_info_t));
     }
 
@@ -325,6 +339,10 @@ esp_err_t drm_license_reload(void) {
         }
     }
 
+    // Drop the cached pattern AES key so key material recovered under the
+    // old license doesn't outlive it
+    EncryptedPatternReader::invalidateKeyCache();
+
     ESP_LOGI(TAG, "License reloaded, status: %d", license_state.status);
     return ret;
 }
@@ -366,6 +384,20 @@ static esp_err_t load_license_file(void) {
         fclose(f);
         license_state.loaded = false;
         return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    // Bound the allocation sizes — the header comes straight from a file on
+    // the SD card, so a crafted length must not be able to exhaust SPIRAM
+    // (and 0 would make heap_caps_malloc return NULL -> spurious NO_MEM).
+    constexpr uint32_t MAX_PAYLOAD_LEN = 64 * 1024;
+    constexpr uint32_t MAX_SIGNATURE_LEN = 1024;  // RSA-2048 sig is 256 bytes
+    if (header.payload_len == 0 || header.payload_len > MAX_PAYLOAD_LEN ||
+        header.signature_len == 0 || header.signature_len > MAX_SIGNATURE_LEN) {
+        ESP_LOGE(TAG, "License header lengths out of range: payload=%lu sig=%lu",
+            (unsigned long)header.payload_len, (unsigned long)header.signature_len);
+        fclose(f);
+        license_state.loaded = false;
+        return ESP_ERR_INVALID_ARG;
     }
 
     // Allocate and read payload (use SPIRAM - persistent, cold path)
@@ -467,9 +499,17 @@ static drm_license_status_t validate_license(void) {
         return DRM_LICENSE_SIGNATURE_INVALID;
     }
 
-    // Check device binding
-    size_t cert_len = 0;
-    if (kd_common_get_device_cert(nullptr, &cert_len) == ESP_OK && cert_len > 0) {
+    // Check device binding. Enforced whenever the license carries a binding
+    // (for_device set) — genuinely fail-closed: if the device cert can't be
+    // read, parsed, or matched, a bound license must NOT validate. Licenses
+    // without a binding skip this check.
+    if (license_state.info.for_device[0] != '\0') {
+        size_t cert_len = 0;
+        if (kd_common_get_device_cert(nullptr, &cert_len) != ESP_OK || cert_len == 0) {
+            ESP_LOGE(TAG, "License is device-bound but device cert is unavailable");
+            return DRM_LICENSE_DEVICE_MISMATCH;
+        }
+
         // Certificate buffer lives in SPIRAM (cold path, ~4KB typical)
         constexpr size_t MAX_CERT_SIZE = 4096;
         if (cert_len >= MAX_CERT_SIZE) {
@@ -484,38 +524,72 @@ static drm_license_status_t validate_license(void) {
             return DRM_LICENSE_INVALID_FORMAT;
         }
 
-        if (kd_common_get_device_cert(cert_pem, &cert_len) == ESP_OK) {
-            // Parse certificate to extract CN
-            mbedtls_x509_crt crt;
-            mbedtls_x509_crt_init(&crt);
+        if (kd_common_get_device_cert(cert_pem, &cert_len) != ESP_OK ||
+            cert_len == 0 || cert_len >= MAX_CERT_SIZE) {
+            ESP_LOGE(TAG, "License is device-bound but device cert read failed");
+            heap_caps_free(cert_pem);
+            return DRM_LICENSE_DEVICE_MISMATCH;
+        }
 
-            if (mbedtls_x509_crt_parse(&crt, reinterpret_cast<const unsigned char*>(cert_pem),
-                cert_len + 1) == 0) {
-                // Extract CN from subject
-                char cn[128] = { 0 };
-                int cn_ret = mbedtls_x509_dn_gets(cn, sizeof(cn), &crt.subject);
-                if (cn_ret > 0) {
-                    // Check if license for_device matches certificate CN
-                    // The CN format is: CN=TRANQUIL-XXXXX.iotdevices.koiosdigital.net
-                    char* cn_start = strstr(cn, "CN=");
-                    if (cn_start) {
-                        cn_start += 3;  // Skip "CN="
-                        char* cn_end = strchr(cn_start, ',');
-                        if (cn_end) *cn_end = '\0';
+        // NUL-terminate: the cert is stored WITHOUT a trailing NUL, and
+        // mbedtls decides PEM-vs-DER by checking buf[buflen-1] == '\0'.
+        // Without this, that byte is uninitialized heap memory — the
+        // parse nondeterministically fails as DER and the device-binding
+        // check below would fail spuriously. (cert_len < MAX_CERT_SIZE was
+        // validated above, so the index is in bounds.)
+        cert_pem[cert_len] = '\0';
 
-                        if (strcmp(cn_start, license_state.info.for_device) != 0) {
-                            ESP_LOGE(TAG, "Device mismatch: cert='%s', license='%s'",
-                                cn_start, license_state.info.for_device);
-                            mbedtls_x509_crt_free(&crt);
-                            heap_caps_free(cert_pem);
-                            return DRM_LICENSE_DEVICE_MISMATCH;
-                        }
+        // Parse certificate to extract CN. A cert that exists but can't be
+        // parsed or matched must NOT validate a license bound to another
+        // device.
+        bool binding_verified = false;
+        mbedtls_x509_crt crt;
+        mbedtls_x509_crt_init(&crt);
+
+        if (mbedtls_x509_crt_parse(&crt, reinterpret_cast<const unsigned char*>(cert_pem),
+            cert_len + 1) == 0) {
+            // Extract CN from subject
+            char cn[128] = { 0 };
+            int cn_ret = mbedtls_x509_dn_gets(cn, sizeof(cn), &crt.subject);
+            if (cn_ret > 0) {
+                // Check if license for_device matches certificate CN
+                // The CN format is: CN=TRANQUIL-XXXXX.iotdevices.koiosdigital.net
+                char* cn_start = strstr(cn, "CN=");
+                if (cn_start) {
+                    cn_start += 3;  // Skip "CN="
+                    char* cn_end = strchr(cn_start, ',');
+                    if (cn_end) *cn_end = '\0';
+
+                    // The license for_device may be either the plain device
+                    // ID (TRANQUIL-XXXX) or the fully-qualified cert CN
+                    // (TRANQUIL-XXXX.iotdevices.koiosdigital.net). Compare
+                    // only the device-ID portion of each side.
+                    auto device_id_len = [](const char* s) -> size_t {
+                        const char* dot = strchr(s, '.');
+                        return dot ? static_cast<size_t>(dot - s) : strlen(s);
+                    };
+                    const size_t cn_id_len = device_id_len(cn_start);
+                    const size_t lic_id_len = device_id_len(license_state.info.for_device);
+
+                    if (cn_id_len == 0 || cn_id_len != lic_id_len ||
+                        strncmp(cn_start, license_state.info.for_device, cn_id_len) != 0) {
+                        ESP_LOGE(TAG, "Device mismatch: cert='%s', license='%s'",
+                            cn_start, license_state.info.for_device);
+                        mbedtls_x509_crt_free(&crt);
+                        heap_caps_free(cert_pem);
+                        return DRM_LICENSE_DEVICE_MISMATCH;
                     }
+                    binding_verified = true;
                 }
             }
-            mbedtls_x509_crt_free(&crt);
         }
+        mbedtls_x509_crt_free(&crt);
         heap_caps_free(cert_pem);
+
+        if (!binding_verified) {
+            ESP_LOGE(TAG, "Failed to verify device binding (cert parse/CN extraction failed)");
+            return DRM_LICENSE_DEVICE_MISMATCH;
+        }
     }
 
     // Check time validity
@@ -559,15 +633,19 @@ static void free_license_data(void) {
 }
 
 esp_err_t drm_license_get_store_token(char* token, size_t* token_len) {
-    if (!license_state.initialized || !license_state.loaded) {
+    if (!license_state.initialized) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    raii::MutexGuard guard(license_state.mutex);
+
+    if (!license_state.loaded) {
         return ESP_ERR_NOT_FOUND;
     }
 
     if (license_state.status != DRM_LICENSE_VALID) {
         return ESP_ERR_INVALID_STATE;
     }
-
-    raii::MutexGuard guard(license_state.mutex);
 
     size_t len = strlen(license_state.info.store_token);
     if (len == 0) {

@@ -1,4 +1,5 @@
 #include "job_queue.h"
+#include "job_processor.h"
 #include "ManifestDatabase.h"
 #include "esp_log.h"
 #include <sys/stat.h>
@@ -26,7 +27,18 @@ esp_err_t JobQueue::initialize() {
     }
 
     initialized_ = true;
-    ESP_LOGD(TAG, "JobQueue initialized");
+
+    // Re-queue jobs orphaned by a reboot mid-execution. InProgress status
+    // persists on SD, the claim scan only considers Pending, and the
+    // duplicate check treats InProgress as "already running" — so without
+    // this sweep an interrupted job (and every re-request for the same
+    // pattern) is stuck forever.
+    size_t recovered = ManifestDatabase::instance().recoverOrphanedJobs();
+    if (recovered > 0) {
+        ESP_LOGW(TAG, "Re-queued %zu jobs interrupted by reboot", recovered);
+    }
+
+    ESP_LOGI(TAG, "JobQueue initialized (%zu pending jobs)", getPendingCount());
     return ESP_OK;
 }
 
@@ -61,7 +73,11 @@ esp_err_t JobQueue::enqueueConversion(uint32_t pattern_id,
     job.created_at = ManifestDatabase::currentTimestamp();
     job.job_data = data.toJson();
 
-    return ManifestDatabase::instance().enqueueJob(job);
+    esp_err_t err = ManifestDatabase::instance().enqueueJob(job);
+    if (err == ESP_OK) {
+        JobProcessor::instance().triggerProcessing();
+    }
+    return err;
 }
 
 esp_err_t JobQueue::enqueueThumbnail(uint32_t pattern_id,
@@ -86,7 +102,11 @@ esp_err_t JobQueue::enqueueThumbnail(uint32_t pattern_id,
     job.created_at = ManifestDatabase::currentTimestamp();
     job.job_data = data.toJson();
 
-    return ManifestDatabase::instance().enqueueJob(job);
+    esp_err_t err = ManifestDatabase::instance().enqueueJob(job);
+    if (err == ESP_OK) {
+        JobProcessor::instance().triggerProcessing();
+    }
+    return err;
 }
 
 esp_err_t JobQueue::enqueueDownload(const std::string& pattern_external_uuid,
@@ -97,6 +117,8 @@ esp_err_t JobQueue::enqueueDownload(const std::string& pattern_external_uuid,
     // Check if job already exists for this external UUID
     if (hasJobForExternalUuid(pattern_external_uuid, JobType::Download)) {
         ESP_LOGW(TAG, "Download job already exists for pattern: %s", pattern_external_uuid.c_str());
+        // The existing job may still be Pending — make sure it runs now.
+        JobProcessor::instance().triggerProcessing();
         return ESP_OK;
     }
 
@@ -112,7 +134,11 @@ esp_err_t JobQueue::enqueueDownload(const std::string& pattern_external_uuid,
     job.created_at = ManifestDatabase::currentTimestamp();
     job.job_data = data.toJson();
 
-    return ManifestDatabase::instance().enqueueJob(job);
+    esp_err_t err = ManifestDatabase::instance().enqueueJob(job);
+    if (err == ESP_OK) {
+        JobProcessor::instance().triggerProcessing();
+    }
+    return err;
 }
 
 std::optional<Job> JobQueue::claimNextPendingJob() {
@@ -125,9 +151,14 @@ esp_err_t JobQueue::markCompleted(uint32_t job_id) {
     return ManifestDatabase::instance().markJobCompleted(job_id);
 }
 
-esp_err_t JobQueue::markFailed(uint32_t job_id, const std::string& error) {
+esp_err_t JobQueue::markFailed(uint32_t job_id, const std::string& error, bool permanent) {
     if (!initialized_) return ESP_ERR_INVALID_STATE;
-    return ManifestDatabase::instance().markJobFailed(job_id, error);
+    return ManifestDatabase::instance().markJobFailed(job_id, error, permanent);
+}
+
+esp_err_t JobQueue::releaseJob(uint32_t job_id) {
+    if (!initialized_) return ESP_ERR_INVALID_STATE;
+    return ManifestDatabase::instance().releaseJob(job_id);
 }
 
 std::optional<Job> JobQueue::getJob(uint32_t job_id) {
@@ -177,12 +208,19 @@ esp_err_t JobQueue::cancelJobsForPatternId(uint32_t pattern_id) {
 
 esp_err_t JobQueue::cancelJobsForExternalUuid(const std::string& external_uuid) {
     if (!initialized_) return ESP_ERR_INVALID_STATE;
-    // Look up pattern by external UUID to get internal ID
+
+    // Download jobs are enqueued with pattern_id=0 (the pattern doesn't exist
+    // yet) and carry the server UUID on the job row — cancel those directly.
+    esp_err_t err = ManifestDatabase::instance().cancelJobsForExternalUuid(external_uuid);
+
+    // If the pattern already exists, also cancel jobs keyed by internal ID
+    // (conversion/thumbnail).
     auto pattern_id = ManifestDatabase::instance().findPatternIdByExternalUuid(external_uuid);
-    if (!pattern_id) {
-        return ESP_OK;  // No pattern with this UUID, nothing to cancel
+    if (pattern_id) {
+        esp_err_t err2 = ManifestDatabase::instance().cancelJobsForPattern(*pattern_id);
+        if (err == ESP_OK) err = err2;
     }
-    return ManifestDatabase::instance().cancelJobsForPattern(*pattern_id);
+    return err;
 }
 
 } // namespace jobs

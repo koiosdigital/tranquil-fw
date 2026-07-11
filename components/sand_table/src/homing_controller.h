@@ -132,12 +132,26 @@ namespace sand_table {
         // Homing parameters
         static constexpr uint32_t kMaxHomingSteps = 100000;
 
+        // StallGuard is invalid at standstill and during initial
+        // acceleration, and DIAG can still be asserted from a previous
+        // stall. Each rho seek first moves this far with the DIAG ISR
+        // DISABLED before arming stall detection. A real stall inside the
+        // blanking window grinds for at most this many steps (~150ms).
+        static constexpr int32_t kStallBlankingSteps = 200;
+
+        // A stall reported with less total travel than this is a false
+        // trigger (residual DIAG / StallGuard noise), not the opposite hard
+        // stop. Refuse to treat it as a valid calibration.
+        static constexpr int32_t kMinRhoTravelSteps = 1000;
+
         // Homing step intervals (constant speed, no acceleration)
         // These are CRITICAL for StallGuard to work reliably
         static constexpr uint32_t kRhoHomingIntervalUs = 750;   // 750µs/step = 1333 steps/sec
         static constexpr uint32_t kThetaHomingIntervalUs = 400; // 400µs/step = 2500 steps/sec
 
-        static constexpr uint32_t kGearRatio = static_cast<uint32_t>(MechanicalConfig::THETA_GEAR_RATIO);
+        // NOTE: gear-ratio math uses MechanicalConfig::theta_gear_ratio()
+        // (runtime double) — an integer-truncated constant here skewed the
+        // rho coupling compensation by ~0.6% during theta homing.
 
         // ISR handlers - these directly stop RMT transmission when sensors trigger
         static void IRAM_ATTR hall_isr_handler(void* arg);

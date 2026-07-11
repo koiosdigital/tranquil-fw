@@ -3,6 +3,7 @@
 #include "types.h"
 #include "config.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <optional>
@@ -76,14 +77,11 @@ private:
         const MotionSegment& next
     ) const;
 
-    /// Run the two-pass lookahead algorithm
+    /// Recalculate per-motor junction velocities across the buffer.
+    /// Acceleration-limited ramping between the junction velocities is done
+    /// per-segment by CoordinatedStepperController::calculate_velocity_profile;
+    /// this pass only decides where each motor must stop (direction reversals).
     void recalculate();
-
-    /// Backward pass: propagate deceleration limits from end to start
-    void reverse_pass();
-
-    /// Forward pass: propagate acceleration limits from start to end
-    void forward_pass();
 
     /// Get segment at buffer index (with wraparound)
     [[nodiscard]] MotionSegment& at(size_t index);
@@ -282,76 +280,6 @@ inline void VelocityPlanner::recalculate() {
                 // Same direction - maintain velocity
                 next.rho_entry_velocity = seg.rho_exit_velocity;
             }
-        }
-    }
-}
-
-inline void VelocityPlanner::reverse_pass() {
-    // Work backward from end to start
-    // Ensure each motor can decelerate to its exit velocity (independently)
-
-    for (size_t i = count_; i > 0; --i) {
-        MotionSegment& seg = at(i - 1);
-
-        // Maximum entry velocity that allows deceleration to exit velocity
-        // v_entry = sqrt(v_exit^2 + 2 * a * d)
-
-        // Theta motor
-        const float max_theta_entry = std::sqrt(
-            seg.theta_exit_velocity * seg.theta_exit_velocity +
-            2.0f * seg.acceleration * seg.distance
-        );
-        seg.theta_entry_velocity = std::min(seg.theta_entry_velocity, max_theta_entry);
-        seg.theta_entry_velocity = std::min(seg.theta_entry_velocity, seg.nominal_velocity);
-
-        // Rho motor
-        const float max_rho_entry = std::sqrt(
-            seg.rho_exit_velocity * seg.rho_exit_velocity +
-            2.0f * seg.acceleration * seg.distance
-        );
-        seg.rho_entry_velocity = std::min(seg.rho_entry_velocity, max_rho_entry);
-        seg.rho_entry_velocity = std::min(seg.rho_entry_velocity, seg.nominal_velocity);
-
-        // Propagate to previous segment's exit velocity
-        if (i > 1) {
-            MotionSegment& prev = at(i - 2);
-            prev.theta_exit_velocity = std::min(prev.theta_exit_velocity, seg.theta_entry_velocity);
-            prev.rho_exit_velocity = std::min(prev.rho_exit_velocity, seg.rho_entry_velocity);
-        }
-    }
-}
-
-inline void VelocityPlanner::forward_pass() {
-    // Work forward from start to end
-    // Ensure each motor can accelerate from its entry velocity (independently)
-
-    for (size_t i = 0; i < count_; ++i) {
-        MotionSegment& seg = at(i);
-
-        // Maximum exit velocity achievable from entry velocity
-        // v_exit = sqrt(v_entry^2 + 2 * a * d)
-
-        // Theta motor
-        const float max_theta_exit = std::sqrt(
-            seg.theta_entry_velocity * seg.theta_entry_velocity +
-            2.0f * seg.acceleration * seg.distance
-        );
-        seg.theta_exit_velocity = std::min(seg.theta_exit_velocity, max_theta_exit);
-        seg.theta_exit_velocity = std::min(seg.theta_exit_velocity, seg.nominal_velocity);
-
-        // Rho motor
-        const float max_rho_exit = std::sqrt(
-            seg.rho_entry_velocity * seg.rho_entry_velocity +
-            2.0f * seg.acceleration * seg.distance
-        );
-        seg.rho_exit_velocity = std::min(seg.rho_exit_velocity, max_rho_exit);
-        seg.rho_exit_velocity = std::min(seg.rho_exit_velocity, seg.nominal_velocity);
-
-        // Propagate to next segment's entry velocity
-        if (i < count_ - 1) {
-            MotionSegment& next = at(i + 1);
-            next.theta_entry_velocity = std::min(next.theta_entry_velocity, seg.theta_exit_velocity);
-            next.rho_entry_velocity = std::min(next.rho_entry_velocity, seg.rho_exit_velocity);
         }
     }
 }

@@ -13,6 +13,9 @@
 #include <koios/cloudlink.h>
 
 #include "drm/drm_license.h"
+#include "sockets.h"
+
+#include <cinttypes>
 
 static const char* TAG = "cloud_messages";
 
@@ -45,7 +48,12 @@ bool cloud_msg_queue(const Kd__V1__TranquilMessage* message) {
     kd__v1__tranquil_message__pack(message, buf);
     bool ok = koios_cloudlink_send(buf, len);  // copies buf
     heap_caps_free(buf);
-    if (!ok) ESP_LOGW(TAG, "cloudlink outbox full, dropped message");
+    if (!ok) {
+        // send() fails for oversize messages and uninitialized cloudlink,
+        // not just a full outbox — don't claim to know which.
+        ESP_LOGW(TAG, "cloudlink send failed, dropped message (%zu bytes, max %zu)",
+                 len, cloud_sockets_max_msg_size());
+    }
     return ok;
 }
 
@@ -74,39 +82,53 @@ void cloud_msg_upload_coredump() {
         ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_COREDUMP, "coredump");
     if (part == nullptr) return;
 
-    size_t size = part->size;
-    auto* data = static_cast<uint8_t*>(heap_caps_malloc(size, MALLOC_CAP_SPIRAM));
+    // Flash core dumps begin with a 32-bit total image size. Reading the
+    // whole partition (64 KB) always exceeded cloudlink's message limit, so
+    // the upload could never succeed and retried every boot.
+    uint32_t dump_size = 0;
+    if (esp_partition_read(part, 0, &dump_size, sizeof(dump_size)) != ESP_OK) return;
+    if (dump_size == 0xFFFFFFFF) return;  // Erased - nothing to upload
+
+    if (dump_size < 8 || dump_size > part->size) {
+        ESP_LOGW(TAG, "Invalid coredump header (size=%" PRIu32 "), erasing partition",
+                 dump_size);
+        esp_partition_erase_range(part, 0, part->size);
+        return;
+    }
+
+    auto* data = static_cast<uint8_t*>(heap_caps_malloc(dump_size, MALLOC_CAP_SPIRAM));
     if (data == nullptr) return;
 
-    if (esp_partition_read(part, 0, data, size) != ESP_OK) {
+    if (esp_partition_read(part, 0, data, dump_size) != ESP_OK) {
         heap_caps_free(data);
         return;
     }
 
-    // Check if erased (all 0xFF)
-    bool erased = true;
-    for (size_t i = 0; i < 256 && i < size; i++) {
-        if (data[i] != 0xFF) { erased = false; break; }
-    }
+    const esp_app_desc_t* app = esp_app_get_description();
 
-    if (!erased) {
-        ESP_LOGI(TAG, "Uploading coredump (%zu bytes)", size);
+    Kd__V1__UploadCoreDump upload = KD__V1__UPLOAD_CORE_DUMP__INIT;
+    upload.core_dump.data = data;
+    upload.core_dump.len = dump_size;
+    upload.firmware_project = const_cast<char*>(app->project_name);
+    upload.firmware_version = const_cast<char*>(app->version);
 
-        const esp_app_desc_t* app = esp_app_get_description();
+    Kd__V1__TranquilMessage msg = KD__V1__TRANQUIL_MESSAGE__INIT;
+    msg.message_case = KD__V1__TRANQUIL_MESSAGE__MESSAGE_UPLOAD_CORE_DUMP;
+    msg.upload_core_dump = &upload;
 
-        Kd__V1__UploadCoreDump upload = KD__V1__UPLOAD_CORE_DUMP__INIT;
-        upload.core_dump.data = data;
-        upload.core_dump.len = size;
-        upload.firmware_project = const_cast<char*>(app->project_name);
-        upload.firmware_version = const_cast<char*>(app->version);
-
-        Kd__V1__TranquilMessage msg = KD__V1__TRANQUIL_MESSAGE__INIT;
-        msg.message_case = KD__V1__TRANQUIL_MESSAGE__MESSAGE_UPLOAD_CORE_DUMP;
-        msg.upload_core_dump = &upload;
-
+    size_t packed = kd__v1__tranquil_message__get_packed_size(&msg);
+    if (packed > cloud_sockets_max_msg_size()) {
+        // Undeliverable at any retry - erase so it doesn't churn every boot.
+        ESP_LOGE(TAG, "Coredump message (%zu bytes) exceeds cloud limit (%zu), discarding",
+                 packed, cloud_sockets_max_msg_size());
+        esp_partition_erase_range(part, 0, part->size);
+    } else {
+        ESP_LOGI(TAG, "Uploading coredump (%" PRIu32 " bytes)", dump_size);
         if (cloud_msg_queue(&msg)) {
-            esp_partition_erase_range(part, 0, size);
+            esp_partition_erase_range(part, 0, part->size);
         }
+        // Transient failure (offline, outbox full): keep the dump and let the
+        // next boot retry.
     }
 
     heap_caps_free(data);

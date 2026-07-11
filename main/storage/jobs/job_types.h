@@ -102,9 +102,11 @@ struct DownloadJobData {
 struct JobResult {
     bool success;
     std::string error;
+    bool permanent = false;  // Failure can never succeed on retry (skip retries)
 
-    static JobResult ok() { return {true, ""}; }
-    static JobResult fail(const std::string& msg) { return {false, msg}; }
+    static JobResult ok() { return {true, "", false}; }
+    static JobResult fail(const std::string& msg) { return {false, msg, false}; }
+    static JobResult fail_permanent(const std::string& msg) { return {false, msg, true}; }
 };
 
 // String conversion helpers

@@ -146,19 +146,34 @@ namespace sand_table {
         /// @param total_steps Total steps on major axis
         /// @param theta_pos Atomic position counter for theta (updated during execution)
         /// @param rho_pos Atomic position counter for rho (updated during execution)
+        /// @param timeout_ms Completion timeout; pass the expected segment
+        ///        duration with margin (a fixed value spuriously kills long
+        ///        slow segments)
         [[nodiscard]] Result<void> execute(
             BresenhamState& bresenham,
             const uint16_t* intervals,
             uint32_t total_steps,
             std::atomic<int32_t>& theta_pos,
-            std::atomic<int32_t>& rho_pos
+            std::atomic<int32_t>& rho_pos,
+            uint32_t timeout_ms
         );
 
-        /// Emergency stop - immediately halt transmission
+        /// Request stop: raises the stop flag and wakes execute(), which
+        /// performs the hardware abort in the executing task's context.
+        /// Safe to call from any task. The flag PERSISTS until clear_stop():
+        /// a stop landing between two chunked execute() calls still aborts
+        /// the next one instead of being silently discarded.
         void stop();
 
         /// ISR-safe stop - sets flag and signals semaphore without blocking
         void IRAM_ATTR stop_from_isr();
+
+        /// Consume a pending stop request. Call once at the start of each
+        /// logical motion operation (a segment, a whole homing seek) - NOT
+        /// per chunk - so stops raised mid-operation are never lost.
+        void clear_stop() {
+            stop_requested_.store(false, std::memory_order_release);
+        }
 
         /// Check if currently executing
         [[nodiscard]] bool is_executing() const noexcept {
@@ -186,20 +201,37 @@ namespace sand_table {
         rmt_symbol_word_t theta_symbols_[2][kChunkSize];
         rmt_symbol_word_t rho_symbols_[2][kChunkSize];
         size_t symbol_counts_[2] = { 0, 0 };
-        uint8_t active_buffer_ = 0;
+
+        // Per-buffer signed step deltas, credited to the position counters
+        // when that buffer's transmission COMPLETES (not when it is encoded).
+        // Crediting at encode time ran up to two chunks (~128 steps) ahead of
+        // the motors, so any mid-segment stop (hall/stall ISR, e-stop,
+        // timeout) permanently desynced logical position from physical.
+        // Residual error is now bounded by the partially-transmitted chunk
+        // (< kChunkSize steps) and only on aborted segments.
+        int32_t buf_theta_delta_[2] = { 0, 0 };
+        int32_t buf_rho_delta_[2] = { 0, 0 };
+        // Buffers are transmitted in strict 0,1,0,1... alternation; this
+        // counts completed pairs so the callback knows which buffer finished.
+        uint32_t completed_pairs_ = 0;
 
         // Execution state
         std::atomic<bool> executing_{ false };
         std::atomic<bool> stop_requested_{ false };
         std::atomic<int32_t> pending_tx_{ 0 };  // Count of pending transmissions
         uint32_t steps_encoded_ = 0;
+        uint32_t encoded_chunks_ = 0;  // Chunk N is encoded into buffer N&1
         uint32_t total_steps_ = 0;
         BresenhamState* bresenham_ = nullptr;
         const uint16_t* intervals_ = nullptr;
         std::atomic<int32_t>* theta_pos_ = nullptr;
         std::atomic<int32_t>* rho_pos_ = nullptr;
 
-        // Completion signaling
+        // Pair-completion / stop signaling (counting semaphore). The TX-done
+        // ISR gives it once per completed buffer pair; execute()'s refill
+        // loop consumes it, re-encodes the freed buffer, and queues the next
+        // transmission from TASK context (rmt_transmit uses non-ISR queue
+        // APIs and must never be called from the callback).
         SemaphoreHandle_t completion_sem_ = nullptr;
 
         // Channel completion tracking - counts how many channels have completed
@@ -213,15 +245,21 @@ namespace sand_table {
             void* user_ctx
         );
 
-        // Encode next chunk of steps into RMT symbols (called from ISR)
-        void IRAM_ATTR encode_chunk(uint8_t buffer_idx);
+        // Encode next chunk of steps into RMT symbols (task context only -
+        // called from execute()'s refill loop, never from the ISR)
+        void encode_chunk(uint8_t buffer_idx);
 
-        // Helper to create step and idle symbols (called from ISR)
-        static rmt_symbol_word_t IRAM_ATTR make_step_symbol(uint16_t interval_us);
-        static rmt_symbol_word_t IRAM_ATTR make_idle_symbol(uint16_t interval_us);
+        // Helper to create step and idle symbols
+        static rmt_symbol_word_t make_step_symbol(uint16_t interval_us);
+        static rmt_symbol_word_t make_idle_symbol(uint16_t interval_us);
 
-        // Run one Bresenham iteration (called from ISR)
-        void IRAM_ATTR bresenham_step(bool& step_theta, bool& step_rho);
+        // Run one Bresenham iteration
+        void bresenham_step(bool& step_theta, bool& step_rho);
+
+        // Abort in-flight/queued RMT transmissions (disable+enable resets the
+        // channel). MUST be called from the task that owns execution (the
+        // stepper task inside execute()) — never from an ISR.
+        void hard_abort_channels();
 
         bool initialized_ = false;
     };
@@ -313,15 +351,19 @@ namespace sand_table {
         std::unique_ptr<RmtStepSequencer, InternalRamDeleter> rmt_sequencer_;
         BresenhamState bresenham_;
 
-        // Pre-computed step intervals for velocity profiles
-        // Must be large enough for full rotation (25600 steps) plus margin
-        static constexpr size_t kMaxIntervalsPerSegment = 32768;
+        // Pre-computed step intervals for velocity profiles.
+        // Capacity comes from MotionConfig::MAX_SEGMENT_STEPS — the path
+        // planner splits moves to fit, and execute_segment() rejects (never
+        // silently truncates) anything larger. Sized to fit internal RAM
+        // because the RMT TX-done ISR reads this table.
+        static constexpr size_t kMaxIntervalsPerSegment = MotionConfig::MAX_SEGMENT_STEPS;
 
         struct IntervalTable {
-            uint16_t* intervals = nullptr;  // Allocated from SPIRAM
+            uint16_t* intervals = nullptr;  // Allocated from internal RAM (ISR-read)
             uint32_t total_steps = 0;
+            uint64_t total_us = 0;          // Sum of intervals (for timeout sizing)
 
-            void clear() { total_steps = 0; }
+            void clear() { total_steps = 0; total_us = 0; }
         };
         IntervalTable interval_table_;
 

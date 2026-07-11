@@ -1,6 +1,7 @@
 #include "PatternReader.h"
 #include "EncryptedPatternReader.h"
 #include "esp_log.h"
+#include <cmath>
 #include <cstring>
 
 static const char* TAG = "PatternReader";
@@ -60,8 +61,34 @@ esp_err_t BinaryPatternReader::open(const char* uuid) {
         return ESP_ERR_INVALID_ARG;
     }
 
+    // Validate point_count against actual file size so a truncated file
+    // can't wedge playback (hasMore() true forever past EOF)
+    long file_size = -1;
+    if (fseek(file_, 0, SEEK_END) == 0) {
+        file_size = ftell(file_);
+    }
+    if (file_size < 0 || fseek(file_, sizeof(header_), SEEK_SET) != 0) {
+        ESP_LOGE(TAG, "Failed to determine pattern file size");
+        fclose(file_);
+        file_ = nullptr;
+        return ESP_FAIL;
+    }
+    size_t available_points =
+        (static_cast<size_t>(file_size) - sizeof(header_)) / sizeof(BinaryPoint);
+    if (header_.point_count > available_points) {
+        ESP_LOGW(TAG, "Pattern truncated: header claims %lu points, file holds %zu",
+                 (unsigned long)header_.point_count, available_points);
+        if (available_points == 0) {
+            fclose(file_);
+            file_ = nullptr;
+            return ESP_ERR_INVALID_SIZE;
+        }
+        header_.point_count = available_points;
+    }
+
     current_point_ = 0;
     has_peeked_ = false;
+    read_failed_ = false;
 
     ESP_LOGI(TAG, "Opened binary pattern: %s (%lu points)",
              path, (unsigned long)header_.point_count);
@@ -76,6 +103,7 @@ void BinaryPatternReader::close() {
     memset(&header_, 0, sizeof(header_));
     current_point_ = 0;
     has_peeked_ = false;
+    read_failed_ = false;
 }
 
 bool BinaryPatternReader::isOpen() const {
@@ -91,17 +119,25 @@ size_t BinaryPatternReader::getCurrentLine() const {
 }
 
 PatternPoint BinaryPatternReader::readBinaryPoint() {
-    if (!file_ || current_point_ >= header_.point_count) {
+    if (!file_ || read_failed_ || current_point_ >= header_.point_count) {
         return PatternPoint();
     }
 
     BinaryPoint bp;
     if (fread(&bp, sizeof(bp), 1, file_) != 1) {
         ESP_LOGE(TAG, "Failed to read binary point at index %zu", current_point_);
+        read_failed_ = true;  // terminal: end playback cleanly instead of spinning
         return PatternPoint();
     }
 
-    // Convert uint16 rho to float 0.0-1.0
+    // Reject garbage motion targets: theta must be a finite, sane angle
+    // (|theta| < 10000 rad is generous for multi-rotation patterns)
+    if (!std::isfinite(bp.theta) || std::fabs(bp.theta) >= 10000.0f) {
+        ESP_LOGW(TAG, "Invalid theta at point %zu, skipping", current_point_);
+        return PatternPoint();
+    }
+
+    // Convert uint16 rho to float 0.0-1.0 (in [0,1] by construction)
     double rho = static_cast<double>(bp.rho) / 65535.0;
 
     return PatternPoint(static_cast<double>(bp.theta), rho);
@@ -132,14 +168,12 @@ PatternPoint BinaryPatternReader::peekNext() {
         return peeked_point_;
     }
 
-    // Save position
-    long prev_pos = ftell(file_);
-
-    // Read next point
+    // Read the point and leave the file advanced past it: readNext()'s
+    // cached branch returns peeked_point_ WITHOUT re-reading the stream,
+    // so rewinding here would desync the file from current_point_ — every
+    // peek+read cycle re-reads the same bytes and playback replays one
+    // point until the index runs out.
     peeked_point_ = readBinaryPoint();
-
-    // Restore position
-    fseek(file_, prev_pos, SEEK_SET);
 
     if (peeked_point_.valid) {
         has_peeked_ = true;
@@ -149,7 +183,7 @@ PatternPoint BinaryPatternReader::peekNext() {
 }
 
 bool BinaryPatternReader::hasMore() const {
-    if (!file_) return false;
+    if (!file_ || read_failed_) return false;
 
     if (has_peeked_) return peeked_point_.valid;
 
@@ -160,9 +194,14 @@ esp_err_t BinaryPatternReader::rewind() {
     if (!file_) return ESP_ERR_INVALID_STATE;
 
     // Seek to start of points (after header)
-    fseek(file_, sizeof(UnencryptedPatternHeader), SEEK_SET);
+    if (fseek(file_, sizeof(UnencryptedPatternHeader), SEEK_SET) != 0) {
+        ESP_LOGE(TAG, "Rewind seek failed");
+        read_failed_ = true;
+        return ESP_FAIL;
+    }
     current_point_ = 0;
     has_peeked_ = false;
+    read_failed_ = false;
 
     return ESP_OK;
 }

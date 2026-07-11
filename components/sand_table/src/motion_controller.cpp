@@ -7,6 +7,8 @@
 
 #include "esp_log.h"
 
+#include <cmath>
+
 namespace sand_table {
 
     static const char* TAG = "MotionController";
@@ -16,6 +18,8 @@ namespace sand_table {
         , velocity_planner_(std::make_unique<VelocityPlanner>())
         , transformer_(std::make_unique<CoordinateTransformer>())
     {
+        planner_mutex_ = xSemaphoreCreateMutex();
+
         // Set up PathPlanner callback to enqueue segments via VelocityPlanner
         path_planner_->set_segment_callback([this](MotionSegment& seg) {
             return this->enqueue_segment(seg);
@@ -27,6 +31,10 @@ namespace sand_table {
 
         if (inactivity_timer_) {
             xTimerDelete(inactivity_timer_, 0);
+        }
+        if (planner_mutex_) {
+            vSemaphoreDelete(planner_mutex_);
+            planner_mutex_ = nullptr;
         }
     }
 
@@ -204,10 +212,32 @@ namespace sand_table {
 
     void MotionController::stepper_task_loop() {
         while (running_.load(std::memory_order_acquire)) {
+            // Drain request (normal stop): this task owns the queue's
+            // consumer side, so IT clears everything and acknowledges by
+            // clearing the flag (see halt_and_drain()).
+            if (drain_requested_.load(std::memory_order_acquire)) {
+                segment_queue_.clear();
+                if (xSemaphoreTake(planner_mutex_, pdMS_TO_TICKS(100)) == pdTRUE) {
+                    velocity_planner_->clear();
+                    xSemaphoreGive(planner_mutex_);
+                }
+                stepper_controller_->emergency_stop();
+                // Discarded segments will never execute — replan from where
+                // the motors actually are.
+                path_planner_->set_current_position(get_position());
+                state_.store(SystemState::Idle, std::memory_order_release);
+                reset_inactivity_timer();
+                drain_requested_.store(false, std::memory_order_release);
+                continue;
+            }
+
             // Check for emergency stop
             if (emergency_stop_.load(std::memory_order_acquire)) {
                 segment_queue_.clear();
-                velocity_planner_->clear();
+                if (xSemaphoreTake(planner_mutex_, pdMS_TO_TICKS(100)) == pdTRUE) {
+                    velocity_planner_->clear();
+                    xSemaphoreGive(planner_mutex_);
+                }
                 stepper_controller_->emergency_stop();
                 state_.store(SystemState::EStop, std::memory_order_release);
                 vTaskDelay(pdMS_TO_TICKS(100));
@@ -228,6 +258,14 @@ namespace sand_table {
             MotionSegment segment;
             if (segment_queue_.pop(segment)) {
                 // Motor steps already calculated in enqueue_segment() before velocity planning
+
+                // Running reflects actual execution, set HERE. Setting it
+                // from move_to() (the old design) only happened after the
+                // whole move finished planning — a long multi-rotation move
+                // pumps hundreds of split segments through the planner's
+                // backpressure, so move_to() doesn't return (and the state
+                // stayed "Idle") while the table was visibly drawing.
+                state_.store(SystemState::Running, std::memory_order_release);
 
                 // Execute segment with trapezoidal velocity profile
                 auto result = execute_segment(segment);
@@ -275,13 +313,17 @@ namespace sand_table {
             return;  // Not calibrated yet
         }
 
-        // Calculate rho adjustment per theta rotation (due to coupling)
-        // When theta motor rotates once (EFFECTIVE_STEPS_PER_REV steps), rho moves
-        // by EFFECTIVE_STEPS_PER_REV / THETA_GEAR_RATIO steps due to mechanical coupling.
-
+        // Calculate rho adjustment per theta rotation (due to coupling).
+        // The coupling counteraction accumulated by the transformer over one
+        // theta rotation is theta_rot / gear_ratio steps, so that is exactly
+        // what must be unwound per wrap. Using the compile-time
+        // EFFECTIVE_STEPS_PER_REV here (the old code) is only correct when
+        // the calibrated theta_rot happens to equal the nominal
+        // gear_ratio * steps_per_rev — any calibration/config difference
+        // injected a rho error on every wrap.
         const int32_t rho_per_theta_rot = static_cast<int32_t>(
-            MechanicalConfig::EFFECTIVE_STEPS_PER_REV
-            );
+            std::lround(static_cast<double>(theta_rot) /
+                MechanicalConfig::theta_gear_ratio()));
 
         bool wrapped = false;
 
@@ -332,6 +374,14 @@ namespace sand_table {
             return Result<void>::err(MotionError::InvalidState);
         }
 
+        // Homing runs in the CALLER's task while the stepper task keeps
+        // consuming the segment queue. Stop playback and drain queued
+        // segments first, or a queued move executes concurrently with the
+        // homing seeks on the same sequencer. move_to()/move_linear() reject
+        // new moves while state is Homing (below), so nothing refills the
+        // queue mid-homing.
+        halt_and_drain();
+
         state_.store(SystemState::Homing, std::memory_order_release);
         enable_motors();
 
@@ -342,6 +392,12 @@ namespace sand_table {
 
             // Pass calibration values to coordinate transformer
             transformer_->set_calibration(
+                homing_controller_->theta_steps_per_rotation(),
+                homing_controller_->rho_max_steps()
+            );
+
+            // The path planner splits moves against the real step scales
+            path_planner_->set_calibration(
                 homing_controller_->theta_steps_per_rotation(),
                 homing_controller_->rho_max_steps()
             );
@@ -369,6 +425,7 @@ namespace sand_table {
     void MotionController::_set_homed(int32_t theta_steps_per_rot, int32_t rho_max) {
         homing_controller_->_set_homed(theta_steps_per_rot, rho_max);
         transformer_->set_calibration(theta_steps_per_rot, rho_max);
+        path_planner_->set_calibration(theta_steps_per_rot, rho_max);
 
         theta_stepper_->set_position(0);
         rho_stepper_->set_position(0);
@@ -391,6 +448,11 @@ namespace sand_table {
             return Result<void>::err(MotionError::EmergencyStop);
         }
 
+        // No new moves while homing owns the sequencer (see home())
+        if (state_.load(std::memory_order_acquire) == SystemState::Homing) {
+            return Result<void>::err(MotionError::InvalidState);
+        }
+
         // Check bounds
         if (!is_in_bounds(target)) {
             ESP_LOGW(TAG, "Target out of bounds: theta=%.4f, rho=%.4f", target.theta, target.rho);
@@ -409,15 +471,15 @@ namespace sand_table {
         ESP_LOGD(TAG, "Queueing polar move: (%.4f, %.4f) -> (%.4f, %.4f) @ %.1f RPM",
             current.theta, current.rho, target.theta, target.rho, actual_feedrate);
 
+        // Enable motors BEFORE planning: plan_polar_move blocks on planner
+        // backpressure for long moves, and execution starts consuming
+        // segments while we are still inside it. (SystemState::Running is
+        // set by the stepper task when it actually executes — see
+        // stepper_task_loop.)
+        enable_motors();
+
         // Plan direct polar move (arcs in XY space)
-        auto result = path_planner_->plan_polar_move(current, target, actual_feedrate);
-
-        if (result.is_ok()) {
-            enable_motors();
-            state_.store(SystemState::Running, std::memory_order_release);
-        }
-
-        return result;
+        return path_planner_->plan_polar_move(current, target, actual_feedrate);
     }
 
     Result<void> MotionController::move_linear(const PolarPosition& target, float feedrate) {
@@ -427,6 +489,11 @@ namespace sand_table {
 
         if (emergency_stop_.load(std::memory_order_acquire)) {
             return Result<void>::err(MotionError::EmergencyStop);
+        }
+
+        // No new moves while homing owns the sequencer (see home())
+        if (state_.load(std::memory_order_acquire) == SystemState::Homing) {
+            return Result<void>::err(MotionError::InvalidState);
         }
 
         // Check bounds
@@ -447,15 +514,12 @@ namespace sand_table {
         ESP_LOGD(TAG, "Queueing linear move: (%.4f, %.4f) -> (%.4f, %.4f) @ %.1f RPM",
             current.theta, current.rho, target.theta, target.rho, actual_feedrate);
 
+        // Enable motors before planning; Running is set by the stepper task
+        // on actual execution (see move_to / stepper_task_loop).
+        enable_motors();
+
         // Plan Cartesian-interpolated move (straight lines in XY space)
-        auto result = path_planner_->plan_linear_move(current, target, actual_feedrate);
-
-        if (result.is_ok()) {
-            enable_motors();
-            state_.store(SystemState::Running, std::memory_order_release);
-        }
-
-        return result;
+        return path_planner_->plan_linear_move(current, target, actual_feedrate);
     }
 
     void MotionController::pause() {
@@ -468,6 +532,37 @@ namespace sand_table {
         ESP_LOGI(TAG, "Motion resumed");
     }
 
+    void MotionController::halt_and_drain() {
+        // No stepper task -> nothing queued, nothing to acknowledge the
+        // drain flag (it would just stall the 5s wait below).
+        if (!running_.load(std::memory_order_acquire)) {
+            return;
+        }
+
+        // Refuse new segments so a task blocked mid-plan unwinds
+        abort_planning_.store(true, std::memory_order_release);
+
+        // Ask the stepper task to drain, and interrupt the blocking
+        // execute() so it gets there promptly. The sequencer only raises a
+        // flag here; the hardware abort happens inside execute() in the
+        // stepper task's own context.
+        drain_requested_.store(true, std::memory_order_release);
+        stepper_controller_->emergency_stop();
+
+        // Wait for the stepper task to acknowledge (it clears the flag).
+        // Bounded: the in-flight chunk is at most ~2s even at minimum speed.
+        for (int i = 0; i < 500 && drain_requested_.load(std::memory_order_acquire); ++i) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        if (drain_requested_.load(std::memory_order_acquire)) {
+            ESP_LOGE(TAG, "halt_and_drain: stepper task did not acknowledge");
+            drain_requested_.store(false, std::memory_order_release);
+        }
+
+        abort_planning_.store(false, std::memory_order_release);
+        ESP_LOGI(TAG, "Motion halted and queues drained");
+    }
+
     void MotionController::emergency_stop() {
         emergency_stop_.store(true, std::memory_order_release);
         stepper_controller_->emergency_stop();
@@ -477,6 +572,8 @@ namespace sand_table {
 
     void MotionController::clear_emergency_stop() {
         emergency_stop_.store(false, std::memory_order_release);
+        // Queued segments were discarded — replan from the physical position
+        path_planner_->set_current_position(get_position());
         state_.store(SystemState::Idle, std::memory_order_release);
         ESP_LOGI(TAG, "Emergency stop cleared");
     }
@@ -499,31 +596,52 @@ namespace sand_table {
             segment.delta_rho_steps
         );
 
-        // Track total steps queued for progress reporting
-        // Use the maximum of theta/rho steps (major axis determines segment duration)
-        uint32_t segment_steps = static_cast<uint32_t>(
-            std::max(std::abs(segment.delta_theta_steps), std::abs(segment.delta_rho_steps))
-        );
-        total_steps_queued_.fetch_add(segment_steps, std::memory_order_relaxed);
-
-        // Push segment to velocity planner for lookahead processing
-        // VelocityPlanner calculates entry/exit velocities based on motor directions
-        while (velocity_planner_->full()) {
+        // Backpressure: wait for planner space, but bail out if a stop/drain
+        // is in progress — refilling a planner that is being drained would
+        // deadlock the busy-wait (the drain empties it, we refill it).
+        for (;;) {
+            if (abort_planning_.load(std::memory_order_acquire) ||
+                emergency_stop_.load(std::memory_order_acquire)) {
+                return false;
+            }
+            if (xSemaphoreTake(planner_mutex_, pdMS_TO_TICKS(100)) != pdTRUE) {
+                continue;
+            }
+            if (!velocity_planner_->full()) {
+                break;  // mutex held, space available
+            }
+            xSemaphoreGive(planner_mutex_);
             vTaskDelay(pdMS_TO_TICKS(10));
         }
-        return velocity_planner_->add_segment(segment);
+
+        const bool added = velocity_planner_->add_segment(segment);
+        xSemaphoreGive(planner_mutex_);
+
+        if (added) {
+            // Track total steps queued for progress reporting
+            // (major axis determines segment duration)
+            uint32_t segment_steps = static_cast<uint32_t>(
+                std::max(std::abs(segment.delta_theta_steps), std::abs(segment.delta_rho_steps))
+            );
+            total_steps_queued_.fetch_add(segment_steps, std::memory_order_relaxed);
+        }
+        return added;
     }
 
     void MotionController::transfer_ready_segments() {
         // Transfer all available segments from velocity planner to execution queue
         // Lookahead works naturally: if segments queue faster than execution,
         // velocity planner calculates junction velocities before transfer
+        if (xSemaphoreTake(planner_mutex_, pdMS_TO_TICKS(100)) != pdTRUE) {
+            return;  // Retry next loop iteration
+        }
         while (!velocity_planner_->empty() && !segment_queue_.full()) {
             auto popped = velocity_planner_->pop_segment();
             if (popped) {
                 (void)segment_queue_.push(*popped);  // Already checked !full() above
             }
         }
+        xSemaphoreGive(planner_mutex_);
     }
 
     Result<void> MotionController::execute_segment(const MotionSegment& segment) {
@@ -575,6 +693,9 @@ namespace sand_table {
         progress.steps_queued = total_steps_queued_.load(std::memory_order_acquire);
         progress.steps_completed = total_steps_completed_.load(std::memory_order_acquire);
         progress.segments_queued = segment_queue_.size();
+        // Advisory single-word read; exactness is not required here and the
+        // planner mutex must not block a status getter.
+        progress.planner_pending = velocity_planner_->segment_count();
 
         // Get current segment progress from stepper controller
         if (stepper_controller_) {

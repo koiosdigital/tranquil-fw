@@ -197,7 +197,10 @@ components:
     DownloadedPatterns:
       name: DownloadedPatterns
       title: Downloaded Patterns
-      summary: List of all downloaded patterns
+      summary: >-
+        List of all downloaded patterns. Sent in response to
+        DownloadedPatternsRequest, and also broadcast unsolicited to all local
+        clients when a cloud pattern download completes.
       payload:
         $ref: '#/components/schemas/DownloadedPatterns'
 

@@ -19,8 +19,16 @@ public:
 
     std::vector<Kd__V1__TranquilMessage__MessageCase> supportedMessages() const override;
 
+    // Called from the job-completion hook when a cloud download job finishes.
+    // Clears the origin-socket tracking and, on success, broadcasts the
+    // updated pattern list to all local websocket clients.
+    void notifyPatternDownloadComplete(const std::string& pattern_uuid, bool success);
+
 private:
     PatternHandler() = default;
+
+    // Builds a DownloadedPatterns message from the manifest
+    ResponseMessage buildPatternListMessage();
 
     // Individual message handlers
     HandleResult handleDownloadedPatternsRequest(ResponseMessage& response);

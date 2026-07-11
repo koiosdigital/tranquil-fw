@@ -39,7 +39,10 @@ public:
 
     // Job status updates (by internal ID)
     esp_err_t markCompleted(uint32_t job_id);
-    esp_err_t markFailed(uint32_t job_id, const std::string& error);
+    // permanent=true skips retries and sends the job straight to Failed
+    esp_err_t markFailed(uint32_t job_id, const std::string& error, bool permanent = false);
+    // Put a claimed job back to Pending without incrementing retry_count
+    esp_err_t releaseJob(uint32_t job_id);
 
     // Query
     std::optional<Job> getJob(uint32_t job_id);

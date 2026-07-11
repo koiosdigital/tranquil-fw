@@ -50,8 +50,6 @@ esp_err_t ManifestDatabase::initialize() {
         }
     }
 
-    kdc_heap_log_status("post-sd-init");
-
     // Allocate scratch buffer from SPIRAM
     impl_->scratch = static_cast<uint8_t*>(
         heap_caps_malloc(Impl::SCRATCH_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
@@ -135,12 +133,7 @@ esp_err_t ManifestDatabase::initialize() {
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "Registered 3 entity types: Pattern, Playlist, Job");
-
-    kdc_heap_log_status("post-init");
-
     impl_->initialized = true;
-    ESP_LOGI(TAG, "Initialized with TQDB (8KB scratch buffer)");
     return ESP_OK;
 }
 
@@ -148,7 +141,9 @@ void ManifestDatabase::shutdown() {
     if (!impl_->initialized) return;
 
     if (impl_->db) {
-        // WAL buffer is freed by tqdb_close (flushes pending entries first)
+        // tqdb_close flushes pending WAL entries but does NOT free
+        // user-provided buffers (owns_mem_buf=false) — wal_buf/scratch
+        // stay ours to free below. Do not remove those frees.
         tqdb_close(impl_->db);
         impl_->db = nullptr;
     }

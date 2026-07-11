@@ -8,7 +8,45 @@
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include <cstdlib>
 #include <new>
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Heap scratch for trait read functions
+//
+// TQDB_MAX_STRING_LEN is 4KB — a stack buffer that size overflows the small
+// tasks these readers run on (app_main is 3584 bytes, job workers 4KB var).
+// tqdb_read_str preserves stream framing when the buffer is too small, so
+// the tiny OOM fallback truncates string fields instead of derailing the
+// read or crashing.
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+struct StringScratch {
+    char* buf;
+    size_t size;
+    char fallback[64];
+
+    StringScratch() {
+        buf = static_cast<char*>(
+            heap_caps_malloc(TQDB_MAX_STRING_LEN, MALLOC_CAP_SPIRAM));
+        if (!buf) {
+            buf = static_cast<char*>(malloc(TQDB_MAX_STRING_LEN));
+        }
+        if (buf) {
+            size = TQDB_MAX_STRING_LEN;
+        } else {
+            buf = fallback;
+            size = sizeof(fallback);
+        }
+    }
+    ~StringScratch() {
+        if (buf != fallback) free(buf);
+    }
+    StringScratch(const StringScratch&) = delete;
+    StringScratch& operator=(const StringScratch&) = delete;
+};
+} // namespace
 
 // ─────────────────────────────────────────────────────────────────────────────
 // FreeRTOS Mutex Wrapper for TQDB
@@ -77,6 +115,10 @@ static void pattern_destroy(void* entity) {
     static_cast<Pattern*>(entity)->~Pattern();  // Explicit destructor
 }
 
+static void pattern_copy(void* dst, const void* src) {
+    new (dst) Pattern(*static_cast<const Pattern*>(src));
+}
+
 static uint32_t pattern_get_id(const void* entity) {
     return static_cast<const Pattern*>(entity)->id;
 }
@@ -108,13 +150,14 @@ static void pattern_write(tqdb_writer_t* w, const void* entity) {
 
 static void pattern_read(tqdb_reader_t* r, void* entity) {
     Pattern* p = static_cast<Pattern*>(entity);
-    char buf[TQDB_MAX_STRING_LEN];
+    StringScratch scratch;
+    char* buf = scratch.buf;
 
     p->id = tqdb_read_u32(r);
-    tqdb_read_str(r, buf, sizeof(buf)); p->external_uuid = buf;
-    tqdb_read_str(r, buf, sizeof(buf)); p->name = buf;
-    tqdb_read_str(r, buf, sizeof(buf)); p->creator = buf;
-    tqdb_read_str(r, buf, sizeof(buf)); p->date = buf;
+    tqdb_read_str(r, buf, scratch.size); p->external_uuid = buf;
+    tqdb_read_str(r, buf, scratch.size); p->name = buf;
+    tqdb_read_str(r, buf, scratch.size); p->creator = buf;
+    tqdb_read_str(r, buf, scratch.size); p->date = buf;
     p->popularity = tqdb_read_i32(r);
     uint8_t flags = tqdb_read_u8(r);
     p->reversible = flags & 0x01;
@@ -122,11 +165,11 @@ static void pattern_read(tqdb_reader_t* r, void* entity) {
     p->purchased = flags & 0x04;
     p->start_point = tqdb_read_i32(r);
     p->size_bytes = static_cast<size_t>(tqdb_read_i64(r));
-    tqdb_read_str(r, buf, sizeof(buf)); p->created_at = buf;
-    tqdb_read_str(r, buf, sizeof(buf)); p->last_played_at = buf;
-    tqdb_read_str(r, buf, sizeof(buf)); p->downloaded_at = buf;
+    tqdb_read_str(r, buf, scratch.size); p->created_at = buf;
+    tqdb_read_str(r, buf, scratch.size); p->last_played_at = buf;
+    tqdb_read_str(r, buf, scratch.size); p->downloaded_at = buf;
     p->purchased_at = tqdb_read_i64(r);
-    tqdb_read_str(r, buf, sizeof(buf)); p->receipt_id = buf;
+    tqdb_read_str(r, buf, scratch.size); p->receipt_id = buf;
 }
 
 static void pattern_skip(tqdb_reader_t* r) {
@@ -156,7 +199,8 @@ const tqdb_trait_t g_pattern_trait = {
     .set_id = pattern_set_id,
     .init = pattern_init,
     .destroy = pattern_destroy,
-    .skip = pattern_skip
+    .skip = pattern_skip,
+    .copy = pattern_copy
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -169,6 +213,10 @@ static void playlist_init(void* entity) {
 
 static void playlist_destroy(void* entity) {
     static_cast<Playlist*>(entity)->~Playlist();
+}
+
+static void playlist_copy(void* dst, const void* src) {
+    new (dst) Playlist(*static_cast<const Playlist*>(src));
 }
 
 static uint32_t playlist_get_id(const void* entity) {
@@ -199,16 +247,17 @@ static void playlist_write(tqdb_writer_t* w, const void* entity) {
 
 static void playlist_read(tqdb_reader_t* r, void* entity) {
     Playlist* pl = static_cast<Playlist*>(entity);
-    char buf[TQDB_MAX_STRING_LEN];
+    StringScratch scratch;
+    char* buf = scratch.buf;
 
     pl->id = tqdb_read_u32(r);
-    tqdb_read_str(r, buf, sizeof(buf)); pl->external_uuid = buf;
-    tqdb_read_str(r, buf, sizeof(buf)); pl->name = buf;
-    tqdb_read_str(r, buf, sizeof(buf)); pl->description = buf;
+    tqdb_read_str(r, buf, scratch.size); pl->external_uuid = buf;
+    tqdb_read_str(r, buf, scratch.size); pl->name = buf;
+    tqdb_read_str(r, buf, scratch.size); pl->description = buf;
     pl->featured_pattern_id = tqdb_read_u32(r);
-    tqdb_read_str(r, buf, sizeof(buf)); pl->date = buf;
-    tqdb_read_str(r, buf, sizeof(buf)); pl->created_at = buf;
-    tqdb_read_str(r, buf, sizeof(buf)); pl->updated_at = buf;
+    tqdb_read_str(r, buf, scratch.size); pl->date = buf;
+    tqdb_read_str(r, buf, scratch.size); pl->created_at = buf;
+    tqdb_read_str(r, buf, scratch.size); pl->updated_at = buf;
 
     // Read pattern IDs array
     uint32_t count = tqdb_read_u32(r);
@@ -246,7 +295,8 @@ const tqdb_trait_t g_playlist_trait = {
     .set_id = playlist_set_id,
     .init = playlist_init,
     .destroy = playlist_destroy,
-    .skip = playlist_skip
+    .skip = playlist_skip,
+    .copy = playlist_copy
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -259,6 +309,10 @@ static void job_init(void* entity) {
 
 static void job_destroy(void* entity) {
     static_cast<jobs::Job*>(entity)->~Job();
+}
+
+static void job_copy(void* dst, const void* src) {
+    new (dst) jobs::Job(*static_cast<const jobs::Job*>(src));
 }
 
 static uint32_t job_get_id(const void* entity) {
@@ -288,21 +342,22 @@ static void job_write(tqdb_writer_t* w, const void* entity) {
 
 static void job_read(tqdb_reader_t* r, void* entity) {
     jobs::Job* j = static_cast<jobs::Job*>(entity);
-    char buf[TQDB_MAX_STRING_LEN];
+    StringScratch scratch;
+    char* buf = scratch.buf;
 
     j->id = tqdb_read_u32(r);
-    tqdb_read_str(r, buf, sizeof(buf)); j->type = jobs::jobTypeFromString(buf);
+    tqdb_read_str(r, buf, scratch.size); j->type = jobs::jobTypeFromString(buf);
     j->pattern_id = tqdb_read_u32(r);
-    tqdb_read_str(r, buf, sizeof(buf)); j->pattern_external_uuid = buf;
-    tqdb_read_str(r, buf, sizeof(buf)); j->status = jobs::jobStatusFromString(buf);
+    tqdb_read_str(r, buf, scratch.size); j->pattern_external_uuid = buf;
+    tqdb_read_str(r, buf, scratch.size); j->status = jobs::jobStatusFromString(buf);
     j->priority = tqdb_read_i32(r);
     j->retry_count = tqdb_read_i32(r);
     j->max_retries = tqdb_read_i32(r);
-    tqdb_read_str(r, buf, sizeof(buf)); j->created_at = buf;
-    tqdb_read_str(r, buf, sizeof(buf)); j->started_at = buf;
-    tqdb_read_str(r, buf, sizeof(buf)); j->completed_at = buf;
-    tqdb_read_str(r, buf, sizeof(buf)); j->error_message = buf;
-    tqdb_read_str(r, buf, sizeof(buf)); j->job_data = buf;
+    tqdb_read_str(r, buf, scratch.size); j->created_at = buf;
+    tqdb_read_str(r, buf, scratch.size); j->started_at = buf;
+    tqdb_read_str(r, buf, scratch.size); j->completed_at = buf;
+    tqdb_read_str(r, buf, scratch.size); j->error_message = buf;
+    tqdb_read_str(r, buf, scratch.size); j->job_data = buf;
 }
 
 static void job_skip(tqdb_reader_t* r) {
@@ -331,5 +386,6 @@ const tqdb_trait_t g_job_trait = {
     .set_id = job_set_id,
     .init = job_init,
     .destroy = job_destroy,
-    .skip = job_skip
+    .skip = job_skip,
+    .copy = job_copy
 };

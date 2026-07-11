@@ -82,6 +82,14 @@ public:
         DownloadCallback callback = nullptr);
 
     /**
+     * @brief Fire the completion callback registered for a pattern (if any)
+     *
+     * Called by the job-completion hook when a download job finishes.
+     */
+    void notifyDownloadComplete(const std::string& pattern_uuid,
+        bool success, const std::string& error);
+
+    /**
      * @brief Cancel a pending download job
      */
     bool cancelDownload(const std::string& pattern_uuid);

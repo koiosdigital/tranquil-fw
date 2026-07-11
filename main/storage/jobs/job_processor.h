@@ -3,6 +3,7 @@
 #include "job_types.h"
 #include <memory>
 #include <atomic>
+#include <functional>
 #include <unordered_map>
 
 namespace jobs {
@@ -25,6 +26,13 @@ struct JobProcessorConfig {
     uint32_t poll_interval_ms = 5000;   // Poll interval
     size_t worker_stack_size = 12288;   // Stack for worker tasks
     int worker_priority = 4;            // Task priority
+
+    // Invoked from the worker task after a job's status has been persisted
+    // (markCompleted/markFailed), and ONLY when the job is final: completed,
+    // failed permanently, or failed with retries exhausted. Intermediate
+    // failures that will be retried do not fire this. Keep it light: it runs
+    // on the worker's stack and delays the next job slot until it returns.
+    std::function<void(const Job&, const JobResult&)> on_job_complete;
 };
 
 /**

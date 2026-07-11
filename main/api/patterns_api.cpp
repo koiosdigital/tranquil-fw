@@ -11,6 +11,7 @@
 #include "jobs/job_processor.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "raii_utils.hpp"
 #include <string.h>
 #include <stdlib.h>
 #include <sys/stat.h>
@@ -23,7 +24,7 @@
 static const char* TAG = "patterns_api";
 
 // Upload constants
-static constexpr size_t UPLOAD_CHUNK_SIZE = 8 * 1024;  // HTTP server stack is 8KB (set in kd_common)
+static constexpr size_t UPLOAD_CHUNK_SIZE = 8 * 1024;  // heap-allocated per upload (too big for the 8KB httpd stack)
 static constexpr size_t MAX_BOUNDARY_SIZE = 128;
 static constexpr size_t MAX_FILENAME_SIZE = 256;
 static constexpr size_t MAX_HEADER_SIZE = 1024;
@@ -225,11 +226,28 @@ static esp_err_t patterns_list_handler(httpd_req_t* req) {
 static esp_err_t patterns_upload_handler(httpd_req_t* req) {
     esp_err_t ret = ESP_OK;
 
-    // Stack-allocate buffers (total ~5.7KB - fits HTTP server 8KB stack)
+    // The receive buffer alone is UPLOAD_CHUNK_SIZE (8KB) — the same size as
+    // the entire httpd task stack — so the big buffers must live on the heap
+    // (SPIRAM preferred). Only small state stays on the stack.
     UploadContext ctx_storage = {};
     UploadContext* ctx = &ctx_storage;
-    char header_buf[MAX_HEADER_SIZE] = { 0 };
-    char buffer[UPLOAD_CHUNK_SIZE];
+    char* header_buf = static_cast<char*>(
+        heap_caps_malloc(MAX_HEADER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    char* buffer = static_cast<char*>(
+        heap_caps_malloc(UPLOAD_CHUNK_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!header_buf || !buffer) {
+        ESP_LOGE(TAG, "Failed to allocate upload buffers");
+        free(header_buf);
+        free(buffer);
+        httpd_resp_send_500(req);
+        return ESP_ERR_NO_MEM;
+    }
+    memset(header_buf, 0, MAX_HEADER_SIZE);
+    // RAII so every return path below releases the buffers.
+    auto buffers_guard = raii::make_scope_guard([&] {
+        free(header_buf);
+        free(buffer);
+    });
 
     // Extract multipart boundary
     if (!extract_boundary(req, ctx->boundary, sizeof(ctx->boundary))) {
@@ -465,13 +483,18 @@ static esp_err_t patterns_upload_handler(httpd_req_t* req) {
     cJSON_AddStringToObject(response, "message", "Pattern uploaded, conversion in progress");
 
     char* json_str = cJSON_PrintUnformatted(response);
+    cJSON_Delete(response);
+    if (!json_str) {
+        // Upload already succeeded — the response just couldn't be built.
+        httpd_resp_send_500(req);
+        return ESP_ERR_NO_MEM;
+    }
 
     httpd_resp_set_status(req, "200 OK");
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json_str, strlen(json_str));
 
     free(json_str);
-    cJSON_Delete(response);
 
     return ESP_OK;
 }
@@ -585,10 +608,16 @@ static esp_err_t patterns_download_handler(httpd_req_t* req) {
         return ESP_FAIL;
     }
 
-    // Get file size
+    // Get file size (ftell returns long and -1 on failure)
     fseek(f, 0, SEEK_END);
-    size_t file_size = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    long file_pos = ftell(f);
+    if (file_pos < 0 || fseek(f, 0, SEEK_SET) != 0) {
+        ESP_LOGE(TAG, "Failed to determine size of %s", file_path);
+        fclose(f);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    size_t file_size = static_cast<size_t>(file_pos);
 
     // Set response headers (no Content-Length when using chunked transfer)
     httpd_resp_set_type(req, "application/octet-stream");
@@ -676,10 +705,21 @@ static esp_err_t pattern_thumb_handler(httpd_req_t* req) {
         // uuid is external_uuid
         auto pattern = ManifestDatabase::instance().getPatternByExternalUuid(uuid);
         if (pattern && !jobs::JobQueue::instance().hasJobForPatternId(pattern->id, jobs::JobType::Thumbnail)) {
-            jobs::ThumbnailJobData data;
-            data.encrypted = pattern->encrypted;
-            data.output_path = thumb_path;
-            jobs::JobQueue::instance().enqueueThumbnail(pattern->id, data, 0);
+            // Only enqueue if the pattern's .dat file actually exists —
+            // otherwise the job is doomed and every 404 would re-enqueue it.
+            char dat_path[128];
+            getPatternFilePath(pattern->external_uuid, pattern->encrypted, dat_path, sizeof(dat_path));
+            struct stat dat_st;
+            if (stat(dat_path, &dat_st) == 0) {
+                jobs::ThumbnailJobData data;
+                data.encrypted = pattern->encrypted;
+                data.output_path = thumb_path;
+                jobs::JobQueue::instance().enqueueThumbnail(pattern->id, data, 0);
+            }
+            else {
+                ESP_LOGW(TAG, "Thumbnail requested for %s but pattern file %s is missing",
+                    uuid, dat_path);
+            }
         }
         httpd_resp_send_404(req);
         return ESP_FAIL;

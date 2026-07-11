@@ -79,6 +79,14 @@ public:
     bool hasMore() const override;
     esp_err_t rewind() override;
 
+    /**
+     * @brief Invalidate (zeroize) the static per-UUID AES key cache
+     *
+     * Called when the license is cleared/reloaded so cached key material
+     * doesn't outlive the authorization state it was recovered under.
+     */
+    static void invalidateKeyCache();
+
 private:
     static constexpr const char* PATTERNS_PATH = "/sd/patterns";
 
@@ -88,7 +96,8 @@ private:
     // Header info (stored for rewind)
     EncryptedPatternHeader header_;
 
-    // AES key kept in memory for lifetime of reader
+    // Raw AES key staging buffer: only holds the key between recovery and
+    // PSA import, then is zeroized (rewind/seek use aes_key_id_ instead)
     uint8_t aes_key_[DRM_AES_KEY_BYTES];
     bool has_key_ = false;
 
@@ -108,6 +117,11 @@ private:
     // Point tracking
     size_t current_point_ = 0;
 
+    // Terminal read/decrypt failure: once the file offset and CTR keystream
+    // can no longer be trusted to be in sync, hasMore() returns false so
+    // playback ends cleanly instead of spinning on garbage.
+    bool read_failed_ = false;
+
     // Peek support
     bool has_peeked_ = false;
     PatternPoint peeked_point_;
@@ -117,7 +131,7 @@ private:
     PatternPoint readBinaryPoint();
 
     // Streaming helpers
-    esp_err_t openFile(const char* path);
+    esp_err_t openFile(const char* path, const char* uuid);
     esp_err_t initDecryption();
     esp_err_t importAesKey();
     esp_err_t startCipherAtPosition(size_t byte_position);

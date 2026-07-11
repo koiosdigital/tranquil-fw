@@ -107,6 +107,18 @@ namespace sand_table {
         static constexpr float JUNCTION_DEVIATION_MM = 0.05f;
         static constexpr uint32_t MOTOR_INACTIVITY_TIMEOUT_MS = 5000;
 
+        // Hard cap on major-axis steps per motion segment. Sized so the
+        // interval table (MAX_SEGMENT_STEPS * sizeof(uint16_t)) fits in
+        // internal RAM — the RMT TX-done ISR reads it, and ISR-time access
+        // to SPIRAM crashes if flash cache is disabled (e.g. NVS commit).
+        // The path planner splits longer moves; the stepper controller
+        // REJECTS (never silently truncates) segments that exceed this.
+        static constexpr uint32_t MAX_SEGMENT_STEPS = 8192;
+
+        // Per-motor step acceleration used for the per-segment trapezoid
+        // profile (steps/s^2). This is the knob that actually shapes ramps.
+        static constexpr float STEP_ACCEL_STEPS_S2 = 10000.0f;
+
         // Legacy constexpr for compile-time contexts (uses defaults)
         static constexpr int32_t THETA_MAX_SPEED_RPM = kDefaultThetaMaxRpm;
         static constexpr int32_t RHO_MAX_SPEED_RPM = kDefaultRhoMaxRpm;

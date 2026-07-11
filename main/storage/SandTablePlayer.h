@@ -12,6 +12,7 @@
 #include <vector>
 #include <optional>
 #include <memory>
+#include <atomic>
 
 #define MAX_UUID_LEN 64
 #define MAX_LINE_BUFFER_SIZE 512
@@ -43,8 +44,15 @@ struct PatternLine {
 
 // Tracks previous position for pattern playback
 struct PatternPosition {
-    double prev_theta = 0.0;
+    double prev_theta = 0.0;   // Last COMMANDED theta (after offset), radians
     double prev_rho = 0.0;
+    // Constant per-pattern rebase set at the first line: shifts the file's
+    // absolute theta so its first point lands within half a turn of the
+    // table's current position (same angle modulo 2π) instead of physically
+    // unwinding however far the file's theta had accumulated when authored.
+    // In-pattern multi-rotation jumps are NOT folded - they play in full at
+    // kFoldedMoveSpeedMultiplier (see processPatternLine).
+    double theta_offset = 0.0;
 };
 
 struct PlaybackStatus {
@@ -89,6 +97,12 @@ public:
     static esp_err_t setLoop(bool loop);
     static bool isLoop();
 
+    // Route pattern moves through move_linear() (Cartesian interpolation:
+    // straight lines in XY) instead of move_to() (direct polar: arcs).
+    // Default off - theta-rho files are authored for polar interpolation.
+    static void setLinearInterpolation(bool enabled);
+    static bool isLinearInterpolation();
+
     // Status
     static PlaybackState getPlaybackState();
     static PlayMode getPlayMode();
@@ -129,7 +143,8 @@ private:
 
     // Motion processing
     static bool processPatternLine(const PatternLine& line);
-    static void sendMoveCommand(double theta_rad, double rho_normalized);
+    static void sendMoveCommand(double theta_rad, double rho_normalized,
+                                float speed_multiplier = 1.0f);
 
     // State
     static sand_table::MotionController* motion_controller_;
@@ -137,6 +152,11 @@ private:
     static TaskHandle_t service_task_handle_;
     static SemaphoreHandle_t state_mutex_;
     static SemaphoreHandle_t file_mutex_;
+    // Shutdown handshake: shutdown() sets shutdown_requested_ and waits for
+    // the service task to acknowledge via service_task_exited_ before any
+    // mutex is deleted (deleting a mutex a task holds is undefined).
+    static std::atomic<bool> shutdown_requested_;
+    static std::atomic<bool> service_task_exited_;
 
     // Playback state
     static PlaybackState playback_state_;
@@ -161,12 +181,23 @@ private:
     // Pattern position tracking
     static PatternPosition pattern_position_;
 
-    // Configuration
-    static double feed_rate_;
+    // Configuration. Atomic: written from API threads, read by the service
+    // task mid-feed without the state mutex (a plain double store/load can
+    // tear on this target).
+    static std::atomic<double> feed_rate_;
+    static std::atomic<bool> linear_interpolation_;
+
+    // Speed multiplier for moves that had full rotations folded out of them
+    // (transit moves, not drawing) - hurry through, don't draw slowly.
+    static constexpr float kFoldedMoveSpeedMultiplier = 3.0f;
 
     // Constants
     static const char* TAG;
     static constexpr uint32_t SERVICE_TASK_DELAY_MS = 10;
+    // Upper bound on pattern lines fed per service tick — keeps one tick's
+    // work bounded while still saturating the motion queue (the queue-full
+    // return from processPatternLine is the real throttle).
+    static constexpr int kMaxLinesPerTick = 64;
     static constexpr size_t SERVICE_TASK_STACK_SIZE = 8192;
     static constexpr UBaseType_t SERVICE_TASK_PRIORITY = 5;
 };

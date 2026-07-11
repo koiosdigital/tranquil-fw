@@ -6,6 +6,8 @@
 #include "thumbnail/bezier_renderer.h"
 #include "thumbnail/png_encoder.h"
 #include "esp_log.h"
+#include <cerrno>
+#include <cstdio>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <memory>
@@ -15,10 +17,11 @@ static const char* TAG = "ThumbnailExecutor";
 namespace jobs {
 
 JobResult ThumbnailExecutor::execute(const Job& job) {
-    // Get pattern by internal ID to find external_uuid
+    // Get pattern by internal ID to find external_uuid — a row that doesn't
+    // exist now will not exist on retry either
     auto pattern = ManifestDatabase::instance().getPattern(job.pattern_id);
     if (!pattern) {
-        return JobResult::fail("Pattern not found");
+        return JobResult::fail_permanent("Pattern not found");
     }
     const std::string& pattern_uuid = pattern->external_uuid;
 
@@ -57,13 +60,22 @@ JobResult ThumbnailExecutor::renderPattern(const std::string& pattern_uuid,
     // Open pattern file
     esp_err_t err = reader->open(pattern_uuid.c_str());
     if (err != ESP_OK) {
+        // If the .dat file is simply gone, no amount of retrying will bring
+        // it back — fail permanently instead of burning retries.
+        char dat_path[128];
+        snprintf(dat_path, sizeof(dat_path), "/sd/patterns/%s.dat", pattern_uuid.c_str());
+        struct stat dat_st;
+        errno = 0;
+        if (stat(dat_path, &dat_st) != 0 && errno == ENOENT) {
+            return JobResult::fail_permanent("Pattern file missing: " + std::string(dat_path));
+        }
         return JobResult::fail("Failed to open pattern file");
     }
 
     size_t total_points = reader->getTotalLines();
     if (total_points == 0) {
         reader->close();
-        return JobResult::fail("Pattern has no points");
+        return JobResult::fail_permanent("Pattern has no points");
     }
 
     ESP_LOGD(TAG, "Pattern has %zu points", total_points);

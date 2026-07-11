@@ -158,8 +158,11 @@ namespace sand_table {
         gpio_set_drive_capability(theta_step, GPIO_DRIVE_CAP_3);  // 40mA max drive
         gpio_set_drive_capability(rho_step, GPIO_DRIVE_CAP_3);    // 40mA max drive
 
-        // Create completion semaphore
-        completion_sem_ = xSemaphoreCreateBinary();
+        // Pair-completion semaphore. Counting: the ISR gives once per
+        // completed buffer pair (plus stop()-gives), and execute()'s refill
+        // loop may lag behind by a pair - a binary semaphore would merge
+        // those signals and stall the loop.
+        completion_sem_ = xSemaphoreCreateCounting(8, 0);
         if (!completion_sem_) {
             ESP_LOGE(TAG, "Failed to create completion semaphore");
             return Result<void>::err(MotionError::HardwareFault);
@@ -169,7 +172,7 @@ namespace sand_table {
         rmt_tx_channel_config_t theta_config = {
             .gpio_num = theta_step,
             .clk_src = RMT_CLK_SRC_DEFAULT,
-            .resolution_hz = HardwareConfig::RMT_RESOLUTION_HZ,  // 10 MHz
+            .resolution_hz = HardwareConfig::RMT_RESOLUTION_HZ,  // 1 MHz (1 tick = 1us)
             .mem_block_symbols = 64,  // Hardware memory block
             .trans_queue_depth = 8,   // Extra depth for dual-channel queuing
             .intr_priority = 0,
@@ -280,8 +283,8 @@ namespace sand_table {
         initialized_ = false;
     }
 
-    rmt_symbol_word_t IRAM_ATTR RmtStepSequencer::make_step_symbol(uint16_t interval_us) {
-        // At 10 MHz: 1 tick = 100ns, so 1us = 10 ticks
+    rmt_symbol_word_t RmtStepSequencer::make_step_symbol(uint16_t interval_us) {
+        // At 1 MHz: 1 tick = 1us
         constexpr uint32_t TICKS_PER_US = HardwareConfig::RMT_RESOLUTION_HZ / 1000000;
         constexpr uint32_t PULSE_TICKS = HardwareConfig::MIN_STEP_PULSE_US * TICKS_PER_US;
         constexpr uint32_t MAX_DURATION = 32767;  // 15-bit max for RMT symbol duration
@@ -307,7 +310,7 @@ namespace sand_table {
         return symbol;
     }
 
-    rmt_symbol_word_t IRAM_ATTR RmtStepSequencer::make_idle_symbol(uint16_t interval_us) {
+    rmt_symbol_word_t RmtStepSequencer::make_idle_symbol(uint16_t interval_us) {
         // No step pulse - just maintain timing (must use same structure as step symbol)
         constexpr uint32_t TICKS_PER_US = HardwareConfig::RMT_RESOLUTION_HZ / 1000000;
         constexpr uint32_t PULSE_TICKS = HardwareConfig::MIN_STEP_PULSE_US * TICKS_PER_US;
@@ -400,17 +403,12 @@ namespace sand_table {
 
         symbol_counts_[buffer_idx] = count;
 
-        // Update position counters atomically using __atomic builtins
-        // Note: Using __atomic_* instead of std::atomic methods to ensure the code
-        // is inlined and doesn't call into flash-resident library functions (ISR-safe)
-        if (theta_pos_ && theta_steps_encoded > 0) {
-            __atomic_fetch_add(reinterpret_cast<int32_t*>(theta_pos_),
-                theta_steps_encoded * bresenham_->theta_dir, __ATOMIC_RELEASE);
-        }
-        if (rho_pos_ && rho_steps_encoded > 0) {
-            __atomic_fetch_add(reinterpret_cast<int32_t*>(rho_pos_),
-                rho_steps_encoded * bresenham_->rho_dir, __ATOMIC_RELEASE);
-        }
+        // Record this buffer's signed step deltas. They are credited to the
+        // position counters only when the buffer's transmission COMPLETES
+        // (see tx_done_callback) — crediting at encode time ran ~2 chunks
+        // ahead of the motors and desynced position on every aborted segment.
+        buf_theta_delta_[buffer_idx] = theta_steps_encoded * bresenham_->theta_dir;
+        buf_rho_delta_[buffer_idx] = rho_steps_encoded * bresenham_->rho_dir;
     }
 
     bool IRAM_ATTR RmtStepSequencer::tx_done_callback(
@@ -422,11 +420,11 @@ namespace sand_table {
         BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
         // Check for stop request
-        // Using __atomic_* builtins instead of std::atomic methods for ISR safety
+        // Using __atomic_* builtins instead of std::atomic methods for ISR safety.
+        // Only wake execute() - it owns the abort and clears executing_;
+        // clearing it here would let another execute() claim the sequencer
+        // while this one is still mid-abort.
         if (__atomic_load_n(reinterpret_cast<bool*>(&self->stop_requested_), __ATOMIC_ACQUIRE)) {
-            __atomic_store_n(reinterpret_cast<int*>(&self->channels_done_), 0, __ATOMIC_RELEASE);
-            __atomic_store_n(reinterpret_cast<int32_t*>(&self->pending_tx_), 0, __ATOMIC_RELEASE);
-            __atomic_store_n(reinterpret_cast<bool*>(&self->executing_), false, __ATOMIC_RELEASE);
             xSemaphoreGiveFromISR(self->completion_sem_, &xHigherPriorityTaskWoken);
             return xHigherPriorityTaskWoken == pdTRUE;
         }
@@ -447,40 +445,28 @@ namespace sand_table {
         // Decrement pending counter - this transmission pair just completed
         __atomic_fetch_sub(reinterpret_cast<int32_t*>(&self->pending_tx_), 1, __ATOMIC_ACQ_REL);
 
-        // Switch buffer and try to encode next chunk
-        uint8_t next_buffer = self->active_buffer_ ^ 1;
-        self->active_buffer_ = next_buffer;
-        self->encode_chunk(next_buffer);
-
-        if (self->symbol_counts_[next_buffer] > 0) {
-            // Queue next transmission - increment pending counter BEFORE queuing
-            __atomic_fetch_add(reinterpret_cast<int32_t*>(&self->pending_tx_), 1, __ATOMIC_RELEASE);
-
-            rmt_transmit_config_t tx_config = {
-                .loop_count = 0,
-                .flags = {
-                    .eot_level = 0,  // Keep low when done
-                    .queue_nonblocking = true,
-                },
-            };
-
-            // Queue to both channels - sync manager ensures they start together
-            rmt_transmit(self->theta_channel_, self->copy_encoder_,
-                self->theta_symbols_[next_buffer],
-                self->symbol_counts_[next_buffer] * sizeof(rmt_symbol_word_t),
-                &tx_config);
-            rmt_transmit(self->rho_channel_, self->copy_encoder_,
-                self->rho_symbols_[next_buffer],
-                self->symbol_counts_[next_buffer] * sizeof(rmt_symbol_word_t),
-                &tx_config);
+        // Buffers transmit in strict 0,1,0,1... order, so the pair that just
+        // completed is completed_pairs_ & 1. Credit its steps to the position
+        // counters NOW (transmission finished => the motors physically moved),
+        // before encode_chunk below overwrites the buffer's deltas.
+        // __atomic_* builtins keep this inlined and ISR-safe.
+        const uint8_t done_buffer = static_cast<uint8_t>(self->completed_pairs_ & 1);
+        self->completed_pairs_++;
+        if (self->theta_pos_ && self->buf_theta_delta_[done_buffer] != 0) {
+            __atomic_fetch_add(reinterpret_cast<int32_t*>(self->theta_pos_),
+                self->buf_theta_delta_[done_buffer], __ATOMIC_RELEASE);
+        }
+        if (self->rho_pos_ && self->buf_rho_delta_[done_buffer] != 0) {
+            __atomic_fetch_add(reinterpret_cast<int32_t*>(self->rho_pos_),
+                self->buf_rho_delta_[done_buffer], __ATOMIC_RELEASE);
         }
 
-        // Only signal completion when no transmissions pending AND all steps encoded
-        if (__atomic_load_n(reinterpret_cast<int32_t*>(&self->pending_tx_), __ATOMIC_ACQUIRE) == 0 &&
-            self->steps_encoded_ >= self->total_steps_) {
-            __atomic_store_n(reinterpret_cast<bool*>(&self->executing_), false, __ATOMIC_RELEASE);
-            xSemaphoreGiveFromISR(self->completion_sem_, &xHigherPriorityTaskWoken);
-        }
+        // Wake execute()'s refill loop: it re-encodes the freed buffer and
+        // queues the next transmission from task context. rmt_transmit()
+        // uses non-ISR FreeRTOS queue APIs internally, so calling it from
+        // this callback (the old design) corrupted the driver's transaction
+        // queues.
+        xSemaphoreGiveFromISR(self->completion_sem_, &xHigherPriorityTaskWoken);
 
         return xHigherPriorityTaskWoken == pdTRUE;
     }
@@ -490,18 +476,32 @@ namespace sand_table {
         const uint16_t* intervals,
         uint32_t total_steps,
         std::atomic<int32_t>& theta_pos,
-        std::atomic<int32_t>& rho_pos)
+        std::atomic<int32_t>& rho_pos,
+        uint32_t timeout_ms)
     {
         if (!initialized_) {
             return Result<void>::err(MotionError::InvalidState);
         }
 
-        if (executing_.load(std::memory_order_acquire)) {
+        if (total_steps == 0) {
+            return Result<void>::ok();
+        }
+
+        // Claim execution atomically. The old load-then-store let two tasks
+        // (stepper task segment + homing from a console/API task) both pass
+        // the check and drive the same buffers and RMT channels.
+        bool expected = false;
+        if (!executing_.compare_exchange_strong(expected, true,
+                std::memory_order_acq_rel)) {
             return Result<void>::err(MotionError::InvalidState);
         }
 
-        if (total_steps == 0) {
-            return Result<void>::ok();
+        // A stop raised since the caller's clear_stop() aborts this motion
+        // too - it may have landed between two chunked execute() calls,
+        // where the old per-call flag reset silently discarded it.
+        if (stop_requested_.load(std::memory_order_acquire)) {
+            executing_.store(false, std::memory_order_release);
+            return Result<void>::err(MotionError::EmergencyStop);
         }
 
         // Setup execution state
@@ -511,17 +511,26 @@ namespace sand_table {
         theta_pos_ = &theta_pos;
         rho_pos_ = &rho_pos;
         steps_encoded_ = 0;
+        encoded_chunks_ = 0;
+        completed_pairs_ = 0;
+        buf_theta_delta_[0] = buf_theta_delta_[1] = 0;
+        buf_rho_delta_[0] = buf_rho_delta_[1] = 0;
         pending_tx_.store(0, std::memory_order_release);
-        stop_requested_.store(false, std::memory_order_release);
         channels_done_.store(0, std::memory_order_release);
-        executing_.store(true, std::memory_order_release);
 
-        // Clear semaphore
-        xSemaphoreTake(completion_sem_, 0);
+        // Drain stale completion signals from a previous segment
+        while (xSemaphoreTake(completion_sem_, 0) == pdTRUE) {}
+
+        // Re-arm the sync manager so this segment's first theta/rho pair
+        // starts simultaneously (sync only applies to the first transmission
+        // after creation/reset).
+        if (sync_manager_) {
+            rmt_sync_reset(sync_manager_);
+        }
 
         // Encode first chunk into buffer 0
-        active_buffer_ = 0;
         encode_chunk(0);
+        encoded_chunks_ = 1;
 
         if (symbol_counts_[0] == 0) {
             executing_.store(false, std::memory_order_release);
@@ -529,8 +538,10 @@ namespace sand_table {
         }
 
         // Pre-encode second chunk for ping-pong buffering
+        symbol_counts_[1] = 0;
         if (steps_encoded_ < total_steps_) {
             encode_chunk(1);
+            encoded_chunks_ = 2;
         }
 
         // Start transmission - track pending count
@@ -567,10 +578,9 @@ namespace sand_table {
             return Result<void>::err(MotionError::HardwareFault);
         }
 
-        // Queue second chunk if available (set active_buffer_ FIRST to avoid race)
+        // Queue second chunk if available
         if (symbol_counts_[1] > 0) {
             pending_tx_.fetch_add(1, std::memory_order_release);
-            active_buffer_ = 1;  // Set before queuing to avoid race with callback
             tx_config.flags.queue_nonblocking = true;
             rmt_transmit(theta_channel_, copy_encoder_,
                 theta_symbols_[1],
@@ -584,36 +594,101 @@ namespace sand_table {
 
         ESP_LOGD(TAG, "RMT transmission started: %lu total steps", total_steps);
 
-        // Wait for completion (with timeout)
-        const TickType_t timeout_ticks = pdMS_TO_TICKS(30000);  // 30 second timeout
-        if (xSemaphoreTake(completion_sem_, timeout_ticks) != pdTRUE) {
-            ESP_LOGE(TAG, "RMT execution timeout");
-            stop();
-            return Result<void>::err(MotionError::Timeout);
+        // Refill loop: the TX-done ISR gives completion_sem_ once per
+        // completed buffer pair (after crediting its steps); THIS task then
+        // re-encodes the freed buffer and queues the next chunk.
+        // rmt_transmit() must run in task context — it uses non-ISR queue
+        // APIs, and calling it from the callback (the old design) corrupted
+        // the RMT driver's transaction bookkeeping.
+        //
+        // The overall timeout is sized by the caller from the segment's
+        // actual duration — a fixed timeout spuriously killed long slow
+        // segments mid-motion.
+        const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+        for (;;) {
+            const TickType_t now = xTaskGetTickCount();
+            const int32_t remaining = static_cast<int32_t>(deadline - now);
+            if (remaining <= 0 ||
+                xSemaphoreTake(completion_sem_, remaining) != pdTRUE) {
+                ESP_LOGE(TAG, "RMT execution timeout (%lu ms)", timeout_ms);
+                stop_requested_.store(true, std::memory_order_release);
+                hard_abort_channels();
+                return Result<void>::err(MotionError::Timeout);
+            }
+
+            // Stop request (emergency stop / hall / stall ISR). The flag is
+            // only raised elsewhere — the RMT hardware may still be draining
+            // queued symbols, so abort it HERE, in the executing task's
+            // context (RMT channel APIs must not be called from ISRs or
+            // raced across tasks). Without this, motors kept stepping up to
+            // two chunks (~128 steps) after an "emergency stop" returned.
+            if (stop_requested_.load(std::memory_order_acquire)) {
+                hard_abort_channels();
+                return Result<void>::err(MotionError::EmergencyStop);
+            }
+
+            // One pair completed: its buffer is free. Buffers alternate
+            // strictly, so chunk N lives in buffer N&1.
+            if (steps_encoded_ < total_steps_) {
+                const uint8_t buf = static_cast<uint8_t>(encoded_chunks_ & 1);
+                encode_chunk(buf);
+                if (symbol_counts_[buf] > 0) {
+                    encoded_chunks_++;
+                    pending_tx_.fetch_add(1, std::memory_order_release);
+
+                    rmt_transmit_config_t refill_config = {
+                        .loop_count = 0,
+                        .flags = {
+                            .eot_level = 0,
+                            .queue_nonblocking = true,
+                        },
+                    };
+                    rmt_transmit(theta_channel_, copy_encoder_,
+                        theta_symbols_[buf],
+                        symbol_counts_[buf] * sizeof(rmt_symbol_word_t),
+                        &refill_config);
+                    rmt_transmit(rho_channel_, copy_encoder_,
+                        rho_symbols_[buf],
+                        symbol_counts_[buf] * sizeof(rmt_symbol_word_t),
+                        &refill_config);
+                }
+            }
+
+            // Done when everything encoded has finished transmitting
+            if (pending_tx_.load(std::memory_order_acquire) == 0 &&
+                steps_encoded_ >= total_steps_) {
+                break;
+            }
         }
 
-        // Check for stop request (emergency stop)
-        if (stop_requested_.load(std::memory_order_acquire)) {
-            return Result<void>::err(MotionError::EmergencyStop);
-        }
-
+        executing_.store(false, std::memory_order_release);
         return Result<void>::ok();
     }
 
-    void RmtStepSequencer::stop() {
-        stop_requested_.store(true, std::memory_order_release);
-
+    void RmtStepSequencer::hard_abort_channels() {
+        // disable/enable resets the channel: aborts the in-flight
+        // transmission and flushes the queue. Task context only.
         if (theta_channel_) {
-            rmt_tx_wait_all_done(theta_channel_, 10);
+            rmt_disable(theta_channel_);
+            rmt_enable(theta_channel_);
         }
         if (rho_channel_) {
-            rmt_tx_wait_all_done(rho_channel_, 10);
+            rmt_disable(rho_channel_);
+            rmt_enable(rho_channel_);
         }
-
         pending_tx_.store(0, std::memory_order_release);
         executing_.store(false, std::memory_order_release);
+        // Position note: steps from the partially-transmitted chunk were
+        // emitted but not credited (crediting is completion-based), so the
+        // logical position may lag the physical by < kChunkSize steps after
+        // an abort. This is the bounded residual error of an abort.
+    }
 
-        // Signal completion in case execute() is waiting
+    void RmtStepSequencer::stop() {
+        // Raise the flag and wake execute(); the executing task performs the
+        // actual hardware abort (see execute()). Safe to call from any task.
+        stop_requested_.store(true, std::memory_order_release);
+
         if (completion_sem_) {
             xSemaphoreGive(completion_sem_);
         }
@@ -623,8 +698,6 @@ namespace sand_table {
         // ISR-safe version - only set flag and signal semaphore
         // No blocking calls allowed
         stop_requested_.store(true, std::memory_order_release);
-        pending_tx_.store(0, std::memory_order_release);
-        executing_.store(false, std::memory_order_release);
 
         if (completion_sem_) {
             BaseType_t xHigherPriorityTaskWoken = pdFALSE;
@@ -656,12 +729,16 @@ namespace sand_table {
     }
 
     Result<void> CoordinatedStepperController::init() {
-        // Allocate interval table from SPIRAM (65KB - too large for internal RAM)
+        // Allocate interval table from INTERNAL RAM. The RMT TX-done ISR
+        // reads this table (encode_chunk); SPIRAM access from an IRAM ISR
+        // crashes whenever the flash cache is disabled (NVS commits, OTA).
+        // At MAX_SEGMENT_STEPS=8192 this is 16KB.
         interval_table_.intervals = static_cast<uint16_t*>(
-            heap_caps_calloc(kMaxIntervalsPerSegment, sizeof(uint16_t), MALLOC_CAP_SPIRAM)
+            heap_caps_calloc(kMaxIntervalsPerSegment, sizeof(uint16_t),
+                MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
         );
         if (!interval_table_.intervals) {
-            ESP_LOGE(TAG, "Failed to allocate interval table from SPIRAM");
+            ESP_LOGE(TAG, "Failed to allocate interval table from internal RAM");
             return Result<void>::err(MotionError::HardwareFault);
         }
 
@@ -684,6 +761,13 @@ namespace sand_table {
     }
 
     void CoordinatedStepperController::enable() {
+        // Already on: nothing to warm up. move_to() calls this per move —
+        // an unconditional 250ms sleep here throttled pattern feeding to
+        // ~4 lines/sec.
+        if (theta_.is_enabled() && rho_.is_enabled()) {
+            return;
+        }
+
         theta_.set_enabled(true);
         rho_.set_enabled(true);
 
@@ -698,8 +782,9 @@ namespace sand_table {
     }
 
     void CoordinatedStepperController::emergency_stop() {
+        // Only raise the flag. Clearing bresenham_ here raced the executing
+        // task's encode loop (execute() sets it up fresh per motion anyway).
         rmt_sequencer_->stop();
-        bresenham_.clear();
     }
 
     void CoordinatedStepperController::emergency_stop_from_isr() {
@@ -776,11 +861,8 @@ namespace sand_table {
             nominal_steps_s = max_step_rate;
         }
 
-        // Acceleration in steps/s^2
-        // Use a reasonable default that gives smooth motion
-        // For sand table: accelerate from 0 to max in ~0.5s = 50000/0.5 = 100000 steps/s^2
-        // But that's aggressive. Use 10000 steps/s^2 for gentler acceleration.
-        const float accel_steps_s2 = 10000.0f;  // steps/s^2
+        // Acceleration in steps/s^2 (single tunable, see config.h)
+        const float accel_steps_s2 = MotionConfig::STEP_ACCEL_STEPS_S2;
 
         // Calculate distances (in steps) for acceleration and deceleration
         // Using kinematic equation: v^2 = v0^2 + 2*a*d  =>  d = (v^2 - v0^2) / (2*a)
@@ -854,6 +936,17 @@ namespace sand_table {
             return Result<void>::ok();
         }
 
+        // Reject oversized segments outright. Truncating silently (the old
+        // behavior) executed only part of the delta while the planner
+        // believed all of it ran — permanent position drift. The path
+        // planner splits moves below this cap; hitting this is a bug there.
+        if (total_steps > kMaxIntervalsPerSegment) {
+            ESP_LOGE(TAG, "Segment exceeds step cap: %lu > %u (theta=%ld, rho=%ld) - rejected",
+                total_steps, static_cast<unsigned>(kMaxIntervalsPerSegment),
+                segment.delta_theta_steps, segment.delta_rho_steps);
+            return Result<void>::err(MotionError::OutOfBounds);
+        }
+
         // Set directions
         theta_.set_direction(segment.delta_theta_steps >= 0);
         rho_.set_direction(segment.delta_rho_steps >= 0);
@@ -890,13 +983,25 @@ namespace sand_table {
             segment.delta_theta_steps, segment.delta_rho_steps,
             total_steps, profile.cruise_velocity, interval_table_.intervals[0]);
 
+        // Timeout: the interval table's summed duration with 2x margin plus a
+        // fixed floor. A fixed 30s timeout used to kill long slow segments
+        // (a max-length segment at minimum speed legitimately runs minutes).
+        const uint32_t expected_ms = static_cast<uint32_t>(interval_table_.total_us / 1000);
+        const uint32_t timeout_ms = expected_ms * 2 + 2000;
+
+        // Each segment is one logical motion op: consume any stop left over
+        // from a previous abort, then execute (a stop raised from here on
+        // aborts this segment).
+        rmt_sequencer_->clear_stop();
+
         // Execute via RMT sequencer (blocking)
         auto result = rmt_sequencer_->execute(
             bresenham_,
             interval_table_.intervals,
             interval_table_.total_steps,
             theta_.position_,
-            rho_.position_
+            rho_.position_,
+            timeout_ms
         );
 
         return result;
@@ -924,7 +1029,7 @@ namespace sand_table {
         theta_.set_direction(theta_steps >= 0);
         rho_.set_direction(rho_steps >= 0);
 
-        // Setup Bresenham state
+        // Setup Bresenham state (persists across chunks below)
         bresenham_.theta_remaining = std::abs(theta_steps);
         bresenham_.rho_remaining = std::abs(rho_steps);
         bresenham_.theta_total = bresenham_.theta_remaining;
@@ -943,24 +1048,54 @@ namespace sand_table {
         if (clamped_interval < min_interval_us) clamped_interval = min_interval_us;
         if (clamped_interval > max_interval_us) clamped_interval = max_interval_us;
 
-        // Fill interval table with constant value (no acceleration/deceleration)
-        interval_table_.clear();
-        interval_table_.total_steps = std::min(total_steps, static_cast<uint32_t>(kMaxIntervalsPerSegment));
-        for (uint32_t i = 0; i < interval_table_.total_steps; ++i) {
-            interval_table_.intervals[i] = static_cast<uint16_t>(clamped_interval);
-        }
-
         ESP_LOGI(TAG, "Constant-speed: theta=%ld, rho=%ld, interval=%lu us (%lu steps/s)",
             theta_steps, rho_steps, clamped_interval, 1000000UL / clamped_interval);
 
-        // Execute via RMT sequencer (blocking)
-        return rmt_sequencer_->execute(
-            bresenham_,
-            interval_table_.intervals,
-            interval_table_.total_steps,
-            theta_.position_,
-            rho_.position_
-        );
+        // Fill interval table once with the constant value (reused per chunk)
+        interval_table_.clear();
+        const uint32_t table_fill = std::min(total_steps,
+            static_cast<uint32_t>(kMaxIntervalsPerSegment));
+        for (uint32_t i = 0; i < table_fill; ++i) {
+            interval_table_.intervals[i] = static_cast<uint16_t>(clamped_interval);
+        }
+
+        // Homing moves (e.g. kMaxHomingSteps=100000) exceed the per-execute
+        // table capacity, which used to be SILENTLY truncated to 32768 steps.
+        // Execute in chunks instead; the shared Bresenham state carries the
+        // axis coordination across chunk boundaries, and an ISR-requested
+        // stop (hall/stall) aborts the loop via the EmergencyStop result.
+        //
+        // Consume stops ONCE for the whole seek, not per chunk: the stop
+        // flag persists across execute() calls, so a hall/stall ISR that
+        // fires in the gap between two chunks aborts the next chunk instead
+        // of being silently discarded (which drove the axis into the hard
+        // stop for up to another full chunk).
+        rmt_sequencer_->clear_stop();
+
+        uint32_t executed = 0;
+        while (executed < total_steps) {
+            const uint32_t chunk = std::min(total_steps - executed,
+                static_cast<uint32_t>(kMaxIntervalsPerSegment));
+
+            const uint32_t expected_ms = static_cast<uint32_t>(
+                (static_cast<uint64_t>(chunk) * clamped_interval) / 1000);
+            const uint32_t timeout_ms = expected_ms * 2 + 2000;
+
+            auto result = rmt_sequencer_->execute(
+                bresenham_,
+                interval_table_.intervals,
+                chunk,
+                theta_.position_,
+                rho_.position_,
+                timeout_ms
+            );
+            if (result.is_err()) {
+                return result;
+            }
+            executed += chunk;
+        }
+
+        return Result<void>::ok();
     }
 
     void CoordinatedStepperController::prepare_interval_table(
@@ -1022,6 +1157,7 @@ namespace sand_table {
             }
 
             interval_table_.intervals[step] = static_cast<uint16_t>(interval_us);
+            interval_table_.total_us += interval_us;
         }
     }
 

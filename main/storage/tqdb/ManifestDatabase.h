@@ -141,15 +141,26 @@ public:
     // Job queue operations (using internal IDs)
     esp_err_t enqueueJob(jobs::Job& job);  // ID assigned on success
     std::optional<jobs::Job> claimNextPendingJob();
+    // Re-queue jobs left InProgress by a reboot mid-execution and purge
+    // finished (Completed/Failed) rows so the table doesn't grow forever.
+    // Returns the number recovered. Call once at startup before processing
+    // begins.
+    size_t recoverOrphanedJobs();
     std::optional<jobs::Job> getJob(uint32_t id);
     std::optional<jobs::Job> getJobByPatternId(uint32_t pattern_id, jobs::JobType type);
     std::optional<jobs::Job> getJobByPatternExternalUuid(const std::string& external_uuid, jobs::JobType type);
     bool hasJobForPattern(uint32_t pattern_id, jobs::JobType type);
     bool hasJobForPatternExternalUuid(const std::string& external_uuid, jobs::JobType type);
     esp_err_t markJobCompleted(uint32_t id);
-    esp_err_t markJobFailed(uint32_t id, const std::string& error);
+    // permanent=true sends the job straight to Failed (no retry).
+    esp_err_t markJobFailed(uint32_t id, const std::string& error, bool permanent = false);
+    // Put a claimed (InProgress) job back to Pending WITHOUT burning a retry.
+    esp_err_t releaseJob(uint32_t id);
     esp_err_t deleteJob(uint32_t id);
     esp_err_t cancelJobsForPattern(uint32_t pattern_id);
+    // Cancel Pending jobs matched by the external UUID stored on the job row
+    // (download jobs are enqueued with pattern_id=0 before the pattern exists).
+    esp_err_t cancelJobsForExternalUuid(const std::string& external_uuid);
     size_t getPendingJobCount();
     size_t getInProgressJobCount();
 

@@ -6,10 +6,85 @@
 #include <esp_log.h>
 #include <mbedtls/platform_util.h>
 
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+
+#include <cmath>
 #include <stdio.h>
 #include <string.h>
 
 static const char* TAG = "encrypted_reader";
+
+// -----------------------------------------------------------------------------
+// Single-entry AES key cache
+//
+// drm_recover_aes_key() costs ~1.7s of RSA-4096 on the DS peripheral, and the
+// player re-opens the pattern on every playlist advance/loop. Cache the last
+// successfully recovered key by pattern UUID so repeat opens skip the RSA step.
+// The cache only bypasses key recovery — the authorization check in open()
+// still runs on every open. Lifetime: zeroized by invalidateKeyCache() (called
+// on license reload), otherwise lives until overwritten by another pattern.
+// -----------------------------------------------------------------------------
+namespace {
+
+struct AesKeyCache {
+    char uuid[64];
+    uint8_t key[DRM_AES_KEY_BYTES];
+    bool valid;
+};
+
+AesKeyCache s_key_cache = {};
+
+SemaphoreHandle_t keyCacheMutex() {
+    // Thread-safe magic static; may be nullptr if allocation fails (cache
+    // is then simply bypassed)
+    static SemaphoreHandle_t mutex = xSemaphoreCreateMutex();
+    return mutex;
+}
+
+bool keyCacheLookup(const char* uuid, uint8_t key[DRM_AES_KEY_BYTES]) {
+    SemaphoreHandle_t mutex = keyCacheMutex();
+    if (uuid == nullptr || mutex == nullptr) {
+        return false;
+    }
+
+    bool hit = false;
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    if (s_key_cache.valid &&
+        strncmp(s_key_cache.uuid, uuid, sizeof(s_key_cache.uuid)) == 0) {
+        memcpy(key, s_key_cache.key, DRM_AES_KEY_BYTES);
+        hit = true;
+    }
+    xSemaphoreGive(mutex);
+    return hit;
+}
+
+void keyCacheStore(const char* uuid, const uint8_t key[DRM_AES_KEY_BYTES]) {
+    SemaphoreHandle_t mutex = keyCacheMutex();
+    if (uuid == nullptr || mutex == nullptr ||
+        strlen(uuid) >= sizeof(s_key_cache.uuid)) {
+        return;
+    }
+
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    strncpy(s_key_cache.uuid, uuid, sizeof(s_key_cache.uuid) - 1);
+    s_key_cache.uuid[sizeof(s_key_cache.uuid) - 1] = '\0';
+    memcpy(s_key_cache.key, key, DRM_AES_KEY_BYTES);
+    s_key_cache.valid = true;
+    xSemaphoreGive(mutex);
+}
+
+}  // namespace
+
+void EncryptedPatternReader::invalidateKeyCache() {
+    SemaphoreHandle_t mutex = keyCacheMutex();
+    if (mutex == nullptr) {
+        return;
+    }
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    mbedtls_platform_zeroize(&s_key_cache, sizeof(s_key_cache));
+    xSemaphoreGive(mutex);
+}
 
 EncryptedPatternReader::EncryptedPatternReader() {
     memset(aes_key_, 0, sizeof(aes_key_));
@@ -61,12 +136,17 @@ esp_err_t EncryptedPatternReader::startCipherAtPosition(size_t byte_position) {
     uint8_t iv[16];
     memcpy(iv, base_iv_, 16);
 
-    // Add position/16 to counter (big-endian, last 8 bytes used as counter)
+    // Add position/16 to the big-endian 128-bit counter. The carry must
+    // propagate through all 16 bytes (not just the low 8): a random base IV
+    // near 0xFF..FF in byte 8 would otherwise drop the carry and desync the
+    // keystream on seek.
     uint64_t block_num = byte_position / 16;
-    for (int i = 15; i >= 8 && block_num > 0; i--) {
-        uint16_t sum = iv[i] + (block_num & 0xFF);
+    unsigned int carry = 0;
+    for (int i = 15; i >= 0; i--) {
+        unsigned int sum = iv[i] + static_cast<unsigned int>(block_num & 0xFF) + carry;
         iv[i] = sum & 0xFF;
-        block_num = (block_num >> 8) + (sum >> 8);  // carry
+        carry = sum >> 8;
+        block_num >>= 8;
     }
 
     // Setup new cipher operation
@@ -112,7 +192,7 @@ esp_err_t EncryptedPatternReader::open(const char* uuid) {
     }
 
     // Check authorization: purchase receipt OR valid subscription
-    bool authorized = false; //RESET TO FALSE
+    bool authorized = false;
 
     // First, check for purchase receipt (permanent ownership)
     if (drm_purchase_is_valid(uuid)) {
@@ -133,10 +213,10 @@ esp_err_t EncryptedPatternReader::open(const char* uuid) {
     char file_path[256];
     getFilePath(uuid, file_path, sizeof(file_path));
 
-    return openFile(file_path);
+    return openFile(file_path, uuid);
 }
 
-esp_err_t EncryptedPatternReader::openFile(const char* path) {
+esp_err_t EncryptedPatternReader::openFile(const char* path, const char* uuid) {
     // Authorization already checked in open() - openFile is internal only
     file_ = fopen(path, "rb");
     if (file_ == nullptr) {
@@ -182,17 +262,52 @@ esp_err_t EncryptedPatternReader::openFile(const char* path) {
         return ESP_ERR_NOT_SUPPORTED;
     }
 
-    // Recover AES key using DS peripheral
-    esp_err_t ret = drm_recover_aes_key(header_.encrypted_key, aes_key_);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to recover AES key: %s", esp_err_to_name(ret));
+    // Validate point_count against actual file size so a truncated file
+    // can't wedge playback (hasMore() true forever past EOF). Done before
+    // key recovery so a corrupt file fails fast, not after ~1.7s of RSA.
+    long file_size = -1;
+    if (fseek(file_, 0, SEEK_END) == 0) {
+        file_size = ftell(file_);
+    }
+    if (file_size < 0 || fseek(file_, sizeof(header_), SEEK_SET) != 0) {
+        ESP_LOGE(TAG, "Failed to determine pattern file size");
         fclose(file_);
         file_ = nullptr;
-        return ret;
+        return ESP_FAIL;
     }
-    has_key_ = true;
+    size_t available_points =
+        (static_cast<size_t>(file_size) - sizeof(header_)) / sizeof(BinaryPoint);
+    if (header_.point_count > available_points) {
+        ESP_LOGW(TAG, "Pattern truncated: header claims %lu points, file holds %zu",
+                 (unsigned long)header_.point_count, available_points);
+        if (available_points == 0) {
+            fclose(file_);
+            file_ = nullptr;
+            return ESP_ERR_INVALID_SIZE;
+        }
+        header_.point_count = available_points;
+    }
 
-    // Initialize decryption context
+    // Recover AES key, skipping the ~1.7s RSA-4096 operation when the
+    // single-entry cache already holds this pattern's key
+    esp_err_t ret;
+    if (keyCacheLookup(uuid, aes_key_)) {
+        ESP_LOGD(TAG, "AES key cache hit for %s", uuid);
+        has_key_ = true;
+    }
+    else {
+        ret = drm_recover_aes_key(header_.encrypted_key, aes_key_);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to recover AES key: %s", esp_err_to_name(ret));
+            fclose(file_);
+            file_ = nullptr;
+            return ret;
+        }
+        has_key_ = true;
+        keyCacheStore(uuid, aes_key_);
+    }
+
+    // Initialize decryption context (zeroizes aes_key_ after PSA import)
     ret = initDecryption();
     if (ret != ESP_OK) {
         clearKey();
@@ -203,6 +318,7 @@ esp_err_t EncryptedPatternReader::openFile(const char* path) {
 
     current_point_ = 0;
     has_peeked_ = false;
+    read_failed_ = false;
 
     ESP_LOGI(TAG, "Successfully opened encrypted pattern (bufferless)");
     return ESP_OK;
@@ -218,8 +334,20 @@ esp_err_t EncryptedPatternReader::initDecryption() {
         return ret;
     }
 
+    // The key now lives in the PSA keystore (aes_key_id_); rewind/seek go
+    // through the key id, so drop the raw copy immediately
+    clearKey();
+
     // Start cipher at position 0
-    return startCipherAtPosition(0);
+    ret = startCipherAtPosition(0);
+    if (ret != ESP_OK) {
+        // Don't leak the volatile PSA key slot on the error path
+        psa_destroy_key(aes_key_id_);
+        aes_key_id_ = PSA_KEY_ID_NULL;
+        return ret;
+    }
+
+    return ESP_OK;
 }
 
 void EncryptedPatternReader::close() {
@@ -248,6 +376,7 @@ void EncryptedPatternReader::close() {
     decrypt_position_ = 0;
     current_point_ = 0;
     has_peeked_ = false;
+    read_failed_ = false;
 }
 
 bool EncryptedPatternReader::isOpen() const {
@@ -263,14 +392,16 @@ size_t EncryptedPatternReader::getCurrentLine() const {
 }
 
 PatternPoint EncryptedPatternReader::readBinaryPoint() {
-    if (!isOpen() || current_point_ >= header_.point_count) {
+    if (!isOpen() || read_failed_ || current_point_ >= header_.point_count) {
         return PatternPoint();
     }
 
-    // Read encrypted point directly from file
+    // Read encrypted point directly from file. A short read is terminal:
+    // the file offset and CTR keystream would be desynced from here on.
     BinaryPoint bp;
     if (fread(&bp, sizeof(bp), 1, file_) != 1) {
         ESP_LOGE(TAG, "Failed to read encrypted point at index %zu", current_point_);
+        read_failed_ = true;
         return PatternPoint();
     }
 
@@ -281,8 +412,13 @@ PatternPoint EncryptedPatternReader::readBinaryPoint() {
         reinterpret_cast<uint8_t*>(&bp), sizeof(bp),
         decrypted, sizeof(decrypted), &out_len);
 
-    if (status != PSA_SUCCESS) {
-        ESP_LOGE(TAG, "psa_cipher_update failed: %d", status);
+    if (status != PSA_SUCCESS || out_len != sizeof(decrypted)) {
+        ESP_LOGE(TAG, "psa_cipher_update failed: %d (out_len %zu)", status, out_len);
+        // Terminal: abort the cipher so nothing keeps decrypting a
+        // desynced keystream
+        read_failed_ = true;
+        psa_cipher_abort(&cipher_op_);
+        cipher_active_ = false;
         return PatternPoint();
     }
 
@@ -291,7 +427,17 @@ PatternPoint EncryptedPatternReader::readBinaryPoint() {
     // Parse decrypted point
     BinaryPoint* dbp = reinterpret_cast<BinaryPoint*>(decrypted);
 
-    // Convert uint16 rho to float 0.0-1.0
+    // Reject garbage motion targets: theta must be a finite, sane angle
+    // (|theta| < 10000 rad is generous for multi-rotation patterns).
+    // Terminal: CTR garbage here means the rest of the stream is garbage
+    // too (wrong key or corrupt ciphertext).
+    if (!std::isfinite(dbp->theta) || std::fabs(dbp->theta) >= 10000.0f) {
+        ESP_LOGE(TAG, "Invalid theta at point %zu (corrupt stream)", current_point_);
+        read_failed_ = true;
+        return PatternPoint();
+    }
+
+    // Convert uint16 rho to float 0.0-1.0 (in [0,1] by construction)
     double rho = static_cast<double>(dbp->rho) / 65535.0;
 
     return PatternPoint(static_cast<double>(dbp->theta), rho);
@@ -320,20 +466,13 @@ PatternPoint EncryptedPatternReader::peekNext() {
         return PatternPoint();
     }
 
-    // Save state
-    long saved_file_pos = ftell(file_);
-    size_t saved_decrypt_pos = decrypt_position_;
-    size_t saved_point = current_point_;
-
-    // Read next point (advances cipher state)
+    // Read the point and leave the file/cipher advanced past it:
+    // readNext()'s cached branch returns peeked_point_ WITHOUT touching
+    // the stream, so restoring state here would desync the ciphertext
+    // position from current_point_ — every peek+read cycle decrypts the
+    // same bytes and playback replays one point until the index runs out.
+    // (This also avoids a full CTR cipher restart per peeked point.)
     peeked_point_ = readBinaryPoint();
-
-    // Restore file position
-    fseek(file_, saved_file_pos, SEEK_SET);
-
-    // Restart cipher at saved position
-    startCipherAtPosition(saved_decrypt_pos);
-    current_point_ = saved_point;
 
     if (peeked_point_.valid) {
         has_peeked_ = true;
@@ -343,6 +482,9 @@ PatternPoint EncryptedPatternReader::peekNext() {
 }
 
 bool EncryptedPatternReader::hasMore() const {
+    if (read_failed_) {
+        return false;
+    }
     if (has_peeked_) {
         return peeked_point_.valid;
     }
@@ -354,17 +496,25 @@ esp_err_t EncryptedPatternReader::rewind() {
         return ESP_ERR_INVALID_STATE;
     }
 
-    // Seek file back to start of ciphertext (after header)
-    fseek(file_, sizeof(header_), SEEK_SET);
+    // Seek file back to start of ciphertext (after header). If the seek
+    // fails, do NOT restart the cipher against a mispositioned file — that
+    // would silently desync keystream and ciphertext.
+    if (fseek(file_, sizeof(header_), SEEK_SET) != 0) {
+        ESP_LOGE(TAG, "Rewind seek failed");
+        read_failed_ = true;
+        return ESP_FAIL;
+    }
 
     // Restart cipher at position 0
     esp_err_t ret = startCipherAtPosition(0);
     if (ret != ESP_OK) {
+        read_failed_ = true;
         return ret;
     }
 
     current_point_ = 0;
     has_peeked_ = false;
+    read_failed_ = false;
 
     return ESP_OK;
 }
