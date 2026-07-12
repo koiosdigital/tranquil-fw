@@ -119,6 +119,15 @@ namespace sand_table {
         // profile (steps/s^2). This is the knob that actually shapes ramps.
         static constexpr float STEP_ACCEL_STEPS_S2 = 10000.0f;
 
+        // Hard ceiling on the theta axis rotation rate (rotations/min),
+        // applied AFTER feedrate (including transit boosts) as a safety
+        // clamp. Feedrate is a PATH speed: near the center a tiny path
+        // distance maps to a large theta swing (direction changes pass
+        // through the middle), so path-speed planning alone can whip the
+        // arm around. Enforced in calculate_velocity_profile and, for live
+        // feedrate boosts, via the sequencer's speed-scale ceiling.
+        static constexpr float THETA_MAX_ROT_PER_MIN = 12.0f;
+
         // Legacy constexpr for compile-time contexts (uses defaults)
         static constexpr int32_t THETA_MAX_SPEED_RPM = kDefaultThetaMaxRpm;
         static constexpr int32_t RHO_MAX_SPEED_RPM = kDefaultRhoMaxRpm;

@@ -11,6 +11,8 @@
 #include <esp_log.h>
 #include <esp_heap_caps.h>
 
+#include <kd_common.h>
+
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
@@ -53,6 +55,14 @@ namespace {
     }
 
     void on_session_ready() {
+        // Advertise the platform-assigned device UUID (from the welcome
+        // frame) alongside the existing _koiosdigital service TXT records
+        // (model/type/version).
+        char device_id[48];
+        if (koios_cloudlink_get_device_id(device_id, sizeof(device_id))) {
+            kd_common_mdns_add_svc_record("_koiosdigital", "device_id", device_id);
+        }
+
         // Device-initiated boot handshake. On the vn path the backend only
         // answers requests (it does not push an unsolicited JoinResponse), so
         // the device must drive: report identity, then request its license /

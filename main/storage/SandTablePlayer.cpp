@@ -3,6 +3,7 @@
 #include "drm/drm_purchase.h"
 #include "raii_utils.hpp"
 #include "esp_log.h"
+#include "nvs.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -42,6 +43,51 @@ PatternPosition SandTablePlayer::pattern_position_;
 std::atomic<double> SandTablePlayer::feed_rate_{ 5.0 };
 std::atomic<bool> SandTablePlayer::linear_interpolation_{ false };
 
+// Feed rate scale and persistence. 1..5 is the app-facing speed range
+// (turtle..rabbit); 5 is the historical default speed. The last-set value
+// is stored in NVS as centi-units (no float type there) and restored on
+// boot; writes are skipped when the value hasn't changed (flash wear).
+namespace {
+    constexpr double kFeedRateMin = 1.0;
+    constexpr double kFeedRateMax = 5.0;
+    constexpr double kFeedRateDefault = 5.0;
+    constexpr const char* kPlayerNvsNamespace = "player";
+    constexpr const char* kNvsKeyFeedRate = "feed_rate";
+
+    void persistFeedRate(double rate) {
+        nvs_handle_t handle;
+        if (nvs_open(kPlayerNvsNamespace, NVS_READWRITE, &handle) != ESP_OK) {
+            return;
+        }
+        const uint16_t centi = static_cast<uint16_t>(std::lround(rate * 100.0));
+        uint16_t existing = 0;
+        if (nvs_get_u16(handle, kNvsKeyFeedRate, &existing) != ESP_OK ||
+            existing != centi) {
+            if (nvs_set_u16(handle, kNvsKeyFeedRate, centi) == ESP_OK) {
+                nvs_commit(handle);
+            }
+        }
+        nvs_close(handle);
+    }
+
+    double loadFeedRate() {
+        nvs_handle_t handle;
+        if (nvs_open(kPlayerNvsNamespace, NVS_READONLY, &handle) != ESP_OK) {
+            return kFeedRateDefault;
+        }
+        uint16_t centi = 0;
+        const bool found = (nvs_get_u16(handle, kNvsKeyFeedRate, &centi) == ESP_OK);
+        nvs_close(handle);
+        if (!found) {
+            return kFeedRateDefault;
+        }
+        double rate = static_cast<double>(centi) / 100.0;
+        if (rate < kFeedRateMin) rate = kFeedRateMin;
+        if (rate > kFeedRateMax) rate = kFeedRateMax;
+        return rate;
+    }
+}
+
 // =============================================================================
 // Initialization / Shutdown
 // =============================================================================
@@ -55,6 +101,13 @@ esp_err_t SandTablePlayer::initialize(sand_table::MotionController* controller) 
     }
 
     motion_controller_ = controller;
+
+    // Restore the last-set feed rate (persisted in NVS) and seed the live
+    // override so restored speed applies from the very first move.
+    const double restored_rate = loadFeedRate();
+    feed_rate_.store(restored_rate, std::memory_order_relaxed);
+    motion_controller_->set_live_feedrate(static_cast<float>(restored_rate));
+    ESP_LOGI(TAG, "Restored feed rate: %.2f", restored_rate);
 
     // Create mutexes for thread safety
     state_mutex_ = xSemaphoreCreateMutex();
@@ -453,9 +506,18 @@ esp_err_t SandTablePlayer::skip() {
 // =============================================================================
 
 void SandTablePlayer::setFeedRate(double feed_rate) {
-    if (feed_rate < 1.0) feed_rate = 1.0;
-    if (feed_rate > 20.0) feed_rate = 20.0;
+    if (feed_rate < kFeedRateMin) feed_rate = kFeedRateMin;
+    if (feed_rate > kFeedRateMax) feed_rate = kFeedRateMax;
     feed_rate_.store(feed_rate, std::memory_order_relaxed);
+
+    // Live override: queued and in-flight motion rescales to the new
+    // feedrate within one RMT chunk (~64 steps), not just new lines.
+    if (motion_controller_) {
+        motion_controller_->set_live_feedrate(static_cast<float>(feed_rate));
+    }
+
+    persistFeedRate(feed_rate);
+
     ESP_LOGI(TAG, "Set feed rate: %.2f", feed_rate);
 }
 
@@ -561,13 +623,18 @@ cJSON* SandTablePlayer::getStateJSON() {
     // Snapshot mutable state under the mutex (see getStatus).
     raii::MutexGuard guard(state_mutex_, pdMS_TO_TICKS(100));
 
+    // Field names follow the documented PlayerState schema in
+    // docs/swagger.json (state/mode/current_pattern_uuid/...); the old
+    // names (playback_state/pattern_uuid/progress/is_shuffle) matched
+    // neither the docs nor the app, which read everything as undefined
+    // and permanently showed "not playing".
     const char* state_str = "STOPPED";
     switch (playback_state_) {
     case PlaybackState::PLAYING: state_str = "PLAYING"; break;
     case PlaybackState::PAUSED: state_str = "PAUSED"; break;
     default: break;
     }
-    cJSON_AddStringToObject(root, "playback_state", state_str);
+    cJSON_AddStringToObject(root, "state", state_str);
 
     const char* mode_str = "SINGLE_PATTERN";
     switch (play_mode_) {
@@ -576,16 +643,16 @@ cJSON* SandTablePlayer::getStateJSON() {
     case PlayMode::PLAYLIST_SHUFFLE: mode_str = "PLAYLIST_SHUFFLE"; break;
     default: break;
     }
-    cJSON_AddStringToObject(root, "play_mode", mode_str);
+    cJSON_AddStringToObject(root, "mode", mode_str);
 
-    cJSON_AddStringToObject(root, "pattern_uuid", current_pattern_uuid_);
-    cJSON_AddStringToObject(root, "playlist_uuid", current_playlist_uuid_);
-    cJSON_AddNumberToObject(root, "progress", getTotalProgress());
+    cJSON_AddStringToObject(root, "current_pattern_uuid", current_pattern_uuid_);
+    cJSON_AddStringToObject(root, "current_playlist_uuid", current_playlist_uuid_);
+    cJSON_AddNumberToObject(root, "progress_percent", getTotalProgress());
     cJSON_AddNumberToObject(root, "pattern_index", static_cast<int>(playlist_index_));
     cJSON_AddNumberToObject(root, "playlist_size", static_cast<int>(playlist_patterns_.size()));
     cJSON_AddNumberToObject(root, "feed_rate", feed_rate_);
-    cJSON_AddBoolToObject(root, "is_shuffle", is_shuffle_);
-    cJSON_AddBoolToObject(root, "is_loop", is_loop_);
+    cJSON_AddBoolToObject(root, "shuffle", is_shuffle_);
+    cJSON_AddBoolToObject(root, "loop", is_loop_);
 
     return root;
 }
@@ -670,8 +737,6 @@ void SandTablePlayer::serviceTask() {
                     if (playback_state_ != PlaybackState::PLAYING) break;
 
                     PatternLine line = peekNextLine();
-                    ESP_LOGI(TAG, "Feeding line %zu/%zu: theta=%.4f, rho=%.4f, first=%d",
-                        current_line_index_ + 1, total_lines_, line.theta, line.rho, line.is_first_line);
                     if (line.is_valid) {
                         if (!processPatternLine(line)) {
                             break;  // queue full or motion refused - retry next tick
@@ -1000,7 +1065,7 @@ bool SandTablePlayer::processPatternLine(const PatternLine& line) {
 }
 
 void SandTablePlayer::sendMoveCommand(double theta_rad, double rho_normalized,
-                                      float speed_multiplier) {
+    float speed_multiplier) {
     // Don't normalize theta - pattern files use continuous rotation (can exceed 2π)
     // The motion controller uses radians (0-2π) and normalized rho (0-1) directly
     // No conversion needed - pattern files use the same coordinate system
@@ -1014,14 +1079,18 @@ void SandTablePlayer::sendMoveCommand(double theta_rad, double rho_normalized,
     if (feedrate_rpm <= 0) {
         feedrate_rpm = static_cast<float>(sand_table::MotionConfig::RHO_MAX_SPEED_RPM);
     }
-    // Transit moves (folded rotations) run above the user's draw speed; the
-    // profile generator clamps to hardware step-rate limits downstream.
+    // base = the user's draw speed WITHOUT the transit boost. Live feedrate
+    // changes rescale execution by (new feed / base), so boosted moves keep
+    // their boost ratio under a feedrate change.
+    const float base_rpm = feedrate_rpm;
+    // Transit moves (multi-rotation jumps) run above the user's draw speed;
+    // the profile generator clamps to hardware step-rate limits downstream.
     feedrate_rpm *= speed_multiplier;
 
     sand_table::PolarPosition target{ theta_rad, rho_normalized };
     auto result = linear_interpolation_.load(std::memory_order_relaxed)
-        ? motion_controller_->move_linear(target, feedrate_rpm)
-        : motion_controller_->move_to(target, feedrate_rpm);
+        ? motion_controller_->move_linear(target, feedrate_rpm, base_rpm)
+        : motion_controller_->move_to(target, feedrate_rpm, base_rpm);
 
     if (result.is_err()) {
         ESP_LOGW(TAG, "Failed to send move command: (%.4f rad, %.4f)",

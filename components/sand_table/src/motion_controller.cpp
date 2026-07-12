@@ -88,6 +88,10 @@ namespace sand_table {
             return controller_result;
         }
 
+        // Feed the live feedrate override down to the RMT chunk encoder so
+        // speed changes apply to in-flight motion, not just new segments.
+        stepper_controller_->set_live_feedrate_source(&live_feedrate_);
+
         // Create homing controller
         homing_controller_ = std::make_unique<HomingController>(
             *theta_stepper_, *rho_stepper_, *theta_tmc_, *rho_tmc_
@@ -439,7 +443,8 @@ namespace sand_table {
         state_.store(SystemState::Idle, std::memory_order_release);
     }
 
-    Result<void> MotionController::move_to(const PolarPosition& target, float feedrate) {
+    Result<void> MotionController::move_to(const PolarPosition& target, float feedrate,
+                                           float base_feedrate) {
         if (!is_homed_.load(std::memory_order_acquire)) {
             return Result<void>::err(MotionError::NotHomed);
         }
@@ -479,10 +484,12 @@ namespace sand_table {
         enable_motors();
 
         // Plan direct polar move (arcs in XY space)
-        return path_planner_->plan_polar_move(current, target, actual_feedrate);
+        return path_planner_->plan_polar_move(current, target, actual_feedrate,
+            (base_feedrate > 0) ? base_feedrate : actual_feedrate);
     }
 
-    Result<void> MotionController::move_linear(const PolarPosition& target, float feedrate) {
+    Result<void> MotionController::move_linear(const PolarPosition& target, float feedrate,
+                                               float base_feedrate) {
         if (!is_homed_.load(std::memory_order_acquire)) {
             return Result<void>::err(MotionError::NotHomed);
         }
@@ -519,7 +526,8 @@ namespace sand_table {
         enable_motors();
 
         // Plan Cartesian-interpolated move (straight lines in XY space)
-        return path_planner_->plan_linear_move(current, target, actual_feedrate);
+        return path_planner_->plan_linear_move(current, target, actual_feedrate,
+            (base_feedrate > 0) ? base_feedrate : actual_feedrate);
     }
 
     void MotionController::pause() {

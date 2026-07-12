@@ -145,6 +145,13 @@ namespace sand_table {
         float nominal_velocity = 0.0f;       // RPM (shared nominal/cruise target)
         float acceleration = 0.0f;
 
+        // The user feedrate this segment was planned at, WITHOUT transient
+        // boosts (transit multipliers). The executor scales step intervals
+        // live by current_feedrate / base_feedrate so feedrate changes apply
+        // to already-queued and in-flight segments instantly, and boosted
+        // segments keep their boost ratio. 0 = exempt from live scaling.
+        float base_feedrate = 0.0f;
+
         [[nodiscard]] CartesianPosition direction() const noexcept {
             // Convert polar delta to approximate Cartesian direction
             // This is used for junction velocity calculations

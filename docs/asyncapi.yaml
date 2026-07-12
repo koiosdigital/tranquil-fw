@@ -475,6 +475,9 @@ components:
         feed_rate_rpm:
           type: number
           format: float
+          minimum: 1
+          maximum: 5
+          description: "Playback speed, 1 (slowest) to 5 (fastest); clamped on the device and persisted across reboots"
 
     PlaylistNavigateCommand:
       type: object

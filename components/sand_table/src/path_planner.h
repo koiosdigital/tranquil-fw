@@ -47,11 +47,14 @@ namespace sand_table {
         /// @param current Current polar position (theta: radians, rho: 0-1)
         /// @param target Target polar position (theta: radians, rho: 0-1)
         /// @param feedrate_rpm Speed in normalized units/min (see MotionController::move_to)
+        /// @param base_feedrate_rpm User feedrate without transient boosts,
+        ///        used for live feedrate scaling (0 = same as feedrate_rpm)
         /// @return Error if move could not be planned
         [[nodiscard]] Result<void> plan_linear_move(
             const PolarPosition& current,
             const PolarPosition& target,
-            float feedrate_rpm
+            float feedrate_rpm,
+            float base_feedrate_rpm = 0.0f
         );
 
         /// Plan a direct polar move (no Cartesian interpolation)
@@ -60,11 +63,14 @@ namespace sand_table {
         /// @param current Current polar position (theta: radians, rho: 0-1)
         /// @param target Target polar position (theta: radians, rho: 0-1)
         /// @param feedrate_rpm Speed in normalized units/min (see MotionController::move_to)
+        /// @param base_feedrate_rpm User feedrate without transient boosts,
+        ///        used for live feedrate scaling (0 = same as feedrate_rpm)
         /// @return Error if move could not be planned
         [[nodiscard]] Result<void> plan_polar_move(
             const PolarPosition& current,
             const PolarPosition& target,
-            float feedrate_rpm
+            float feedrate_rpm,
+            float base_feedrate_rpm = 0.0f
         );
 
     private:
@@ -108,7 +114,8 @@ namespace sand_table {
             double delta_rho_norm,
             double distance_norm,
             float feedrate_rpm,
-            const PolarPosition& end_position)
+            const PolarPosition& end_position,
+            float base_feedrate_rpm = 0.0f)
         {
             const uint32_t est = estimate_steps(delta_theta_rad, delta_rho_norm);
             const uint32_t num_segments = (est > 0)
@@ -126,6 +133,8 @@ namespace sand_table {
                 segment.delta_rho_norm = rho_per_seg;
                 segment.distance = dist_per_seg;
                 segment.nominal_velocity = feedrate_rpm;
+                segment.base_feedrate = (base_feedrate_rpm > 0.0f)
+                    ? base_feedrate_rpm : feedrate_rpm;
                 segment.delta_theta_steps = 0;  // Calculated later by transformer
                 segment.delta_rho_steps = 0;
 
@@ -151,7 +160,8 @@ namespace sand_table {
     inline Result<void> PathPlanner::plan_linear_move(
         const PolarPosition& current,
         const PolarPosition& target,
-        float feedrate_rpm)
+        float feedrate_rpm,
+        float base_feedrate_rpm)
     {
         if (!callback_) {
             return Result<void>::err(MotionError::InvalidState);
@@ -165,7 +175,8 @@ namespace sand_table {
         if (target.rho < kCenterThreshold) {
             // Moving TO center: just retract rho, no theta
             if (std::fabs(current.rho) > 0.001) {
-                return emit_split(0.0, -current.rho, current.rho, feedrate_rpm, target);
+                return emit_split(0.0, -current.rho, current.rho, feedrate_rpm, target,
+                    base_feedrate_rpm);
             }
             current_position_ = target;
             return Result<void>::ok();
@@ -179,7 +190,8 @@ namespace sand_table {
                 target.rho,  // From ~0 to target
                 target.rho,  // Distance dominated by rho
                 feedrate_rpm,
-                target);
+                target,
+                base_feedrate_rpm);
         }
 
         // Convert polar to Cartesian for linear interpolation
@@ -232,7 +244,7 @@ namespace sand_table {
             const double d_rho = seg_rho - prev_pos.rho;
 
             auto result = emit_split(d_theta, d_rho, dist_per_seg, feedrate_rpm,
-                { current_position_.theta + d_theta, seg_rho });
+                { current_position_.theta + d_theta, seg_rho }, base_feedrate_rpm);
             if (result.is_err()) {
                 return result;
             }
@@ -249,7 +261,8 @@ namespace sand_table {
     inline Result<void> PathPlanner::plan_polar_move(
         const PolarPosition& current,
         const PolarPosition& target,
-        float feedrate_rpm)
+        float feedrate_rpm,
+        float base_feedrate_rpm)
     {
         if (!callback_) {
             return Result<void>::err(MotionError::InvalidState);
@@ -276,7 +289,8 @@ namespace sand_table {
         const double arc_component = avg_rho * std::fabs(delta_theta);
         const double total_distance = std::sqrt(arc_component * arc_component + delta_rho * delta_rho);
 
-        return emit_split(delta_theta, delta_rho, total_distance, feedrate_rpm, target);
+        return emit_split(delta_theta, delta_rho, total_distance, feedrate_rpm, target,
+            base_feedrate_rpm);
     }
 
 } // namespace sand_table

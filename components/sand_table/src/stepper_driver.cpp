@@ -377,6 +377,46 @@ namespace sand_table {
         }
     }
 
+    void RmtStepSequencer::update_speed_scale() {
+        float target = 1.0f;
+        if (live_feedrate_ && speed_reference_rpm_ > 0.0f) {
+            const float live = live_feedrate_->load(std::memory_order_relaxed);
+            if (live > 0.0f) {
+                target = live / speed_reference_rpm_;
+            }
+        }
+        // Sanity clamp (feedrate range is 1-20, so at most 20x either way),
+        // then the per-segment ceiling (theta rotation-rate safety cap).
+        target = std::max(0.05f, std::min({ target, 20.0f, speed_scale_ceiling_ }));
+
+        // Slew toward the target by at most 25% per chunk so a large
+        // feedrate change ramps over several chunks instead of stepping
+        // the motors instantaneously.
+        constexpr float kMaxRatioPerChunk = 1.25f;
+        if (target > applied_speed_scale_ * kMaxRatioPerChunk) {
+            applied_speed_scale_ *= kMaxRatioPerChunk;
+        }
+        else if (target < applied_speed_scale_ / kMaxRatioPerChunk) {
+            applied_speed_scale_ /= kMaxRatioPerChunk;
+        }
+        else {
+            applied_speed_scale_ = target;
+        }
+    }
+
+    uint16_t RmtStepSequencer::scale_interval(uint16_t base_interval_us) const {
+        if (applied_speed_scale_ == 1.0f) {
+            return base_interval_us;
+        }
+        constexpr float kMinIntervalUs =
+            1000000.0f / static_cast<float>(HardwareConfig::MAX_STEP_RATE_HZ);
+        constexpr float kMaxIntervalUs = 32000.0f;
+
+        float scaled = static_cast<float>(base_interval_us) / applied_speed_scale_;
+        scaled = std::max(kMinIntervalUs, std::min(scaled, kMaxIntervalUs));
+        return static_cast<uint16_t>(scaled + 0.5f);
+    }
+
     void RmtStepSequencer::encode_chunk(uint8_t buffer_idx) {
         auto& theta_buf = theta_symbols_[buffer_idx];
         auto& rho_buf = rho_symbols_[buffer_idx];
@@ -385,8 +425,12 @@ namespace sand_table {
         int32_t theta_steps_encoded = 0;
         int32_t rho_steps_encoded = 0;
 
+        // Live feedrate: re-read the override once per chunk, so a speed
+        // change lands within ~64 steps even mid-segment.
+        update_speed_scale();
+
         for (size_t i = 0; i < kChunkSize && steps_encoded_ < total_steps_; i++) {
-            uint16_t interval = intervals_[steps_encoded_];
+            uint16_t interval = scale_interval(intervals_[steps_encoded_]);
             bool step_theta, step_rho;
 
             bresenham_step(step_theta, step_rho);
@@ -601,16 +645,16 @@ namespace sand_table {
         // APIs, and calling it from the callback (the old design) corrupted
         // the RMT driver's transaction bookkeeping.
         //
-        // The overall timeout is sized by the caller from the segment's
-        // actual duration — a fixed timeout spuriously killed long slow
-        // segments mid-motion.
-        const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+        // Timeout is per pair-completion, not per segment: live feedrate
+        // scaling can stretch a segment far past any duration computed at
+        // plan time, but a single 64-symbol pair is bounded by
+        // 64 x 32.767ms ~= 2.1s even at the slowest interval. No pair
+        // completing within the window means the hardware is wedged.
+        (void)timeout_ms;  // Superseded by per-pair progress timeout
+        constexpr TickType_t kPairTimeout = pdMS_TO_TICKS(6000);
         for (;;) {
-            const TickType_t now = xTaskGetTickCount();
-            const int32_t remaining = static_cast<int32_t>(deadline - now);
-            if (remaining <= 0 ||
-                xSemaphoreTake(completion_sem_, remaining) != pdTRUE) {
-                ESP_LOGE(TAG, "RMT execution timeout (%lu ms)", timeout_ms);
+            if (xSemaphoreTake(completion_sem_, kPairTimeout) != pdTRUE) {
+                ESP_LOGE(TAG, "RMT stalled: no chunk completion within 6s");
                 stop_requested_.store(true, std::memory_order_release);
                 hard_abort_channels();
                 return Result<void>::err(MotionError::Timeout);
@@ -837,6 +881,25 @@ namespace sand_table {
             exit_rpm = 0.0f;
         }
 
+        // Safety cap applied AFTER feedrate: bound the physical theta spin
+        // rate regardless of what path speed was requested. Path speed v
+        // (units/min) over `distance` turns |delta_theta| in distance/v
+        // minutes, so the rotation rate is v * rotations / distance — clamp
+        // v so it never exceeds THETA_MAX_ROT_PER_MIN. Exact for either
+        // major axis (the ratio theta_steps/distance is fixed per segment).
+        float nominal_rpm = segment.nominal_velocity;
+        if (theta_moves && segment.distance > 0.0f) {
+            const float rotations = std::fabs(static_cast<float>(segment.delta_theta_rad)) /
+                (2.0f * static_cast<float>(M_PI));
+            if (rotations > 1e-6f) {
+                const float v_cap = MotionConfig::THETA_MAX_ROT_PER_MIN *
+                    segment.distance / rotations;
+                entry_rpm = std::min(entry_rpm, v_cap);
+                exit_rpm = std::min(exit_rpm, v_cap);
+                nominal_rpm = std::min(nominal_rpm, v_cap);
+            }
+        }
+
         // Convert RPM to steps/s using the relationship:
         //   motion_time = distance / (rpm / 60)
         //   velocity_steps_s = total_steps / motion_time
@@ -847,7 +910,7 @@ namespace sand_table {
 
         float entry_steps_s = entry_rpm * rpm_to_steps_s;
         float exit_steps_s = exit_rpm * rpm_to_steps_s;
-        float nominal_steps_s = segment.nominal_velocity * rpm_to_steps_s;
+        float nominal_steps_s = nominal_rpm * rpm_to_steps_s;
 
         // Clamp velocities to hardware limits
         entry_steps_s = std::max(min_step_rate, std::min(entry_steps_s, max_step_rate));
@@ -989,6 +1052,28 @@ namespace sand_table {
         const uint32_t expected_ms = static_cast<uint32_t>(interval_table_.total_us / 1000);
         const uint32_t timeout_ms = expected_ms * 2 + 2000;
 
+        // Live feedrate scaling reference: chunk intervals execute at
+        // (live_feedrate / base_feedrate) x the planned speed, so feedrate
+        // changes reach this segment even while it is running. The scale is
+        // ceilinged so a live boost can't push the segment past the theta
+        // rotation-rate cap the profile was clamped to (actual speed =
+        // planned_nominal x scale, so scale may grow only up to v_cap /
+        // planned_nominal; 1.0 when the cap already binds the plan).
+        float scale_ceiling = 20.0f;  // matches update_speed_scale's sanity clamp
+        if (segment.delta_theta_steps != 0 && segment.distance > 0.0f &&
+            segment.nominal_velocity > 0.0f) {
+            const float rotations = std::fabs(static_cast<float>(segment.delta_theta_rad)) /
+                (2.0f * static_cast<float>(M_PI));
+            if (rotations > 1e-6f) {
+                const float v_cap = MotionConfig::THETA_MAX_ROT_PER_MIN *
+                    segment.distance / rotations;
+                scale_ceiling = std::max(1.0f,
+                    v_cap / std::min(segment.nominal_velocity, v_cap));
+            }
+        }
+        rmt_sequencer_->set_speed_scale_ceiling(scale_ceiling);
+        rmt_sequencer_->set_speed_reference(segment.base_feedrate);
+
         // Each segment is one logical motion op: consume any stop left over
         // from a previous abort, then execute (a stop raised from here on
         // aborts this segment).
@@ -1065,6 +1150,13 @@ namespace sand_table {
         // axis coordination across chunk boundaries, and an ISR-requested
         // stop (hall/stall) aborts the loop via the EmergencyStop result.
         //
+        // Constant-speed moves (homing seeks) are exempt from live feedrate
+        // scaling - their speeds are chosen for StallGuard reliability.
+        // (The theta-cap scale ceiling is moot with scaling off; reset it so
+        // it can't leak from a previous capped segment.)
+        rmt_sequencer_->set_speed_scale_ceiling(20.0f);
+        rmt_sequencer_->set_speed_reference(0.0f);
+
         // Consume stops ONCE for the whole seek, not per chunk: the stop
         // flag persists across execute() calls, so a hall/stall ISR that
         // fires in the gap between two chunks aborts the next chunk instead

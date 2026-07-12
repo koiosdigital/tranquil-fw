@@ -79,7 +79,7 @@ extern "C" void app_main(void)
             PatternHandler::instance().notifyPatternDownloadComplete(
                 job.pattern_external_uuid, result.success);
         }
-    };
+        };
     esp_err_t job_err = jobs::JobProcessor::instance().init(std::move(executors), job_config);
     if (job_err != ESP_OK) {
         ESP_LOGE(TAG, "JobProcessor init FAILED: %s - background jobs will not run",

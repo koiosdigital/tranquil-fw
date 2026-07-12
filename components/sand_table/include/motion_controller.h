@@ -85,12 +85,27 @@ namespace sand_table {
         /// @param feedrate Constant path speed in normalized table units per
         ///        minute (1.0 = table radius). NOT motor RPM — angular speed
         ///        varies with radius so the ball's surface speed is uniform.
-        [[nodiscard]] Result<void> move_to(const PolarPosition& target, float feedrate = 0);
+        /// @param base_feedrate The user feedrate WITHOUT transient boosts
+        ///        (0 = same as feedrate). Live feedrate changes scale
+        ///        execution by set_live_feedrate() / base_feedrate, so a
+        ///        boosted move keeps its boost ratio.
+        [[nodiscard]] Result<void> move_to(const PolarPosition& target, float feedrate = 0,
+                                           float base_feedrate = 0);
 
         /// Move to a polar position using Cartesian interpolation (straight lines in XY space)
         /// @param target Target position (theta in radians 0-2π, rho normalized 0-1)
         /// @param feedrate Constant path speed, same units as move_to()
-        [[nodiscard]] Result<void> move_linear(const PolarPosition& target, float feedrate = 0);
+        /// @param base_feedrate See move_to()
+        [[nodiscard]] Result<void> move_linear(const PolarPosition& target, float feedrate = 0,
+                                               float base_feedrate = 0);
+
+        /// Live feedrate override: applies INSTANTLY to queued and in-flight
+        /// motion. Each executing chunk's step intervals are scaled by
+        /// (live_feedrate / segment.base_feedrate), slew-limited per chunk.
+        /// 0 disables the override (segments run at their planned speed).
+        void set_live_feedrate(float feedrate_rpm) {
+            live_feedrate_.store(feedrate_rpm, std::memory_order_relaxed);
+        }
 
         // =========================================================================
         // Control
@@ -223,6 +238,10 @@ namespace sand_table {
         // Progress tracking
         std::atomic<uint64_t> total_steps_queued_{ 0 };
         std::atomic<uint64_t> total_steps_completed_{ 0 };
+
+        // Live feedrate override (units/min, 0 = off). Read by the stepper
+        // sequencer's chunk encoder via pointer (see init()).
+        std::atomic<float> live_feedrate_{ 0.0f };
 
         // Position tracking: uses actual motor positions directly
         // No need for separate "target" tracking - motor positions are the source of truth

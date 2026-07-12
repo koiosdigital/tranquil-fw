@@ -11,6 +11,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -175,6 +176,40 @@ namespace sand_table {
             stop_requested_.store(false, std::memory_order_release);
         }
 
+        /// Source of the live feedrate override (units/min; 0 or nullptr =
+        /// no override). Read at every chunk encode, so feedrate changes
+        /// take effect mid-segment within one chunk (~64 steps).
+        void set_live_feedrate_source(const std::atomic<float>* src) {
+            live_feedrate_ = src;
+        }
+
+        /// Per-segment ceiling on the applied live-feedrate scale. The
+        /// planned intervals already respect THETA_MAX_ROT_PER_MIN; this
+        /// keeps a live feedrate boost from scaling the segment back past
+        /// it. Call from the executing task before set_speed_reference().
+        void set_speed_scale_ceiling(float ceiling) {
+            speed_scale_ceiling_ = (ceiling > 0.0f) ? ceiling : 1.0f;
+        }
+
+        /// The base feedrate the CURRENT motion was planned at (units/min).
+        /// Chunk intervals are scaled by live_feedrate / this, slew-limited.
+        /// 0 exempts the motion from live scaling (homing, unset). Call from
+        /// the executing task before execute().
+        void set_speed_reference(float base_feedrate_rpm) {
+            if (base_feedrate_rpm > 0.0f && speed_reference_rpm_ > 0.0f) {
+                // Rebase so the PHYSICAL speed is continuous across the
+                // reference change: a segment planned at the new feedrate
+                // needs scale 1 where the old one needed live/old_base.
+                applied_speed_scale_ *= speed_reference_rpm_ / base_feedrate_rpm;
+                applied_speed_scale_ = std::max(0.05f,
+                    std::min({ applied_speed_scale_, 20.0f, speed_scale_ceiling_ }));
+            }
+            else {
+                applied_speed_scale_ = 1.0f;
+            }
+            speed_reference_rpm_ = base_feedrate_rpm;
+        }
+
         /// Check if currently executing
         [[nodiscard]] bool is_executing() const noexcept {
             return executing_.load(std::memory_order_acquire);
@@ -222,6 +257,14 @@ namespace sand_table {
         uint32_t steps_encoded_ = 0;
         uint32_t encoded_chunks_ = 0;  // Chunk N is encoded into buffer N&1
         uint32_t total_steps_ = 0;
+
+        // Live feedrate scaling (see set_live_feedrate_source). The applied
+        // scale is slewed toward (live / reference) at each chunk encode so
+        // speed changes ramp over a few chunks instead of stepping.
+        const std::atomic<float>* live_feedrate_ = nullptr;
+        float speed_reference_rpm_ = 0.0f;
+        float applied_speed_scale_ = 1.0f;
+        float speed_scale_ceiling_ = 20.0f;  // per-segment, see setter
         BresenhamState* bresenham_ = nullptr;
         const uint16_t* intervals_ = nullptr;
         std::atomic<int32_t>* theta_pos_ = nullptr;
@@ -248,6 +291,12 @@ namespace sand_table {
         // Encode next chunk of steps into RMT symbols (task context only -
         // called from execute()'s refill loop, never from the ISR)
         void encode_chunk(uint8_t buffer_idx);
+
+        // Advance applied_speed_scale_ toward the live target (once per
+        // chunk) and scale one base interval by it (clamped to hardware
+        // limits). Task context only.
+        void update_speed_scale();
+        [[nodiscard]] uint16_t scale_interval(uint16_t base_interval_us) const;
 
         // Helper to create step and idle symbols
         static rmt_symbol_word_t make_step_symbol(uint16_t interval_us);
@@ -303,6 +352,12 @@ namespace sand_table {
 
         /// ISR-safe emergency stop - sets flag without blocking
         void IRAM_ATTR emergency_stop_from_isr();
+
+        /// Forward the live feedrate override source to the sequencer.
+        /// Call after init() (the sequencer must exist).
+        void set_live_feedrate_source(const std::atomic<float>* src) {
+            if (rmt_sequencer_) rmt_sequencer_->set_live_feedrate_source(src);
+        }
 
         /// Check if motion is in progress
         [[nodiscard]] bool is_moving() const noexcept {
