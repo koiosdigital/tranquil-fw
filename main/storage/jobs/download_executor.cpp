@@ -272,7 +272,7 @@ JobResult DownloadExecutor::performDownload(const std::string& pattern_uuid,
 
     // Build pattern info for database
     Pattern pattern_info;
-    pattern_info.id = 0;  // Will be assigned by TQDB
+    pattern_info.id = 0;  // Assigned by ManifestDatabase
     pattern_info.external_uuid = pattern_uuid;  // Server UUID for linking
     pattern_info.name = data.pattern_name;
     pattern_info.creator = data.pattern_creator;

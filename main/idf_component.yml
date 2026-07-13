@@ -4,7 +4,13 @@ dependencies:
   idf:
     version: ">=5.5.2"
   espressif/mdns: ^1.9.1
-  espressif/esp_websocket_client: ^1.6.1
+  # Koios fork of espressif/esp_websocket_client v1.7.0 with cross-task TLS
+  # teardown UAF fixes (sender-side abort deferral, destroy-from-own-task guard).
+  # Takes precedence over the espressif/esp_websocket_client pulled in by
+  # koios_sdk's manifest.
+  esp_websocket_client:
+    git: "https://github.com/koiosdigital/esp_websocket_client.git"
+    version: "v1.7.1"
   espressif/network_provisioning:
     version: "^1.2.2"
   espressif/cjson: "^1.7.19"

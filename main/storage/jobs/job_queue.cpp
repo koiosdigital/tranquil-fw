@@ -63,7 +63,7 @@ esp_err_t JobQueue::enqueueConversion(uint32_t pattern_id,
     }
 
     Job job;
-    job.id = 0;  // Will be assigned by TQDB
+    job.id = 0;  // Assigned by ManifestDatabase
     job.type = JobType::Conversion;
     job.pattern_id = pattern_id;
     job.status = JobStatus::Pending;
@@ -92,7 +92,7 @@ esp_err_t JobQueue::enqueueThumbnail(uint32_t pattern_id,
     }
 
     Job job;
-    job.id = 0;  // Will be assigned by TQDB
+    job.id = 0;  // Assigned by ManifestDatabase
     job.type = JobType::Thumbnail;
     job.pattern_id = pattern_id;
     job.status = JobStatus::Pending;
@@ -123,7 +123,7 @@ esp_err_t JobQueue::enqueueDownload(const std::string& pattern_external_uuid,
     }
 
     Job job;
-    job.id = 0;  // Will be assigned by TQDB
+    job.id = 0;  // Assigned by ManifestDatabase
     job.type = JobType::Download;
     job.pattern_id = 0;  // Pattern doesn't exist yet
     job.pattern_external_uuid = pattern_external_uuid;

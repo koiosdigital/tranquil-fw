@@ -29,7 +29,7 @@ enum class JobStatus : uint8_t {
  * @brief Base job data structure (from database)
  */
 struct Job {
-    uint32_t id = 0;                    // TQDB auto-increment primary key
+    uint32_t id = 0;                    // Auto-increment primary key (assigned on add)
     JobType type;
     uint32_t pattern_id = 0;            // Internal pattern ID reference
     std::string pattern_external_uuid;  // Server UUID for download jobs (before pattern exists)

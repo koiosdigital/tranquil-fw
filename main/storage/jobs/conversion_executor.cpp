@@ -216,7 +216,7 @@ esp_err_t ConversionExecutor::addPatternToDatabase(const std::string& external_u
                                                     size_t file_size,
                                                     bool encrypted) {
     Pattern pattern;
-    pattern.id = 0;  // Will be assigned by TQDB
+    pattern.id = 0;  // Assigned by ManifestDatabase
     pattern.external_uuid = external_uuid;
     pattern.name = name.empty() ? external_uuid : name;
     pattern.creator = "Uploaded";

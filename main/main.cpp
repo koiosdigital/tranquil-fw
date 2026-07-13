@@ -26,6 +26,7 @@
 #include "types.h"
 
 #include "api.h"
+#include "app_console.h"
 #include "usb_pd.h"
 #include "drm/drm_license.h"
 #include "sockets.h"
@@ -51,6 +52,7 @@ extern "C" void app_main(void)
 
     kd_common_init();
     kd_common_set_device_info("tranquil", FIRMWARE_VARIANT);
+    app_console_register_commands();
 
     // Cloud OTA (koios-sdk). Self-schedules once the cloudlink session is up
     // and the device JWT is available; NULL config uses the default OTA host.

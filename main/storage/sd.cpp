@@ -61,7 +61,16 @@ void deinit_sd() {
     ESP_LOGI(TAG, "Unmounted successfully");
 }
 
-void format_sd() {
-    esp_vfs_fat_sdcard_format(mount_point, card);
+esp_err_t format_sd() {
+    if (!card) {
+        ESP_LOGE(TAG, "Cannot format: SD card not mounted");
+        return ESP_ERR_INVALID_STATE;
+    }
+    esp_err_t ret = esp_vfs_fat_sdcard_format(mount_point, card);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Format failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
     ESP_LOGW(TAG, "SD card formatted");
+    return ESP_OK;
 }

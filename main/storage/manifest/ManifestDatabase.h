@@ -17,7 +17,7 @@ namespace jobs {
 
 // Pattern metadata
 struct Pattern {
-    uint32_t id = 0;              // TQDB auto-increment primary key
+    uint32_t id = 0;              // Auto-increment primary key (assigned on add)
     std::string external_uuid;    // Server UUID for linking to server-downloaded patterns
     std::string name;
     std::string creator;
@@ -41,7 +41,7 @@ struct Pattern {
 
 // Playlist metadata
 struct Playlist {
-    uint32_t id = 0;                    // TQDB auto-increment primary key
+    uint32_t id = 0;                    // Auto-increment primary key (assigned on add)
     std::string external_uuid;          // Server UUID for linking to server-downloaded playlists
     std::string name;
     std::string description;
@@ -67,8 +67,9 @@ struct PaginatedResult {
     PaginationInfo pagination;
 };
 
-// Binary file-backed manifest database (.tqdb format)
-// Thread-safe singleton with RAII resource management
+// Manifest database backed by JSONL snapshot files on the SD card.
+// Records are RAM-resident (PSRAM preferred); every mutation persists the
+// affected table atomically. Thread-safe singleton.
 class ManifestDatabase {
 public:
     static ManifestDatabase& instance();
@@ -136,7 +137,7 @@ public:
 
     // Memory management
     void releaseMemory();   // No-op, kept for API compatibility
-    esp_err_t vacuum();     // Compact database file (reclaim deleted space)
+    esp_err_t vacuum();     // Purge finished jobs and compact snapshots
 
     // Job queue operations (using internal IDs)
     esp_err_t enqueueJob(jobs::Job& job);  // ID assigned on success
@@ -164,16 +165,13 @@ public:
     size_t getPendingJobCount();
     size_t getInProgressJobCount();
 
-    // Internal access for JSON conversion (implementation detail)
-    class Impl;
-    Impl* getImpl() { return impl_.get(); }
-
 private:
     ManifestDatabase();
     ~ManifestDatabase();
     ManifestDatabase(const ManifestDatabase&) = delete;
     ManifestDatabase& operator=(const ManifestDatabase&) = delete;
 
+    class Impl;
     std::unique_ptr<Impl> impl_;
 };
 

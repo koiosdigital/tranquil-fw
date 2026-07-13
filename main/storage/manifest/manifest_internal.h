@@ -8,15 +8,24 @@
  */
 
 #include "ManifestDatabase.h"
-#include "tqdb.h"
+#include "manifest_store.h"
+#include "../jobs/job_types.h"
+
+#include <mutex>
 #include <cstdint>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-static constexpr const char* MANIFEST_DB_PATH = "/sd/manifest.tqdb";
 static constexpr const char* MANIFEST_TAG = "ManifestDB";
+static constexpr const char* MANIFEST_DIR = "/sd/manifest";
+static constexpr const char* PATTERNS_PATH = "/sd/manifest/patterns.jsonl";
+static constexpr const char* PLAYLISTS_PATH = "/sd/manifest/playlists.jsonl";
+static constexpr const char* JOBS_PATH = "/sd/manifest/jobs.jsonl";
+
+// Retired tqdb database file; renamed aside on first boot after the migration.
+static constexpr const char* LEGACY_TQDB_PATH = "/sd/manifest.tqdb";
 
 // Max sanity limits for corrupt file detection
 static constexpr uint32_t MAX_PATTERNS = 10000;
@@ -29,34 +38,32 @@ static constexpr uint32_t MAX_JOBS = 5000;
 
 class ManifestDatabase::Impl {
 public:
-    tqdb_t db = nullptr;
     bool initialized = false;
 
-    // Scratch buffer for TQDB (SPIRAM preferred)
-    uint8_t* scratch = nullptr;
-    static constexpr size_t SCRATCH_SIZE = 8192;
+    // Guards all table access. Recursive: public methods call each other.
+    std::recursive_mutex mutex;
 
-    // WAL memory buffer for hybrid WAL (avoids tmpfile() on ESP32)
-    uint8_t* wal_buf = nullptr;
-    static constexpr size_t WAL_BUF_SIZE = 16384;
-    static constexpr size_t WAL_FLUSH_THRESHOLD = 10;  // Flush every 10 writes
+    manifest::JsonlTable patterns{"Pattern", PATTERNS_PATH, MAX_PATTERNS};
+    manifest::JsonlTable playlists{"Playlist", PLAYLISTS_PATH, MAX_PLAYLISTS};
+    manifest::JsonlTable jobs{"Job", JOBS_PATH, MAX_JOBS};
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// TQDB Platform Wrappers
-// ─────────────────────────────────────────────────────────────────────────────
-
-// FreeRTOS mutex operations for TQDB
-extern tqdb_mutex_ops_t g_freertos_mutex_ops;
-
-// SPIRAM-preferred allocator for TQDB
-extern tqdb_alloc_t g_spiram_alloc;
+using ManifestLock = std::lock_guard<std::recursive_mutex>;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TQDB Traits
+// Storage converters (full-fidelity, unlike the API-shaped converters in
+// ManifestDatabase.h — these round-trip every field)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Entity traits for TQDB serialization
-extern const tqdb_trait_t g_pattern_trait;
-extern const tqdb_trait_t g_playlist_trait;
-extern const tqdb_trait_t g_job_trait;
+std::string storage_get_str(const cJSON* obj, const char* key);
+double storage_get_num(const cJSON* obj, const char* key, double def);
+bool storage_get_bool(const cJSON* obj, const char* key);
+
+cJSON* pattern_to_storage(const Pattern& p);
+Pattern pattern_from_storage(const cJSON* obj);
+
+cJSON* playlist_to_storage(const Playlist& pl);
+Playlist playlist_from_storage(const cJSON* obj);
+
+cJSON* job_to_storage(const jobs::Job& j);
+jobs::Job job_from_storage(const cJSON* obj);

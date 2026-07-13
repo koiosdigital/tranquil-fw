@@ -136,7 +136,7 @@ HandleResult PlaylistHandler::handleCreatePlaylist(
     }
 
     Playlist playlist;
-    playlist.id = 0;  // Will be assigned by TQDB
+    playlist.id = 0;  // Assigned by ManifestDatabase
     playlist.external_uuid = ManifestDatabase::generateUUID();
     playlist.name = msg->name;
     playlist.description = msg->description ? msg->description : "";

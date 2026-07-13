@@ -116,4 +116,4 @@ sdkconfig.bak
 #secure files
 flash_encryption_key.bin
 .vscode/mcp.json
-keys
+keyscomponents/tqdb/

@@ -45,7 +45,7 @@ cJSON* ManifestDatabase::playlistToJson(const Playlist& pl) {
     cJSON* json = cJSON_CreateObject();
     if (!json) return nullptr;
 
-    auto* impl = instance().getImpl();
+    auto& db = instance();
 
     // Use external_uuid as "uuid" for API compatibility
     cJSON_AddStringToObject(json, "uuid", pl.external_uuid.c_str());
@@ -54,18 +54,12 @@ cJSON* ManifestDatabase::playlistToJson(const Playlist& pl) {
     cJSON_AddStringToObject(json, "description", pl.description.c_str());
 
     // Convert featured_pattern_id to external UUID
+    std::string featured_uuid;
     if (pl.featured_pattern_id != 0) {
-        Pattern fp;
-        if (tqdb_get(impl->db, "Pattern", pl.featured_pattern_id, &fp) == TQDB_OK) {
-            cJSON_AddStringToObject(json, "featured_pattern", fp.external_uuid.c_str());
-        }
-        else {
-            cJSON_AddStringToObject(json, "featured_pattern", "");
-        }
+        auto fp = db.getPattern(pl.featured_pattern_id);
+        if (fp) featured_uuid = fp->external_uuid;
     }
-    else {
-        cJSON_AddStringToObject(json, "featured_pattern", "");
-    }
+    cJSON_AddStringToObject(json, "featured_pattern", featured_uuid.c_str());
 
     cJSON_AddStringToObject(json, "date", pl.date.c_str());
     if (!pl.created_at.empty())
@@ -77,9 +71,9 @@ cJSON* ManifestDatabase::playlistToJson(const Playlist& pl) {
     cJSON* patterns = cJSON_CreateArray();
     if (patterns) {
         for (uint32_t pid : pl.pattern_ids) {
-            Pattern p;
-            if (tqdb_get(impl->db, "Pattern", pid, &p) == TQDB_OK) {
-                cJSON* entry = cJSON_CreateString(p.external_uuid.c_str());
+            auto p = db.getPattern(pid);
+            if (p) {
+                cJSON* entry = cJSON_CreateString(p->external_uuid.c_str());
                 // cJSON_AddItemToArray does NOT free the item on failure —
                 // an unchecked add leaks the node under OOM.
                 if (entry && !cJSON_AddItemToArray(patterns, entry)) {
@@ -87,7 +81,9 @@ cJSON* ManifestDatabase::playlistToJson(const Playlist& pl) {
                 }
             }
         }
-        cJSON_AddItemToObject(json, "patterns", patterns);
+        if (!cJSON_AddItemToObject(json, "patterns", patterns)) {
+            cJSON_Delete(patterns);
+        }
     }
 
     return json;

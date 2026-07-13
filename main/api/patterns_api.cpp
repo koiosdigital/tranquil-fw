@@ -431,7 +431,7 @@ static esp_err_t patterns_upload_handler(httpd_req_t* req) {
 
     // Create pattern in database first to get internal ID
     Pattern pattern;
-    pattern.id = 0;  // Will be assigned by TQDB
+    pattern.id = 0;  // Assigned by ManifestDatabase
     pattern.external_uuid = ctx->uuid;
     pattern.name = strlen(ctx->filename) > 0 ? ctx->filename : ctx->uuid;
     pattern.creator = "Uploaded";

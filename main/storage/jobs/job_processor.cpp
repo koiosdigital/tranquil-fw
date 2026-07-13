@@ -34,7 +34,7 @@ public:
     // at which the job may be retried. Fixed-size, spinlock-protected — read
     // from the processor task, written from worker tasks.
     struct BackoffEntry {
-        uint32_t job_id = 0;        // 0 = empty slot (TQDB IDs start at 1)
+        uint32_t job_id = 0;        // 0 = empty slot (record IDs start at 1)
         TickType_t not_before = 0;
     };
     static constexpr size_t MAX_BACKOFF_ENTRIES = 8;
