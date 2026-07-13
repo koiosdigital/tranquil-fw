@@ -3238,25 +3238,11 @@ CONFIG_WL_SECTOR_SIZE=4096
 # end of Wear Levelling
 
 #
-# TQDB Configuration
+# ESP WebSocket client
 #
-# default:
-CONFIG_TQDB_ENABLE_WAL=y
-# default:
-CONFIG_TQDB_ENABLE_CACHE=y
-# default:
-# CONFIG_TQDB_ENABLE_QUERY is not set
-# default:
-CONFIG_TQDB_MAX_ENTITY_TYPES=8
-# default:
-CONFIG_TQDB_DEFAULT_SCRATCH_SIZE=8192
-# default:
-CONFIG_TQDB_WAL_MAX_ENTRIES_DEFAULT=100
-# default:
-CONFIG_TQDB_WAL_MAX_SIZE_DEFAULT=65536
-# default:
-CONFIG_TQDB_CACHE_SIZE_DEFAULT=16
-# end of TQDB Configuration
+# CONFIG_ESP_WS_CLIENT_ENABLE_DYNAMIC_BUFFER is not set
+# CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK is not set
+# end of ESP WebSocket client
 
 #
 # cJSON
@@ -3266,13 +3252,6 @@ CONFIG_CJSON_NESTING_LIMIT=1000
 # default:
 CONFIG_CJSON_CIRCULAR_LIMIT=10000
 # end of cJSON
-
-#
-# ESP WebSocket client
-#
-# CONFIG_ESP_WS_CLIENT_ENABLE_DYNAMIC_BUFFER is not set
-# CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK is not set
-# end of ESP WebSocket client
 
 #
 # mDNS
