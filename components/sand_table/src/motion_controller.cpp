@@ -19,6 +19,7 @@ namespace sand_table {
         , transformer_(std::make_unique<CoordinateTransformer>())
     {
         planner_mutex_ = xSemaphoreCreateMutex();
+        motor_power_mutex_ = xSemaphoreCreateMutex();
 
         // Set up PathPlanner callback to enqueue segments via VelocityPlanner
         path_planner_->set_segment_callback([this](MotionSegment& seg) {
@@ -35,6 +36,10 @@ namespace sand_table {
         if (planner_mutex_) {
             vSemaphoreDelete(planner_mutex_);
             planner_mutex_ = nullptr;
+        }
+        if (motor_power_mutex_) {
+            vSemaphoreDelete(motor_power_mutex_);
+            motor_power_mutex_ = nullptr;
         }
     }
 
@@ -355,22 +360,50 @@ namespace sand_table {
 
     void MotionController::inactivity_timer_callback(TimerHandle_t timer) {
         auto* self = static_cast<MotionController*>(pvTimerGetTimerID(timer));
-        self->disable_motors();
+
+        // Runs on the timer service task. Only power off if no enable
+        // happened since this timer was armed — an expiry dispatched just
+        // before enable_motors() must not disable under a starting move.
+        // A failed take skips the disable (safe direction); the next idle
+        // transition re-arms the timer.
+        if (xSemaphoreTake(self->motor_power_mutex_, pdMS_TO_TICKS(500)) != pdTRUE) {
+            return;
+        }
+        if (self->enable_epoch_.load(std::memory_order_acquire) ==
+            self->armed_epoch_.load(std::memory_order_acquire)) {
+            ESP_LOGI(TAG, "Motors idle for %lums - disabling",
+                static_cast<unsigned long>(MotionConfig::MOTOR_INACTIVITY_TIMEOUT_MS));
+            self->stepper_controller_->disable();
+        }
+        xSemaphoreGive(self->motor_power_mutex_);
     }
 
     void MotionController::reset_inactivity_timer() {
         if (inactivity_timer_) {
+            armed_epoch_.store(enable_epoch_.load(std::memory_order_acquire),
+                std::memory_order_release);
             xTimerReset(inactivity_timer_, 0);
         }
     }
 
     void MotionController::enable_motors() {
-        stepper_controller_->enable();
         xTimerStop(inactivity_timer_, 0);
+        if (xSemaphoreTake(motor_power_mutex_, portMAX_DELAY) == pdTRUE) {
+            // Invalidate any in-flight inactivity expiry before energizing;
+            // the callback compares against armed_epoch_ under this mutex.
+            enable_epoch_.fetch_add(1, std::memory_order_acq_rel);
+            stepper_controller_->enable();
+            xSemaphoreGive(motor_power_mutex_);
+        }
     }
 
     void MotionController::disable_motors() {
-        stepper_controller_->disable();
+        // Explicit disable (console command / shutdown) — unconditional,
+        // just serialized against the enable/expiry paths.
+        if (xSemaphoreTake(motor_power_mutex_, portMAX_DELAY) == pdTRUE) {
+            stepper_controller_->disable();
+            xSemaphoreGive(motor_power_mutex_);
+        }
     }
 
     Result<void> MotionController::home(bool force_full) {
@@ -592,6 +625,10 @@ namespace sand_table {
             theta_stepper_->position(),
             rho_stepper_->position()
         );
+    }
+
+    PolarPosition MotionController::get_planning_position() const {
+        return path_planner_->current_position();
     }
 
     bool MotionController::enqueue_segment(MotionSegment& segment) {

@@ -144,7 +144,7 @@ private:
     // Motion processing
     static bool processPatternLine(const PatternLine& line);
     static void sendMoveCommand(double theta_rad, double rho_normalized,
-                                float speed_multiplier = 1.0f);
+        float speed_multiplier = 1.0f);
 
     // State
     static sand_table::MotionController* motion_controller_;
@@ -169,6 +169,22 @@ private:
     static size_t current_line_index_;
     static size_t total_lines_;
     static bool file_loaded_;
+
+    // Path-length-based progress. Line counting misrepresents progress when
+    // lines differ wildly in drawn length (a single multi-rotation sweep line
+    // is minutes of motion), so progress is measured as path length instead:
+    // the file is pre-scanned once at load for the total (cached per UUID so
+    // loop replays skip the scan) and popLine() accumulates the same
+    // per-segment metric as points are fed. Mutated under file_mutex_; the
+    // published percent is atomic so status readers never tear a double.
+    static double total_path_len_;      // whole pattern, normalized units
+    static double completed_path_len_;  // fed to the planner so far
+    static double prev_point_theta_;    // last popped point (file space)
+    static double prev_point_rho_;
+    static bool have_prev_point_;
+    static std::atomic<int> path_progress_percent_;  // -1: no path data, line fallback
+    static char prescan_uuid_[MAX_UUID_LEN];
+    static double prescan_total_;
 
     // Playlist state
     static char current_playlist_uuid_[MAX_UUID_LEN];
@@ -198,6 +214,6 @@ private:
     // work bounded while still saturating the motion queue (the queue-full
     // return from processPatternLine is the real throttle).
     static constexpr int kMaxLinesPerTick = 64;
-    static constexpr size_t SERVICE_TASK_STACK_SIZE = 8192;
+    static constexpr size_t SERVICE_TASK_STACK_SIZE = 4096;
     static constexpr UBaseType_t SERVICE_TASK_PRIORITY = 5;
 };

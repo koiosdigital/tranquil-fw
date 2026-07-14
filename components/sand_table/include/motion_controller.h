@@ -135,8 +135,18 @@ namespace sand_table {
         // Status
         // =========================================================================
 
-        /// Get current polar position
+        /// Get current polar position (derived from motor counters; theta
+        /// WRAPPED to [0, 2π) — display/API only)
         [[nodiscard]] PolarPosition get_position() const;
+
+        /// Position in the path planner's CONTINUOUS frame (theta unwrapped;
+        /// after a long sweep it can be many full turns). This is the frame
+        /// move_to()/move_linear() plan their deltas from — use it, not
+        /// get_position(), when rebasing absolute targets (e.g. a pattern's
+        /// wound-up theta) onto the current position: an offset computed
+        /// against the wrapped theta differs by whole rotations, and the
+        /// first move physically unwinds all of them.
+        [[nodiscard]] PolarPosition get_planning_position() const;
 
         /// Get current system state
         [[nodiscard]] SystemState get_state() const noexcept {
@@ -254,6 +264,17 @@ namespace sand_table {
         TimerHandle_t inactivity_timer_ = nullptr;
         static constexpr TickType_t kInactivityTimeout =
             pdMS_TO_TICKS(MotionConfig::MOTOR_INACTIVITY_TIMEOUT_MS);
+
+        // Guards enable/disable ordering between motion-starting tasks and
+        // the inactivity callback (timer service task): xTimerStop() does
+        // not cancel an already-dispatched callback, so without this an
+        // expiry racing enable_motors() powers the motors off UNDER a
+        // starting move — which then runs (and desyncs position) silently.
+        // The callback only disables if no enable happened since the timer
+        // was armed (enable_epoch_ still equals armed_epoch_).
+        SemaphoreHandle_t motor_power_mutex_ = nullptr;
+        std::atomic<uint32_t> enable_epoch_{ 0 };
+        std::atomic<uint32_t> armed_epoch_{ 0 };
 
         // Task functions
         static void stepper_task_entry(void* arg);

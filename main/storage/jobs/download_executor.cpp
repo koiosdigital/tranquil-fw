@@ -3,6 +3,7 @@
 #include "ManifestDatabase.h"
 #include "PatternReader.h"
 #include "EncryptedPatternReader.h"
+#include "download_progress.h"
 #include "drm/drm_license.h"
 #include "drm/drm_purchase.h"
 
@@ -93,6 +94,9 @@ JobResult DownloadExecutor::performDownload(const std::string& pattern_uuid,
         (long long)data.size_bytes);
     ESP_LOGI(TAG, "  URL: %s", data.download_url.c_str());
 
+    // 10% = job picked up by a worker
+    DownloadProgressBroadcaster::instance().report(pattern_uuid, 10);
+
     // For subscription patterns (no receipt), check license validity and limits
     // For purchased patterns (has receipt), we can download without a valid subscription
     if (!data.hasPurchaseReceipt()) {
@@ -123,12 +127,14 @@ JobResult DownloadExecutor::performDownload(const std::string& pattern_uuid,
     // HTTP event handler context
     struct DownloadContext {
         FileHandle* file;
+        const char* pattern_uuid;
         size_t bytes_written = 0;
         size_t next_progress_log = 0;
+        uint8_t last_progress_pct = 0;
         esp_err_t error = ESP_OK;
     };
 
-    DownloadContext ctx = {&file};
+    DownloadContext ctx = {&file, pattern_uuid.c_str()};
 
     // Event handler that streams to file
     auto event_handler = [](esp_http_client_event_t* evt) -> esp_err_t {
@@ -151,6 +157,21 @@ JobResult DownloadExecutor::performDownload(const std::string& pattern_uuid,
                     if (ctx->bytes_written >= ctx->next_progress_log) {
                         ESP_LOGI(TAG, "  received %zu bytes", ctx->bytes_written);
                         ctx->next_progress_log = ctx->bytes_written + 65536;
+                    }
+                    // Map byte progress into the 20-80 band, in 5% steps
+                    {
+                        int64_t total = esp_http_client_get_content_length(evt->client);
+                        if (total > 0) {
+                            uint8_t pct = 20 + static_cast<uint8_t>(
+                                (ctx->bytes_written * 60) / static_cast<size_t>(total));
+                            if (pct > 80) pct = 80;
+                            pct -= pct % 5;
+                            if (pct > ctx->last_progress_pct) {
+                                ctx->last_progress_pct = pct;
+                                DownloadProgressBroadcaster::instance().report(
+                                    ctx->pattern_uuid, pct);
+                            }
+                        }
                     }
                 }
                 break;
@@ -219,17 +240,21 @@ JobResult DownloadExecutor::performDownload(const std::string& pattern_uuid,
 
     file.close();
 
-    // Validate against the server-announced size: a short body means the
-    // transfer was truncated mid-stream (retryable).
+    // Do NOT validate against the metadata size: the server's size_bytes does
+    // not describe the download payload (observed consistently smaller bodies
+    // with a clean 200 + matching Content-Length). Truncation is already
+    // caught by esp_http_client (ESP_ERR_HTTP_INCOMPLETE_DATA), and the magic
+    // sniff below rejects unusable files.
     if (data.size_bytes > 0 &&
         ctx.bytes_written != static_cast<size_t>(data.size_bytes)) {
-        ESP_LOGE(TAG, "Size mismatch: got %zu bytes, expected %lld",
-            ctx.bytes_written, (long long)data.size_bytes);
-        remove(file_path);
-        return JobResult::fail("Download size mismatch");
+        ESP_LOGW(TAG, "Metadata size %lld != payload size %zu (informational)",
+            (long long)data.size_bytes, ctx.bytes_written);
     }
 
     ESP_LOGI(TAG, "Downloaded %zu bytes -> %s", ctx.bytes_written, file_path);
+
+    // 80% = transfer done; conversion (if any) runs before the thumbnailer's 90
+    DownloadProgressBroadcaster::instance().report(pattern_uuid, 80);
 
     // Sniff the actual format from the file's magic bytes.
     enum class PatternFormat { Kdep, Thrb, Text };

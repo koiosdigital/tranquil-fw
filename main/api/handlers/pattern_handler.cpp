@@ -2,6 +2,7 @@
 #include "pattern_handler.h"
 #include "ManifestDatabase.h"
 #include "download_tracker.h"
+#include "download_progress.h"
 #include "websocket_server.h"
 
 #include <esp_log.h>
@@ -267,6 +268,9 @@ HandleResult PatternHandler::handleRequestPatternDownload(
     if (ctx.isLocal()) {
         // Track the download so we can route progress back to this client
         DownloadTracker::instance().trackDownload(msg->pattern_uuid, ctx.socket_fd);
+
+        // 0% = accepted, job not started yet
+        DownloadProgressBroadcaster::instance().track(msg->pattern_uuid);
 
         ESP_LOGI(TAG, "Forwarding pattern download request to cloud (tracked socket %d)",
             ctx.socket_fd);

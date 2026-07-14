@@ -3,6 +3,7 @@
 #include "drm/drm_purchase.h"
 #include "raii_utils.hpp"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "nvs.h"
 #include <cstdio>
 #include <cstdlib>
@@ -32,6 +33,15 @@ size_t SandTablePlayer::current_line_index_ = 0;
 size_t SandTablePlayer::total_lines_ = 0;
 bool SandTablePlayer::file_loaded_ = false;
 
+double SandTablePlayer::total_path_len_ = 0.0;
+double SandTablePlayer::completed_path_len_ = 0.0;
+double SandTablePlayer::prev_point_theta_ = 0.0;
+double SandTablePlayer::prev_point_rho_ = 0.0;
+bool SandTablePlayer::have_prev_point_ = false;
+std::atomic<int> SandTablePlayer::path_progress_percent_{ -1 };
+char SandTablePlayer::prescan_uuid_[MAX_UUID_LEN] = { 0 };
+double SandTablePlayer::prescan_total_ = 0.0;
+
 char SandTablePlayer::current_playlist_uuid_[MAX_UUID_LEN] = { 0 };
 std::vector<std::string> SandTablePlayer::playlist_patterns_;
 std::vector<size_t> SandTablePlayer::playlist_order_;
@@ -48,6 +58,15 @@ std::atomic<bool> SandTablePlayer::linear_interpolation_{ false };
 // is stored in NVS as centi-units (no float type there) and restored on
 // boot; writes are skipped when the value hasn't changed (flash wear).
 namespace {
+    // Estimated drawn length between two theta-rho points in normalized
+    // table units (1.0 = table radius) — the same metric the feed rate uses.
+    // Arc component |Δθ|·ρ_avg plus radial component, combined euclidean.
+    double segmentLength(double t0, double r0, double t1, double r1) {
+        const double arc = (t1 - t0) * 0.5 * (r0 + r1);
+        const double radial = r1 - r0;
+        return std::sqrt(arc * arc + radial * radial);
+    }
+
     constexpr double kFeedRateMin = 1.0;
     constexpr double kFeedRateMax = 5.0;
     constexpr double kFeedRateDefault = 5.0;
@@ -660,12 +679,15 @@ cJSON* SandTablePlayer::getStateJSON() {
 int SandTablePlayer::getTotalProgress() {
     if (!file_loaded_ || total_lines_ == 0) return 0;
 
-    // Line-based progress. The old steps_completed/steps_queued ratio only
-    // measured the buffered window (queued runs at most ~100 segments ahead
-    // of completed), so it read ~100% almost immediately regardless of how
-    // far into the pattern playback actually was. Lines fed lead physical
-    // motion by at most that same buffered window, so this is accurate to a
-    // few percent and monotonic.
+    // Path-length progress (set by popLine): fraction of the pattern's total
+    // drawn distance fed to the planner. Unlike line counting this stays
+    // truthful for multi-rotation lines, where one line is minutes of motion.
+    // Lines fed lead physical motion by at most the planner's buffered
+    // window, so this is accurate to a few percent and monotonic.
+    int path_percent = path_progress_percent_.load(std::memory_order_relaxed);
+    if (path_percent >= 0) return path_percent;
+
+    // Fallback when no path data exists (pre-scan unavailable): line-based.
     int percent = static_cast<int>(
         (static_cast<double>(current_line_index_) / static_cast<double>(total_lines_)) * 100.0);
     if (percent > 100) percent = 100;
@@ -825,6 +847,44 @@ esp_err_t SandTablePlayer::loadPatternFile(const char* pattern_uuid) {
 
     total_lines_ = pattern_reader_->getTotalLines();
     current_line_index_ = 0;
+
+    // Measure the pattern's total drawn path length for real progress
+    // reporting. One sequential pass through the reader, then rewind; the
+    // result is cached per UUID so loop replays skip the scan.
+    completed_path_len_ = 0.0;
+    have_prev_point_ = false;
+    total_path_len_ = 0.0;
+    if (strncmp(prescan_uuid_, pattern_uuid, MAX_UUID_LEN) == 0 && prescan_total_ > 0.0) {
+        total_path_len_ = prescan_total_;
+    }
+    else {
+        const int64_t t_scan = esp_timer_get_time();
+        double total = 0.0, pt = 0.0, pr = 0.0;
+        bool first = true;
+        while (pattern_reader_->hasMore()) {
+            PatternPoint p = pattern_reader_->readNext();
+            if (!p.valid) break;
+            if (!first) total += segmentLength(pt, pr, p.theta, p.rho);
+            first = false;
+            pt = p.theta;
+            pr = p.rho;
+        }
+        if (pattern_reader_->rewind() != ESP_OK) {
+            ESP_LOGE(TAG, "Rewind after path pre-scan failed");
+            pattern_reader_->close();
+            pattern_reader_.reset();
+            total_lines_ = 0;
+            return ESP_FAIL;
+        }
+        total_path_len_ = total;
+        strlcpy(prescan_uuid_, pattern_uuid, sizeof(prescan_uuid_));
+        prescan_total_ = total;
+        ESP_LOGI(TAG, "Path pre-scan: %.1f units in %lldms",
+            total, (long long)((esp_timer_get_time() - t_scan) / 1000));
+    }
+    path_progress_percent_.store(total_path_len_ > 0.0 ? 0 : -1,
+        std::memory_order_relaxed);
+
     file_loaded_ = true;
 
     ESP_LOGI(TAG, "Loaded pattern: %s (%zu points, encrypted=%d)",
@@ -846,6 +906,10 @@ void SandTablePlayer::unloadPatternFile() {
     }
     current_line_index_ = 0;
     total_lines_ = 0;
+    total_path_len_ = 0.0;
+    completed_path_len_ = 0.0;
+    have_prev_point_ = false;
+    path_progress_percent_.store(-1, std::memory_order_relaxed);
     file_loaded_ = false;
 }
 
@@ -884,9 +948,26 @@ void SandTablePlayer::popLine() {
         return;
     }
     if (!file_loaded_ || !pattern_reader_) return;
-    // Advance the reader position
-    pattern_reader_->readNext();
+    // Advance the reader position, accumulating drawn path length. Deltas in
+    // file space equal the commanded deltas (the theta offset rebase is a
+    // constant shift), so this matches what the table actually draws.
+    PatternPoint p = pattern_reader_->readNext();
     current_line_index_++;
+    if (p.valid) {
+        if (have_prev_point_) {
+            completed_path_len_ += segmentLength(
+                prev_point_theta_, prev_point_rho_, p.theta, p.rho);
+            if (total_path_len_ > 0.0) {
+                int percent = static_cast<int>(
+                    (completed_path_len_ / total_path_len_) * 100.0);
+                path_progress_percent_.store(std::min(std::max(percent, 0), 100),
+                    std::memory_order_relaxed);
+            }
+        }
+        prev_point_theta_ = p.theta;
+        prev_point_rho_ = p.rho;
+        have_prev_point_ = true;
+    }
 }
 
 bool SandTablePlayer::hasMoreLines() {
@@ -1014,20 +1095,6 @@ bool SandTablePlayer::processPatternLine(const PatternLine& line) {
 
     constexpr double kTwoPi = 2.0 * M_PI;
 
-    if (line.is_first_line) {
-        // First line: record starting position, no move needed.
-        // Rebase the pattern's absolute theta so its first point lands
-        // within half a turn of where the table already is (same angle
-        // modulo 2π) — files can open at an arbitrarily wound-up theta,
-        // and without this the first move unwinds all of it physically.
-        const double current = motion_controller_->get_position().theta;
-        const double adjusted = current + std::remainder(line.theta - current, kTwoPi);
-        pattern_position_.theta_offset = line.theta - adjusted;
-        pattern_position_.prev_theta = adjusted;
-        pattern_position_.prev_rho = line.rho;
-        return true;
-    }
-
     // Check if motion controller can accept command
     auto status = motion_controller_->get_status();
     if (!status.is_homed) {
@@ -1038,6 +1105,34 @@ bool SandTablePlayer::processPatternLine(const PatternLine& line) {
     if (status.queue_depth >= status.queue_capacity) {
         // Queue full, don't pop line yet - will retry
         return false;
+    }
+
+    if (line.is_first_line) {
+        // Rebase the pattern's absolute theta so its first point lands
+        // within half a turn of where the table already is (same angle
+        // modulo 2π) — files can open at an arbitrarily wound-up theta,
+        // and without this the first move unwinds all of it physically.
+        // The reference MUST be the planner's continuous theta, not the
+        // wrapped physical get_position(): moves plan their deltas in the
+        // planner frame, which stays wound up after a multi-rotation sweep
+        // (an erase leaves it ~100π ahead). An offset computed against the
+        // wrapped angle is off by those whole turns, and the next pattern's
+        // first move would unwind all of them along the rim.
+        const double current = motion_controller_->get_planning_position().theta;
+        const double adjusted = current + std::remainder(line.theta - current, kTwoPi);
+        pattern_position_.theta_offset = line.theta - adjusted;
+        pattern_position_.prev_theta = adjusted;
+        pattern_position_.prev_rho = line.rho;
+
+        // Physically transit to the pattern's start point. Skipping this
+        // (the old "record only, no move" behavior) left the table wherever
+        // the previous pattern ended, so a pattern authored from the center
+        // — e.g. an erase whose line 1 is "0 0" and line 2 spirals out over
+        // dozens of rotations — never retracted and just circled at the
+        // previous rho for the whole sweep. Boosted like other transits;
+        // theta is bounded to ±π by the rebase above.
+        sendMoveCommand(adjusted, line.rho, kFoldedMoveSpeedMultiplier);
+        return true;
     }
 
     const double theta = line.theta - pattern_position_.theta_offset;

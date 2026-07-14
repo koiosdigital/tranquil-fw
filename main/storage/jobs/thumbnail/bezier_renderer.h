@@ -33,7 +33,10 @@ public:
     void addPoint(const CartesianPoint& point);
 
     /**
-     * Add a polar point (converts internally).
+     * Add a polar point (converts internally). Segments spanning a large
+     * theta delta are subdivided in polar space first, so multi-rotation
+     * lines render as the spiral the table draws instead of a straight
+     * chord from the previous point.
      */
     void addPolarPoint(const PolarPoint& point);
 
@@ -99,9 +102,21 @@ private:
     // Total points added
     size_t point_count_;
 
+    // Last polar point fed, for polar-space subdivision of long segments
+    PolarPoint last_polar_;
+    bool has_last_polar_ = false;
+
     // Rendering constants
     static constexpr int MAX_BEZIER_DEPTH = 8;
     static constexpr float FLATNESS_THRESHOLD = 0.5f;
+
+    // Polar subdivision: segments whose |dtheta| exceeds the threshold are
+    // expanded into steps of at most kPolarStepRad (chord error at full
+    // radius ~ r*step^2/8 < half a pixel). Step count is capped so a
+    // pathological theta delta can't stall the render.
+    static constexpr float kPolarSubdivideThresholdRad = 0.15f;
+    static constexpr float kPolarStepRad = 0.1f;
+    static constexpr int kMaxPolarSteps = 4096;
 };
 
 } // namespace thumbnail

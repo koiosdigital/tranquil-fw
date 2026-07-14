@@ -20,9 +20,31 @@ void BezierRenderer::beginPath() {
     p0_ = CartesianPoint();
     p1_ = CartesianPoint();
     current_ = CartesianPoint();
+    last_polar_ = PolarPoint();
+    has_last_polar_ = false;
 }
 
 void BezierRenderer::addPolarPoint(const PolarPoint& point) {
+    // Long theta sweeps must be traced in polar space: the table moves
+    // linearly in (theta, rho), so a multi-rotation line is a spiral, not
+    // the straight chord a direct Cartesian conversion would draw.
+    if (has_last_polar_) {
+        const float dtheta = point.theta - last_polar_.theta;
+        if (std::fabs(dtheta) > kPolarSubdivideThresholdRad) {
+            int steps = static_cast<int>(std::fabs(dtheta) / kPolarStepRad) + 1;
+            if (steps > kMaxPolarSteps) steps = kMaxPolarSteps;
+            const float drho = point.rho - last_polar_.rho;
+            for (int i = 1; i < steps; i++) {
+                const float t = static_cast<float>(i) / static_cast<float>(steps);
+                addPoint(toCartesian(PolarPoint{
+                    last_polar_.theta + dtheta * t,
+                    last_polar_.rho + drho * t }));
+            }
+        }
+    }
+
+    last_polar_ = point;
+    has_last_polar_ = true;
     addPoint(toCartesian(point));
 }
 

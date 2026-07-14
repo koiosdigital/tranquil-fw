@@ -105,7 +105,10 @@ namespace sand_table {
         // Constants that don't change at runtime
         static constexpr uint32_t LOOKAHEAD_DEPTH = 32;
         static constexpr float JUNCTION_DEVIATION_MM = 0.05f;
-        static constexpr uint32_t MOTOR_INACTIVITY_TIMEOUT_MS = 5000;
+        // De-energize the motors after this long with no motion (holding
+        // current just heats the drivers; the arm can't backdrive). The next
+        // move re-enables them (with the TMC warmup delay).
+        static constexpr uint32_t MOTOR_INACTIVITY_TIMEOUT_MS = 30000;
 
         // Hard cap on major-axis steps per motion segment. Sized so the
         // interval table (MAX_SEGMENT_STEPS * sizeof(uint16_t)) fits in
@@ -168,14 +171,9 @@ namespace sand_table {
 
     struct TaskConfig {
         // Stepper task - highest priority, runs on Core 1
-        static constexpr uint32_t STEPPER_TASK_STACK = 4096;
+        static constexpr uint32_t STEPPER_TASK_STACK = 2048;
         static constexpr int STEPPER_TASK_PRIORITY = 24;  // configMAX_PRIORITIES - 1
         static constexpr int STEPPER_TASK_CORE = 1;
-
-        // Planner task - medium priority, runs on Core 0
-        static constexpr uint32_t PLANNER_TASK_STACK = 4096;
-        static constexpr int PLANNER_TASK_PRIORITY = 5;
-        static constexpr int PLANNER_TASK_CORE = 0;
     };
 
 } // namespace sand_table

@@ -2,6 +2,7 @@
 #include "job_queue.h"
 #include "PatternReader.h"
 #include "ManifestDatabase.h"
+#include "download_progress.h"
 #include "thumbnail/framebuffer.h"
 #include "thumbnail/bezier_renderer.h"
 #include "thumbnail/png_encoder.h"
@@ -41,8 +42,16 @@ namespace jobs {
             }
         }
 
+        // 90% = thumbnailer started, 100% = done. Only for store downloads —
+        // thumbnails also run for local uploads, which aren't tracked.
+        DownloadProgressBroadcaster::instance().reportIfTracked(pattern_uuid, 90);
+
         // Render the pattern using external_uuid (file path)
-        return renderPattern(pattern_uuid, data.encrypted, data.output_path);
+        JobResult result = renderPattern(pattern_uuid, data.encrypted, data.output_path);
+        if (result.success) {
+            DownloadProgressBroadcaster::instance().complete(pattern_uuid);
+        }
+        return result;
     }
 
     JobResult ThumbnailExecutor::renderPattern(const std::string& pattern_uuid,

@@ -37,6 +37,7 @@
 #include "storage/jobs/download_executor.h"
 #include "PatternDownloader.h"
 #include "pattern_handler.h"
+#include "download_progress.h"
 
 #include <koios/ota.h>
 
@@ -80,6 +81,18 @@ extern "C" void app_main(void)
                 job.pattern_external_uuid, result.success, result.error);
             PatternHandler::instance().notifyPatternDownloadComplete(
                 job.pattern_external_uuid, result.success);
+        }
+        // A final failure anywhere in the download→conversion→thumbnail chain
+        // ends the pipeline — stop broadcasting progress for that pattern.
+        if (!result.success) {
+            std::string uuid = job.pattern_external_uuid;
+            if (uuid.empty() && job.pattern_id != 0) {
+                auto pattern = ManifestDatabase::instance().getPattern(job.pattern_id);
+                if (pattern) uuid = pattern->external_uuid;
+            }
+            if (!uuid.empty()) {
+                DownloadProgressBroadcaster::instance().drop(uuid);
+            }
         }
         };
     esp_err_t job_err = jobs::JobProcessor::instance().init(std::move(executors), job_config);
