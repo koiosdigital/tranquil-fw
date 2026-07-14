@@ -58,8 +58,8 @@ namespace sand_table {
 
         initialized_ = true;
 
-        ESP_LOGI(TAG, "ConfigManager initialized - motion: gear_ratio=%.2f, theta_curr=%dmA",
-            motion_.theta_gear_ratio(), motion_.theta_current_ma);
+        ESP_LOGI(TAG, "ConfigManager initialized - motion: steps/rev=%lu x%u, theta_curr=%dmA",
+            motion_.steps_per_rev, motion_.microsteps, motion_.theta_current_ma);
         ESP_LOGI(TAG, "LED config: has_leds=%d, count=%d, rgbw=%d",
             led_.has_leds, led_.led_count, led_.is_rgbw);
         ESP_LOGI(TAG, "Calibration: valid=%d, theta_steps=%d, rho_max=%d",
@@ -73,7 +73,6 @@ namespace sand_table {
         // These are only used on first boot before a preset is loaded
         motion_.steps_per_rev = 200;
         motion_.microsteps = 16;  // TMC2209 default
-        motion_.theta_gear_ratio_x100 = 805;  // 8.05:1
         motion_.pinion_diameter_mm = 12;
         motion_.theta_max_rpm = 15;
         motion_.rho_max_rpm = 15;
@@ -106,7 +105,6 @@ namespace sand_table {
         // If any key is missing, we'll use the default value already set
         nvs.get_u32(kKeyStepsPerRev, &motion_.steps_per_rev);
         nvs.get_u16(kKeyMicrosteps, &motion_.microsteps);
-        nvs.get_i32(kKeyThetaGearX100, &motion_.theta_gear_ratio_x100);
         nvs.get_i32(kKeyPinionDia, &motion_.pinion_diameter_mm);
         nvs.get_i32(kKeyThetaMaxRpm, &motion_.theta_max_rpm);
         nvs.get_i32(kKeyRhoMaxRpm, &motion_.rho_max_rpm);
@@ -140,9 +138,6 @@ namespace sand_table {
         if (err != ESP_OK) return err;
 
         err = nvs.set_u16(kKeyMicrosteps, motion_.microsteps);
-        if (err != ESP_OK) return err;
-
-        err = nvs.set_i32(kKeyThetaGearX100, motion_.theta_gear_ratio_x100);
         if (err != ESP_OK) return err;
 
         err = nvs.set_i32(kKeyPinionDia, motion_.pinion_diameter_mm);
@@ -252,9 +247,22 @@ namespace sand_table {
             return ESP_OK;  // No calibration data, but that's fine
         }
 
-        nvs.get_i32(kKeyCalThetaSteps, &calibration_.theta_steps_per_rotation);
-        nvs.get_i32(kKeyCalRhoMax, &calibration_.rho_max_steps);
+        // The valid flag alone isn't proof the value keys exist (torn
+        // write / partial erase): require both reads to succeed and be
+        // positive, or treat the whole record as invalid. Deeper
+        // plausibility (band checks) is the homing controller's job.
+        esp_err_t theta_err = nvs.get_i32(kKeyCalThetaSteps, &calibration_.theta_steps_per_rotation);
+        esp_err_t rho_err = nvs.get_i32(kKeyCalRhoMax, &calibration_.rho_max_steps);
         nvs.get_u32(kKeyCalTimestamp, &calibration_.timestamp);
+
+        if (theta_err != ESP_OK || rho_err != ESP_OK ||
+            calibration_.theta_steps_per_rotation <= 0 ||
+            calibration_.rho_max_steps <= 0) {
+            ESP_LOGW(TAG, "Calibration record incomplete (theta=%d, rho_max=%d)"
+                " - marking invalid",
+                calibration_.theta_steps_per_rotation, calibration_.rho_max_steps);
+            calibration_ = CalibrationData{};
+        }
 
         return ESP_OK;
     }
@@ -267,9 +275,8 @@ namespace sand_table {
 
         esp_err_t err;
 
-        err = nvs.set_u8(kKeyCalValid, data.is_valid ? 1 : 0);
-        if (err != ESP_OK) return err;
-
+        // Value keys FIRST, valid flag LAST: a write interrupted partway
+        // must never leave valid=1 pointing at missing/stale values.
         err = nvs.set_i32(kKeyCalThetaSteps, data.theta_steps_per_rotation);
         if (err != ESP_OK) return err;
 
@@ -277,6 +284,9 @@ namespace sand_table {
         if (err != ESP_OK) return err;
 
         err = nvs.set_u32(kKeyCalTimestamp, data.timestamp);
+        if (err != ESP_OK) return err;
+
+        err = nvs.set_u8(kKeyCalValid, data.is_valid ? 1 : 0);
         if (err != ESP_OK) return err;
 
         err = nvs.commit();
@@ -415,18 +425,6 @@ namespace sand_table {
         return ConfigManager::instance().motion_config().effective_steps_per_rev();
     }
 
-    int32_t MechanicalConfig::theta_gear_ratio_x100() {
-        return ConfigManager::instance().motion_config().theta_gear_ratio_x100;
-    }
-
-    double MechanicalConfig::theta_gear_ratio() {
-        return ConfigManager::instance().motion_config().theta_gear_ratio();
-    }
-
-    int32_t MechanicalConfig::steps_per_theta_rotation() {
-        return ConfigManager::instance().motion_config().steps_per_theta_rotation();
-    }
-
     int32_t MechanicalConfig::pinion_diameter_mm() {
         return ConfigManager::instance().motion_config().pinion_diameter_mm;
     }
@@ -439,10 +437,6 @@ namespace sand_table {
         const auto& cfg = ConfigManager::instance().motion_config();
         return static_cast<double>(cfg.effective_steps_per_rev()) /
             (cfg.pinion_diameter_mm * M_PI);
-    }
-
-    double MechanicalConfig::rho_steps_per_theta_step() {
-        return ConfigManager::instance().motion_config().rho_steps_per_theta_step();
     }
 
     // =============================================================================

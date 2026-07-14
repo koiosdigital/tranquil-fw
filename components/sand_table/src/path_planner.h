@@ -78,7 +78,7 @@ namespace sand_table {
         PolarPosition current_position_{ 0.0, 0.0 };
 
         // Calibrated step scales (defaults match nominal mechanics; homing overrides)
-        int32_t steps_per_theta_rot_ = MechanicalConfig::STEPS_PER_THETA_ROTATION;
+        int32_t steps_per_theta_rot_ = MechanicalConfig::NOMINAL_STEPS_PER_THETA_ROTATION;
         int32_t rho_max_steps_ = 20000;
 
         // Segment length in normalized units (~1% of table)
@@ -97,8 +97,11 @@ namespace sand_table {
             const double theta_steps = std::fabs(delta_theta_rad) / (2.0 * M_PI) *
                 static_cast<double>(steps_per_theta_rot_);
             // Rho motor moves for the commanded rho delta plus coupling counteraction
+            // (one rho motor rev dragged per theta drum rev, so per theta motor
+            // step: effective_steps_per_rev / steps_per_theta_rot).
             const double rho_steps = std::fabs(delta_rho_norm) * static_cast<double>(rho_max_steps_) +
-                theta_steps / MechanicalConfig::THETA_GEAR_RATIO;
+                theta_steps * static_cast<double>(MechanicalConfig::effective_steps_per_rev()) /
+                    static_cast<double>(steps_per_theta_rot_);
             const double major = std::fmax(theta_steps, rho_steps);
             return static_cast<uint32_t>(std::ceil(major));
         }

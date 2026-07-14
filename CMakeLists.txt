@@ -21,10 +21,6 @@ add_compile_definitions(FIRMWARE_VARIANT="${BUILD_VARIANT}")
 add_compile_definitions(ENABLE_OTA) #comment this line to disable OTA updates
 #End KD-Common OTA
 
-# tqdb is retired (replaced by the JSONL manifest store in main/storage/manifest);
-# the component directory is kept on disk only until its repo is cleaned up.
-set(EXCLUDE_COMPONENTS tqdb)
-
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
 project(tranquil-fw)

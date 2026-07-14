@@ -47,34 +47,32 @@ namespace sand_table {
         // Compile-time defaults (fallback if ConfigManager not initialized)
         static constexpr uint32_t kDefaultStepsPerRev = 200;
         static constexpr uint32_t kDefaultMicrosteps = 16;
-        static constexpr int32_t kDefaultGearRatioX100 = 805;  // 8.05:1
         static constexpr int32_t kDefaultPinionDiaMm = 12;
 
         // Runtime accessors (delegate to ConfigManager)
         static uint32_t steps_per_rev();
         static uint32_t microsteps();
         static uint32_t effective_steps_per_rev();
-        static int32_t theta_gear_ratio_x100();
-        static double theta_gear_ratio();
-        static int32_t steps_per_theta_rotation();
         static int32_t pinion_diameter_mm();
         static double pinion_circumference_mm();
         static double rho_steps_per_mm();
-        static double rho_steps_per_theta_step();
 
         // Legacy constexpr for compile-time contexts (uses defaults)
         static constexpr uint32_t STEPS_PER_REV = kDefaultStepsPerRev;
         static constexpr uint32_t MICROSTEPS = kDefaultMicrosteps;
         static constexpr uint32_t EFFECTIVE_STEPS_PER_REV = STEPS_PER_REV * MICROSTEPS;
-        static constexpr int32_t THETA_GEAR_RATIO_X100 = kDefaultGearRatioX100;
-        static constexpr double THETA_GEAR_RATIO = kDefaultGearRatioX100 / 100.0;
-        static constexpr int32_t STEPS_PER_THETA_ROTATION =
-            (STEPS_PER_REV * MICROSTEPS * THETA_GEAR_RATIO_X100) / 100;
         static constexpr int32_t PINION_PITCH_DIAMETER_MM = kDefaultPinionDiaMm;
         static constexpr double PINION_CIRCUMFERENCE_MM = PINION_PITCH_DIAMETER_MM * M_PI;
         static constexpr double RHO_STEPS_PER_MM =
             static_cast<double>(EFFECTIVE_STEPS_PER_REV) / PINION_CIRCUMFERENCE_MM;
-        static constexpr double RHO_STEPS_PER_THETA_STEP = 100.0 / THETA_GEAR_RATIO_X100;
+
+        // Nominal theta motor steps per drum rotation (8.05:1 tabletop drive
+        // at 200 * 16 steps/rev). PRE-CALIBRATION ESTIMATE ONLY — homing
+        // observes the real value hall-edge-to-hall-edge, and all kinematics
+        // and coupling compensation run off that observation. This constant
+        // just bounds the very first homing run and the path planner's
+        // uncalibrated fallback.
+        static constexpr int32_t NOMINAL_STEPS_PER_THETA_ROTATION = 25760;
     };
 
     // =============================================================================

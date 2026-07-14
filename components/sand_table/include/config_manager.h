@@ -17,7 +17,6 @@ struct RuntimeMotionConfig {
     // Mechanical
     uint32_t steps_per_rev = 200;
     uint16_t microsteps = 16;
-    int32_t theta_gear_ratio_x100 = 805;    // 8.05:1 stored as x100
     int32_t pinion_diameter_mm = 12;
 
     // Velocity limits (RPM)
@@ -38,18 +37,6 @@ struct RuntimeMotionConfig {
     // Derived calculations
     uint32_t effective_steps_per_rev() const {
         return steps_per_rev * microsteps;
-    }
-
-    double theta_gear_ratio() const {
-        return theta_gear_ratio_x100 / 100.0;
-    }
-
-    int32_t steps_per_theta_rotation() const {
-        return (steps_per_rev * microsteps * theta_gear_ratio_x100) / 100;
-    }
-
-    double rho_steps_per_theta_step() const {
-        return 100.0 / theta_gear_ratio_x100;
     }
 };
 
@@ -131,7 +118,9 @@ private:
     // NVS keys - Motion
     static constexpr const char* kKeyStepsPerRev = "steps_per_rev";
     static constexpr const char* kKeyMicrosteps = "microsteps";
-    static constexpr const char* kKeyThetaGearX100 = "theta_gear";
+    // "theta_gear" was the legacy gear-ratio key; the coupling now derives
+    // from homing-observed calibration, so the key is no longer read (stale
+    // values may linger in NVS on upgraded devices — harmless).
     static constexpr const char* kKeyPinionDia = "pinion_dia";
     static constexpr const char* kKeyThetaMaxRpm = "theta_rpm";
     static constexpr const char* kKeyRhoMaxRpm = "rho_rpm";

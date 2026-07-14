@@ -1827,9 +1827,6 @@
           "microsteps": {
             "type": "integer"
           },
-          "theta_gear_ratio_x100": {
-            "type": "integer"
-          },
           "pinion_diameter_mm": {
             "type": "integer"
           },

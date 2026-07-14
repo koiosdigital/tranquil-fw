@@ -166,6 +166,21 @@ namespace sand_table {
         /// Get full robot status
         [[nodiscard]] RobotStatus get_status() const;
 
+        /// Kinematics internals for diagnostics (console `pos`). Exposes the
+        /// calibration snapshot and the UNCLAMPED rho so a divergence between
+        /// counted and physical position (coupling error, config change,
+        /// skipped steps) is observable — the clamped display value cannot
+        /// show it.
+        struct KinematicsDebug {
+            int32_t steps_per_theta_rot;      // calibration snapshot (observed)
+            int32_t rho_max_steps;            // calibration snapshot (observed)
+            double rho_steps_per_theta_step;  // active coupling constant
+            double rho_norm_unclamped;        // coupling-corrected rho, no [0,1] clamp
+            double theta_accumulator;         // fractional step remainders
+            double rho_accumulator;
+        };
+        [[nodiscard]] KinematicsDebug kinematics_debug() const;
+
         /// Get queue depth (segments waiting for execution)
         [[nodiscard]] size_t queue_depth() const noexcept {
             return segment_queue_.size();

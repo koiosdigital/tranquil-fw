@@ -104,12 +104,23 @@ static int cmd_pos(int argc, char** argv) {
 
     auto pos = s_controller->get_position();
     auto status = s_controller->get_status();
+    auto kin = s_controller->kinematics_debug();
 
+    // rho_norm_unclamped outside [0,1] means the counters were commanded
+    // past the physical rails; a physical-vs-counted divergence (coupling
+    // error, skipped steps) is NOT detectable from counters alone — see
+    // the rotate command for the drift test.
     printf("{\n");
     printf("  \"theta_rad\": %.4f,\n", pos.theta);
     printf("  \"rho_norm\": %.4f,\n", pos.rho);
+    printf("  \"rho_norm_unclamped\": %.4f,\n", kin.rho_norm_unclamped);
     printf("  \"theta_steps\": %" PRId32 ",\n", status.theta.position_steps);
     printf("  \"rho_steps\": %" PRId32 ",\n", status.rho.position_steps);
+    printf("  \"steps_per_theta_rot\": %" PRId32 ",\n", kin.steps_per_theta_rot);
+    printf("  \"rho_max_steps\": %" PRId32 ",\n", kin.rho_max_steps);
+    printf("  \"rho_steps_per_theta_step\": %.6f,\n", kin.rho_steps_per_theta_step);
+    printf("  \"theta_accumulator\": %.4f,\n", kin.theta_accumulator);
+    printf("  \"rho_accumulator\": %.4f,\n", kin.rho_accumulator);
     printf("  \"error\": false\n");
     printf("}\n");
     return 0;
@@ -117,6 +128,61 @@ static int cmd_pos(int argc, char** argv) {
 
 static void register_pos() {
     kd_console_register_cmd("pos", "Print current position (theta, rho, steps)", &cmd_pos);
+}
+
+// --- rotate (coupling drift test) ---
+static struct {
+    struct arg_dbl* revs;
+    struct arg_end* end;
+} rotate_args;
+
+static int cmd_rotate(int argc, char** argv) {
+    int nerrors = arg_parse(argc, argv, (void**)&rotate_args);
+    if (nerrors != 0) {
+        arg_print_errors(stderr, rotate_args.end, argv[0]);
+        return 1;
+    }
+
+    if (!s_controller) {
+        printf("{\"error\":true,\"message\":\"Motion controller not initialized\"}\n");
+        return 1;
+    }
+
+    double revs = rotate_args.revs->dval[0];
+    if (revs < -100.0 || revs > 100.0 || revs == 0.0) {
+        printf("{\"error\":true,\"message\":\"revs must be nonzero, within +/-100\"}\n");
+        return 1;
+    }
+
+    // Pure theta rotation at constant rho: the coupling compensation is the
+    // ONLY rho motion commanded, so any physical radial drift after N revs
+    // measures the compensation error per revolution directly (divide the
+    // observed drift by N). Reported rho will not change - that's the point.
+    auto current = s_controller->get_planning_position();
+    PolarPosition target{ current.theta + revs * 2.0 * M_PI, current.rho };
+
+    auto result = s_controller->move_to(target, 0.0f);
+    if (result.is_err()) {
+        printf("{\"error\":true,\"message\":\"Move rejected (homed? not estopped?)\"}\n");
+        return 1;
+    }
+
+    printf("{\"error\":false,\"revs\":%.2f,\"rho\":%.4f,"
+        "\"note\":\"mark ball position; physical radial drift / revs = coupling error per rev\"}\n",
+        revs, current.rho);
+    return 0;
+}
+
+static void register_rotate() {
+    rotate_args.revs = arg_dbl1(NULL, NULL, "<revs>", "Full theta rotations (+/-, e.g. 20)");
+    rotate_args.end = arg_end(1);
+
+    kd_console_register_cmd_with_args(
+        "rotate",
+        "Rotate theta N revolutions at constant rho (coupling drift test)",
+        &cmd_rotate,
+        &rotate_args
+    );
 }
 
 // --- status ---
@@ -190,54 +256,6 @@ static void register_set_rho_sgthrs() {
         "Set rho StallGuard threshold (0-255, higher = less sensitive)",
         &cmd_set_rho_sgthrs,
         &set_sgthrs_args
-    );
-}
-
-// --- set_theta_gear_ratio ---
-static struct {
-    struct arg_dbl* ratio;
-    struct arg_end* end;
-} set_gear_args;
-
-static int cmd_set_theta_gear_ratio(int argc, char** argv) {
-    int nerrors = arg_parse(argc, argv, (void**)&set_gear_args);
-    if (nerrors != 0) {
-        arg_print_errors(stderr, set_gear_args.end, argv[0]);
-        return 1;
-    }
-
-    double ratio = set_gear_args.ratio->dval[0];
-    if (ratio < 1.0 || ratio > 100.0) {
-        printf("{\"error\":true,\"message\":\"Ratio must be 1.0-100.0\"}\n");
-        return 1;
-    }
-
-    int32_t ratio_x100 = static_cast<int32_t>(ratio * 100.0 + 0.5);
-
-    auto& cfg = ConfigManager::instance();
-    RuntimeMotionConfig motion = cfg.motion_config();
-    motion.theta_gear_ratio_x100 = ratio_x100;
-
-    esp_err_t err = cfg.set_motion_config(motion);
-    if (err != ESP_OK) {
-        printf("{\"error\":true,\"message\":\"Failed to save config\"}\n");
-        return 1;
-    }
-
-    printf("{\"error\":false,\"theta_gear_ratio\":%.2f,\"note\":\"Recalibration recommended\"}\n",
-                ratio_x100 / 100.0);
-    return 0;
-}
-
-static void register_set_theta_gear_ratio() {
-    set_gear_args.ratio = arg_dbl1(NULL, NULL, "<ratio>", "Gear ratio (e.g., 8.05)");
-    set_gear_args.end = arg_end(1);
-
-    kd_console_register_cmd_with_args(
-        "set_theta_gear_ratio",
-        "Set theta gear ratio (e.g., 8.05)",
-        &cmd_set_theta_gear_ratio,
-        &set_gear_args
     );
 }
 
@@ -384,7 +402,6 @@ static int cmd_get_config(int argc, char** argv) {
     printf("{\n");
     printf("  \"steps_per_rev\": %" PRIu32 ",\n", m.steps_per_rev);
     printf("  \"microsteps\": %u,\n", m.microsteps);
-    printf("  \"theta_gear_ratio\": %.2f,\n", m.theta_gear_ratio_x100 / 100.0);
     printf("  \"pinion_diameter_mm\": %" PRId32 ",\n", m.pinion_diameter_mm);
     printf("  \"theta_max_rpm\": %" PRId32 ",\n", m.theta_max_rpm);
     printf("  \"rho_max_rpm\": %" PRId32 ",\n", m.rho_max_rpm);
@@ -576,11 +593,11 @@ void console_init(MotionController* controller) {
     register_home();
     register_stop();
     register_pos();
+    register_rotate();
     register_status();
 
     // Configuration commands
     register_set_rho_sgthrs();
-    register_set_theta_gear_ratio();
     register_set_theta_max_rpm();
     register_set_rho_max_rpm();
     register_set_accel();

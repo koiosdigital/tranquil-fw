@@ -16,6 +16,7 @@ namespace sand_table {
     // Forward declarations
     class CoordinatedStepperController;
     class ConfigManager;
+    struct CalibrationData;
 
     /// Controls the homing sequence for both axes using RMT-based stepping.
     /// - Theta uses Hall effect sensor (NEGEDGE interrupt)
@@ -144,14 +145,29 @@ namespace sand_table {
         // stop. Refuse to treat it as a valid calibration.
         static constexpr int32_t kMinRhoTravelSteps = 1000;
 
+        // Theta analogue of kMinRhoTravelSteps: an edge-to-edge measurement
+        // below this is a spurious hall re-trigger (field ripple/EMI), not a
+        // real drum revolution. Half the tabletop nominal keeps every
+        // supported drive in-band (12:1 coffee measures ~1.5x nominal;
+        // a missed edge can't inflate the value past kMaxHomingSteps, so
+        // only the low side needs guarding). The measurement is the
+        // denominator of ALL rho coupling compensation — a saved glitch
+        // value would over-drive rho by orders of magnitude.
+        static constexpr int32_t kMinThetaStepsPerRotation =
+            MechanicalConfig::NOMINAL_STEPS_PER_THETA_ROTATION / 2;
+
         // Homing step intervals (constant speed, no acceleration)
         // These are CRITICAL for StallGuard to work reliably
         static constexpr uint32_t kRhoHomingIntervalUs = 750;   // 750µs/step = 1333 steps/sec
         static constexpr uint32_t kThetaHomingIntervalUs = 400; // 400µs/step = 2500 steps/sec
 
-        // NOTE: gear-ratio math uses MechanicalConfig::theta_gear_ratio()
-        // (runtime double) — an integer-truncated constant here skewed the
-        // rho coupling compensation by ~0.6% during theta homing.
+        // Rho motor steps mechanically dragged per theta motor step (one
+        // rho motor revolution per theta drum revolution). Prefers the
+        // observed steps-per-drum-rev — this run's, then cached
+        // calibration — and only falls back to the nominal constant for
+        // the first-ever calibration, where it merely bounds the seek
+        // moves' companion rho compensation.
+        [[nodiscard]] double rho_steps_per_theta_step() const;
 
         // ISR handlers - these directly stop RMT transmission when sensors trigger
         static void IRAM_ATTR hall_isr_handler(void* arg);
@@ -162,6 +178,11 @@ namespace sand_table {
         void disable_hall_isr();
         void enable_diag_isr();
         void disable_diag_isr();
+
+        // Cached calibration is usable only when marked valid AND in the
+        // plausibility band (guards torn NVS writes / legacy garbage that
+        // would poison the coupling denominator).
+        [[nodiscard]] static bool calibration_plausible(const CalibrationData& calib);
 
         // Internal homing methods (full calibration)
         HomingResult seek_rho_max();

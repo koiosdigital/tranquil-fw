@@ -126,6 +126,21 @@ namespace sand_table {
         }
     }
 
+    double HomingController::rho_steps_per_theta_step() const {
+        int32_t theta_rot = theta_steps_per_rotation_;
+        if (theta_rot <= 0) {
+            const auto& calib = ConfigManager::instance().calibration();
+            if (calib.is_valid) {
+                theta_rot = calib.theta_steps_per_rotation;
+            }
+        }
+        if (theta_rot <= 0) {
+            theta_rot = MechanicalConfig::NOMINAL_STEPS_PER_THETA_ROTATION;
+        }
+        return static_cast<double>(MechanicalConfig::effective_steps_per_rev()) /
+            static_cast<double>(theta_rot);
+    }
+
     bool HomingController::is_hall_triggered() const {
         return gpio_get_level(PinConfig::THETA_HALL) == 0;
     }
@@ -324,7 +339,7 @@ namespace sand_table {
             // Use ~5000 theta steps with coupled rho compensation
             constexpr int32_t kBackoffSteps = 5000;
             int32_t rho_backoff = static_cast<int32_t>(std::lround(
-                kBackoffSteps / MechanicalConfig::theta_gear_ratio()));
+                kBackoffSteps * rho_steps_per_theta_step()));
 
             (void)stepper_controller_->execute_constant_speed(
                 -kBackoffSteps, -rho_backoff, kThetaHomingIntervalUs);
@@ -356,7 +371,7 @@ namespace sand_table {
 
         int32_t theta_before = theta_.position();
         int32_t rho_steps_for_full_rotation = static_cast<int32_t>(std::lround(
-            static_cast<double>(kMaxHomingSteps) / MechanicalConfig::theta_gear_ratio()));
+            static_cast<double>(kMaxHomingSteps) * rho_steps_per_theta_step()));
 
         // Execute large forward move - ISR stops at first edge
         (void)stepper_controller_->execute_constant_speed(
@@ -403,6 +418,20 @@ namespace sand_table {
 
         // Steps between edges = one full rotation
         int32_t steps_per_rotation = theta_.position() - theta_before;
+
+        // Reject implausibly short measurements instead of saving them:
+        // a spurious hall edge here would otherwise become the coupling
+        // denominator and persist in NVS (mirrors the rho false-trigger
+        // rejection above).
+        if (steps_per_rotation < kMinThetaStepsPerRotation) {
+            ESP_LOGE(TAG, "Theta calibration measured %ld steps/rotation "
+                "(min %ld) - spurious hall edge, calibration rejected",
+                steps_per_rotation, kMinThetaStepsPerRotation);
+            HomingResult result;
+            result.error = MotionError::HomingFailed;
+            return result;
+        }
+
         ESP_LOGI(TAG, "Theta calibration complete: %ld steps/rotation", steps_per_rotation);
 
         HomingResult result;
@@ -484,9 +513,24 @@ namespace sand_table {
         return result;
     }
 
+    bool HomingController::calibration_plausible(const CalibrationData& calib) {
+        return calib.is_valid &&
+            calib.theta_steps_per_rotation >= kMinThetaStepsPerRotation &&
+            calib.rho_max_steps >= kMinRhoTravelSteps;
+    }
+
     Result<void> HomingController::home_all(bool force_full) {
         // Check if we can use cached calibration
         const auto& calib = ConfigManager::instance().calibration();
+
+        if (!force_full && calib.is_valid && !calibration_plausible(calib)) {
+            // Marked valid but out of band (torn NVS write, legacy garbage):
+            // recalibrate rather than home against it.
+            ESP_LOGW(TAG, "Cached calibration implausible (theta=%ld, rho_max=%ld)"
+                " - forcing full calibration",
+                calib.theta_steps_per_rotation, calib.rho_max_steps);
+            force_full = true;
+        }
 
         if (!force_full && calib.is_valid) {
             ESP_LOGI(TAG, "Using cached calibration (theta=%ld, rho_max=%ld)",
@@ -563,8 +607,8 @@ namespace sand_table {
     Result<void> HomingController::home_quick() {
         const auto& calib = ConfigManager::instance().calibration();
 
-        if (!calib.is_valid) {
-            ESP_LOGW(TAG, "No valid calibration for quick home, falling back to full");
+        if (!calibration_plausible(calib)) {
+            ESP_LOGW(TAG, "No plausible calibration for quick home, falling back to full");
             return home_all(true);
         }
 
@@ -627,6 +671,14 @@ namespace sand_table {
 
         // Clear calibration in NVS
         ConfigManager::instance().clear_calibration();
+
+        // Also drop this run's in-RAM values: force_recalibrate means the
+        // caller distrusts them (regear, corrupt measurement), and
+        // rho_steps_per_theta_step() would otherwise keep steering the
+        // recalibration's own seek compensation from the value being
+        // replaced. The seeks fall back to the nominal estimate instead.
+        theta_steps_per_rotation_ = 0;
+        rho_max_steps_ = 0;
 
         // Perform full homing
         return home_all(true);
@@ -711,7 +763,7 @@ namespace sand_table {
             // Move backward a moderate amount (hall field is small)
             constexpr int32_t kBackoffSteps = 5000;
             int32_t rho_backoff = static_cast<int32_t>(std::lround(
-                kBackoffSteps / MechanicalConfig::theta_gear_ratio()));
+                kBackoffSteps * rho_steps_per_theta_step()));
 
             (void)stepper_controller_->execute_constant_speed(
                 -kBackoffSteps, -rho_backoff, kThetaHomingIntervalUs);
@@ -743,7 +795,7 @@ namespace sand_table {
 
         int32_t theta_before = theta_.position();
         int32_t rho_steps_for_full_rotation = static_cast<int32_t>(std::lround(
-            static_cast<double>(kMaxHomingSteps) / MechanicalConfig::theta_gear_ratio()));
+            static_cast<double>(kMaxHomingSteps) * rho_steps_per_theta_step()));
 
         // Execute large forward move - ISR stops at hall edge
         (void)stepper_controller_->execute_constant_speed(

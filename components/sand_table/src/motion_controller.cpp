@@ -322,17 +322,13 @@ namespace sand_table {
             return;  // Not calibrated yet
         }
 
-        // Calculate rho adjustment per theta rotation (due to coupling).
-        // The coupling counteraction accumulated by the transformer over one
-        // theta rotation is theta_rot / gear_ratio steps, so that is exactly
-        // what must be unwound per wrap. Using the compile-time
-        // EFFECTIVE_STEPS_PER_REV here (the old code) is only correct when
-        // the calibrated theta_rot happens to equal the nominal
-        // gear_ratio * steps_per_rev — any calibration/config difference
-        // injected a rho error on every wrap.
-        const int32_t rho_per_theta_rot = static_cast<int32_t>(
-            std::lround(static_cast<double>(theta_rot) /
-                MechanicalConfig::theta_gear_ratio()));
+        // Rho adjustment per theta rotation (due to coupling): unwind
+        // exactly what the transformer accumulated over one rotation, from
+        // the transformer's OWN calibration snapshot. Reading live config
+        // here instead (the previous code) desyncs from the snapshot the
+        // moment steps_per_rev/microsteps are PATCHed after homing,
+        // injecting a rho counter error on every wrap.
+        const int32_t rho_per_theta_rot = transformer_->rho_counteract_per_rotation();
 
         bool wrapped = false;
 
@@ -629,6 +625,19 @@ namespace sand_table {
 
     PolarPosition MotionController::get_planning_position() const {
         return path_planner_->current_position();
+    }
+
+    MotionController::KinematicsDebug MotionController::kinematics_debug() const {
+        const int32_t theta_steps = theta_stepper_->position();
+        const int32_t rho_steps = rho_stepper_->position();
+        return {
+            transformer_->steps_per_theta_rotation(),
+            transformer_->rho_max_steps(),
+            transformer_->rho_steps_per_theta_step(),
+            transformer_->rho_norm_unclamped(theta_steps, rho_steps),
+            transformer_->theta_accumulator(),
+            transformer_->rho_accumulator(),
+        };
     }
 
     bool MotionController::enqueue_segment(MotionSegment& segment) {

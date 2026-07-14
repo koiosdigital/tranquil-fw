@@ -17,13 +17,15 @@ namespace sand_table {
         void set_calibration(int32_t steps_per_theta_rot, int32_t rho_max_steps) noexcept {
             steps_per_theta_rot_ = steps_per_theta_rot;
             rho_max_steps_ = rho_max_steps;
-            // Snapshot the runtime-configurable gear ratio here rather than
-            // baking in the compile-time default — a user-configured ratio
-            // otherwise silently diverges from the coupling math.
-            gear_ratio_ = MechanicalConfig::theta_gear_ratio();
-            if (gear_ratio_ <= 0.0) {
-                gear_ratio_ = MechanicalConfig::THETA_GEAR_RATIO;
-            }
+            // Coupling is a mechanical invariant: one theta drum revolution
+            // drags the rho drive by exactly one rho motor revolution. The
+            // homing-observed steps-per-drum-rev therefore fully determines
+            // the rho steps induced per theta motor step — no configured
+            // gear ratio involved.
+            rho_steps_per_theta_step_ = (steps_per_theta_rot_ > 0)
+                ? static_cast<double>(MechanicalConfig::effective_steps_per_rev()) /
+                    static_cast<double>(steps_per_theta_rot_)
+                : 0.0;
         }
 
         /// Check if calibration values are set
@@ -58,7 +60,7 @@ namespace sand_table {
             double rho_base_exact = delta_rho_norm * static_cast<double>(rho_max_steps_);
 
             // Coupling compensation: counteract mechanical rho movement from theta rotation
-            double rho_counteract = static_cast<double>(theta_motor_steps) / gear_ratio_;
+            double rho_counteract = static_cast<double>(theta_motor_steps) * rho_steps_per_theta_step_;
 
             // Add to rho accumulator (base movement + coupling counteraction)
             rho_fractional_accumulator_ += rho_base_exact + rho_counteract;
@@ -70,7 +72,9 @@ namespace sand_table {
 
         /// Convert motor step positions to polar coordinates (for display only)
         [[nodiscard]] PolarPosition steps_to_polar(int32_t theta_steps, int32_t rho_steps) const {
-            if (steps_per_theta_rot_ <= 0) {
+            if (steps_per_theta_rot_ <= 0 || rho_max_steps_ <= 0) {
+                // rho_max_steps_ == 0 would divide to Inf/NaN below (NaN
+                // escapes the clamps and reaches JSON serializers)
                 return { 0.0, 0.0 };
             }
 
@@ -79,16 +83,25 @@ namespace sand_table {
             double theta = motor_rotations * 2.0 * M_PI;
             theta = normalize_angle(theta);
 
-            // Account for coupling when calculating displayed rho
-            double rho_counteract_steps = static_cast<double>(theta_steps) / gear_ratio_;
-            double effective_rho_steps = static_cast<double>(rho_steps) - rho_counteract_steps;
-            double rho = effective_rho_steps / static_cast<double>(rho_max_steps_);
+            double rho = rho_norm_unclamped(theta_steps, rho_steps);
 
             // Clamp rho to valid range
             if (rho < 0.0) rho = 0.0;
             if (rho > 1.0) rho = 1.0;
 
             return { theta, rho };
+        }
+
+        /// Coupling-corrected rho WITHOUT the [0,1] clamp. Diagnostic: a
+        /// value outside [0,1] means the counters have been commanded past
+        /// the physical rails (the clamped display value hides that).
+        [[nodiscard]] double rho_norm_unclamped(int32_t theta_steps, int32_t rho_steps) const {
+            if (rho_max_steps_ <= 0) {
+                return 0.0;
+            }
+            double rho_counteract_steps = static_cast<double>(theta_steps) * rho_steps_per_theta_step_;
+            double effective_rho_steps = static_cast<double>(rho_steps) - rho_counteract_steps;
+            return effective_rho_steps / static_cast<double>(rho_max_steps_);
         }
 
         /// Get calibrated steps per full theta rotation
@@ -99,6 +112,22 @@ namespace sand_table {
         /// Get calibrated rho max steps
         [[nodiscard]] int32_t rho_max_steps() const noexcept {
             return rho_max_steps_;
+        }
+
+        /// Coupling constant this transformer is actually applying
+        /// (rho motor steps per theta motor step, snapshot from calibration)
+        [[nodiscard]] double rho_steps_per_theta_step() const noexcept {
+            return rho_steps_per_theta_step_;
+        }
+
+        /// Rho counteraction this transformer accumulates over exactly one
+        /// theta rotation (= what a position wrap must unwind). Derived from
+        /// the SAME snapshot the per-step compensation uses, so wrap unwind
+        /// and accumulation cannot desync even if runtime config changes
+        /// after calibration.
+        [[nodiscard]] int32_t rho_counteract_per_rotation() const noexcept {
+            return static_cast<int32_t>(std::lround(
+                rho_steps_per_theta_step_ * static_cast<double>(steps_per_theta_rot_)));
         }
 
         /// Get theta fractional accumulator (for debugging)
@@ -119,8 +148,13 @@ namespace sand_table {
         double theta_fractional_accumulator_ = 0.0;
         double rho_fractional_accumulator_ = 0.0;
 
-        // Refreshed from runtime config in set_calibration()
-        double gear_ratio_ = MechanicalConfig::THETA_GEAR_RATIO;
+        // Rho motor steps mechanically dragged per theta motor step.
+        // Derived from the observed calibration in set_calibration();
+        // zero (no compensation) until calibrated. NOTE: nothing on the
+        // motion path checks is_calibrated() — the only motion gate is
+        // MotionController::is_homed_, so callers of set_calibration are
+        // responsible for passing validated values.
+        double rho_steps_per_theta_step_ = 0.0;
     };
 
 } // namespace sand_table
