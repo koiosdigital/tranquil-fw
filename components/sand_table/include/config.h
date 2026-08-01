@@ -47,24 +47,21 @@ namespace sand_table {
         // Compile-time defaults (fallback if ConfigManager not initialized)
         static constexpr uint32_t kDefaultStepsPerRev = 200;
         static constexpr uint32_t kDefaultMicrosteps = 16;
-        static constexpr int32_t kDefaultPinionDiaMm = 12;
 
         // Runtime accessors (delegate to ConfigManager)
         static uint32_t steps_per_rev();
         static uint32_t microsteps();
+        // Steps per motor revolution (steps_per_rev * microsteps). The rho
+        // coupling compensation is the only consumer: rho drive dragged per
+        // theta drum rev = one rho motor rev = this many steps. The rho radial
+        // SCALE comes entirely from the homing-observed rho_max_steps, so no
+        // pinion/lead geometry is needed anywhere.
         static uint32_t effective_steps_per_rev();
-        static int32_t pinion_diameter_mm();
-        static double pinion_circumference_mm();
-        static double rho_steps_per_mm();
 
         // Legacy constexpr for compile-time contexts (uses defaults)
         static constexpr uint32_t STEPS_PER_REV = kDefaultStepsPerRev;
         static constexpr uint32_t MICROSTEPS = kDefaultMicrosteps;
         static constexpr uint32_t EFFECTIVE_STEPS_PER_REV = STEPS_PER_REV * MICROSTEPS;
-        static constexpr int32_t PINION_PITCH_DIAMETER_MM = kDefaultPinionDiaMm;
-        static constexpr double PINION_CIRCUMFERENCE_MM = PINION_PITCH_DIAMETER_MM * M_PI;
-        static constexpr double RHO_STEPS_PER_MM =
-            static_cast<double>(EFFECTIVE_STEPS_PER_REV) / PINION_CIRCUMFERENCE_MM;
 
         // Nominal theta motor steps per drum rotation (8.05:1 tabletop drive
         // at 200 * 16 steps/rev). PRE-CALIBRATION ESTIMATE ONLY — homing
@@ -80,29 +77,22 @@ namespace sand_table {
     // =============================================================================
 
     struct MotionConfig {
-        // Compile-time defaults (fallback if ConfigManager not initialized)
-        static constexpr int32_t kDefaultThetaMaxRpm = 15;
-        static constexpr int32_t kDefaultRhoMaxRpm = 15;
-        static constexpr uint16_t kDefaultThetaCurrentMa = 400;
-        static constexpr uint16_t kDefaultRhoCurrentMa = 400;
-        static constexpr uint8_t kDefaultStallguardThreshold = 30;
-        static constexpr float kDefaultAccelMmS2 = 100.0f;
-        static constexpr float kDefaultMaxAccelMmS2 = 200.0f;
-
-        // Runtime accessors (delegate to ConfigManager)
+        // Runtime accessors (delegate to ConfigManager). These are the live
+        // NVS-backed values and are applied to the hardware:
+        //   rho_max_rpm        - default path feedrate (move_to / player)
+        //   theta_irun_ma      - theta motor run current (TMC IRUN/IHOLD)
+        //   rho_irun_ma        - rho motor run current
+        //   stallguard_threshold - rho StallGuard sensitivity (homing)
+        // theta_max_rpm is retained for a future per-axis clamp (the theta
+        // spin rate is currently bounded by THETA_MAX_ROT_PER_MIN below).
         static int32_t theta_max_rpm();
         static int32_t rho_max_rpm();
         static uint16_t theta_irun_ma();
-        static uint16_t theta_ihold_ma();
         static uint16_t rho_irun_ma();
-        static uint16_t rho_ihold_ma();
         static uint8_t stallguard_threshold();
-        static float default_accel();
-        static float max_accel();
 
         // Constants that don't change at runtime
         static constexpr uint32_t LOOKAHEAD_DEPTH = 32;
-        static constexpr float JUNCTION_DEVIATION_MM = 0.05f;
         // De-energize the motors after this long with no motion (holding
         // current just heats the drivers; the arm can't backdrive). The next
         // move re-enables them (with the TMC warmup delay).
@@ -128,16 +118,6 @@ namespace sand_table {
         // arm around. Enforced in calculate_velocity_profile and, for live
         // feedrate boosts, via the sequencer's speed-scale ceiling.
         static constexpr float THETA_MAX_ROT_PER_MIN = 12.0f;
-
-        // Legacy constexpr for compile-time contexts (uses defaults)
-        static constexpr int32_t THETA_MAX_SPEED_RPM = kDefaultThetaMaxRpm;
-        static constexpr int32_t RHO_MAX_SPEED_RPM = kDefaultRhoMaxRpm;
-        static constexpr float DEFAULT_ACCEL_MM_S2 = kDefaultAccelMmS2;
-        static constexpr uint16_t THETA_IRUN_MA = kDefaultThetaCurrentMa;
-        static constexpr uint16_t THETA_IHOLD_MA = kDefaultThetaCurrentMa / 2;
-        static constexpr uint16_t RHO_IRUN_MA = kDefaultRhoCurrentMa;
-        static constexpr uint16_t RHO_IHOLD_MA = kDefaultRhoCurrentMa / 2;
-        static constexpr uint8_t RHO_STALLGUARD_THRESHOLD = kDefaultStallguardThreshold;
     };
 
     // =============================================================================

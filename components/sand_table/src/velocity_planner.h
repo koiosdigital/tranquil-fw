@@ -42,40 +42,15 @@ public:
     /// Clear all segments from buffer
     void clear() noexcept;
 
-    /// Set default acceleration (mm/s^2)
-    void set_acceleration(float accel) noexcept {
-        acceleration_ = std::max(1.0f, accel);
-    }
-
-    /// Set junction deviation (mm) - affects cornering speed
-    void set_junction_deviation(float deviation) noexcept {
-        junction_deviation_ = std::max(0.001f, deviation);
-    }
-
 private:
     std::array<MotionSegment, kLookaheadDepth> segments_{};
     size_t head_ = 0;  // Next position to write
     size_t tail_ = 0;  // Next position to read
     size_t count_ = 0;
 
-    float acceleration_ = static_cast<float>(MotionConfig::DEFAULT_ACCEL_MM_S2);
-    float junction_deviation_ = MotionConfig::JUNCTION_DEVIATION_MM;
-
     // Track last transferred segment's exit velocities for continuity
     float last_theta_exit_velocity_ = 0.0f;
     float last_rho_exit_velocity_ = 0.0f;
-
-    /// Calculate theta motor junction velocity (only affected by theta direction changes)
-    [[nodiscard]] float calculate_theta_junction_velocity(
-        const MotionSegment& prev,
-        const MotionSegment& next
-    ) const;
-
-    /// Calculate rho motor junction velocity (only affected by rho direction changes)
-    [[nodiscard]] float calculate_rho_junction_velocity(
-        const MotionSegment& prev,
-        const MotionSegment& next
-    ) const;
 
     /// Recalculate per-motor junction velocities across the buffer.
     /// Acceleration-limited ramping between the junction velocities is done
@@ -111,11 +86,6 @@ inline const MotionSegment& VelocityPlanner::at(size_t index) const {
 inline bool VelocityPlanner::add_segment(MotionSegment& segment) {
     if (full()) {
         return false;
-    }
-
-    // Set default acceleration if not specified
-    if (segment.acceleration <= 0.0f) {
-        segment.acceleration = acceleration_;
     }
 
     // Store segment
@@ -156,59 +126,6 @@ inline std::optional<MotionSegment> VelocityPlanner::peek_segment() const {
         return std::nullopt;
     }
     return segments_[tail_];
-}
-
-inline float VelocityPlanner::calculate_theta_junction_velocity(
-    const MotionSegment& prev,
-    const MotionSegment& next) const
-{
-    // Independent velocity for theta motor - only affected by theta direction changes
-    auto sign = [](int32_t v) -> int {
-        if (v > 0) return 1;
-        if (v < 0) return -1;
-        return 0;
-    };
-
-    const int prev_dir = sign(prev.delta_theta_steps);
-    const int next_dir = sign(next.delta_theta_steps);
-
-    // A reversal is when direction changes from +1 to -1 or vice versa
-    // (not when going from 0 to +/-1 or from +/-1 to 0)
-    bool reverses = (prev_dir != 0 && next_dir != 0 && prev_dir != next_dir);
-
-    if (reverses) {
-        // Theta motor reversal - must stop at junction
-        return 0.0f;
-    }
-
-    // No reversal - can maintain velocity through junction
-    return std::min(prev.nominal_velocity, next.nominal_velocity);
-}
-
-inline float VelocityPlanner::calculate_rho_junction_velocity(
-    const MotionSegment& prev,
-    const MotionSegment& next) const
-{
-    // Independent velocity for rho motor - only affected by rho direction changes
-    auto sign = [](int32_t v) -> int {
-        if (v > 0) return 1;
-        if (v < 0) return -1;
-        return 0;
-    };
-
-    const int prev_dir = sign(prev.delta_rho_steps);
-    const int next_dir = sign(next.delta_rho_steps);
-
-    // A reversal is when direction changes from +1 to -1 or vice versa
-    bool reverses = (prev_dir != 0 && next_dir != 0 && prev_dir != next_dir);
-
-    if (reverses) {
-        // Rho motor reversal - must stop at junction
-        return 0.0f;
-    }
-
-    // No reversal - can maintain velocity through junction
-    return std::min(prev.nominal_velocity, next.nominal_velocity);
 }
 
 inline void VelocityPlanner::recalculate() {

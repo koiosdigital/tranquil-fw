@@ -13,6 +13,32 @@ namespace sand_table {
 
     static const char* TAG = "MotionController";
 
+    namespace {
+        // IHOLD as a percentage of IRUN. The arm can't backdrive, so a reduced
+        // holding current is enough and keeps the drivers cool (matches the
+        // previous IHOLD = IRUN/2 intent).
+        constexpr uint8_t kHoldCurrentPercent = 50;
+
+        // Map a configured microstep count to the TMC2209 MRES setting.
+        tmc::MicrostepResolution microsteps_to_mres(uint32_t microsteps) {
+            switch (microsteps) {
+                case 1:   return tmc::MicrostepResolution::Full;
+                case 2:   return tmc::MicrostepResolution::Half;
+                case 4:   return tmc::MicrostepResolution::Quarter;
+                case 8:   return tmc::MicrostepResolution::Eighth;
+                case 16:  return tmc::MicrostepResolution::Sixteenth;
+                case 32:  return tmc::MicrostepResolution::ThirtySecond;
+                case 64:  return tmc::MicrostepResolution::SixtyFourth;
+                case 128: return tmc::MicrostepResolution::OneTwentyEighth;
+                case 256: return tmc::MicrostepResolution::TwoFiftySixth;
+                default:
+                    ESP_LOGW(TAG, "Unsupported microsteps=%lu, using 1/16",
+                        static_cast<unsigned long>(microsteps));
+                    return tmc::MicrostepResolution::Sixteenth;
+            }
+        }
+    }  // namespace
+
     MotionController::MotionController()
         : path_planner_(std::make_unique<PathPlanner>())
         , velocity_planner_(std::make_unique<VelocityPlanner>())
@@ -154,8 +180,6 @@ namespace sand_table {
             return Result<void>::err(MotionError::HardwareFault);
         }
 
-        (void)theta_tmc_->set_motor_current(MotionConfig::THETA_IRUN_MA);
-        (void)theta_tmc_->set_microstep_resolution(tmc::MicrostepResolution::Sixteenth);
         (void)theta_tmc_->set_stealthchop_enable(true);
         (void)theta_tmc_->set_stealthchop_threshold(0);
 
@@ -165,13 +189,44 @@ namespace sand_table {
             return Result<void>::err(MotionError::HardwareFault);
         }
 
-        (void)rho_tmc_->set_motor_current(MotionConfig::RHO_IRUN_MA);
-        (void)rho_tmc_->set_microstep_resolution(tmc::MicrostepResolution::Sixteenth);
         (void)rho_tmc_->set_stealthchop_enable(true);
         (void)rho_tmc_->set_stealthchop_threshold(0);
 
-        ESP_LOGI(TAG, "TMC2209 drivers initialized");
+        // Microstep resolution from runtime config. Applied here (init) only:
+        // the coupling and calibration are expressed in steps at this
+        // resolution, so changing it requires a reboot + re-home. The
+        // configured `microsteps` therefore must match what the coupling math
+        // (effective_steps_per_rev) assumes.
+        const tmc::MicrostepResolution mres =
+            microsteps_to_mres(MechanicalConfig::microsteps());
+        (void)theta_tmc_->set_microstep_resolution(mres);
+        (void)rho_tmc_->set_microstep_resolution(mres);
+
+        // Motor run/hold current from runtime config.
+        apply_motor_config();
+
+        ESP_LOGI(TAG, "TMC2209 drivers initialized (microsteps=%lu)",
+            static_cast<unsigned long>(MechanicalConfig::microsteps()));
         return Result<void>::ok();
+    }
+
+    void MotionController::apply_motor_config() {
+        if (!theta_tmc_ || !rho_tmc_) {
+            return;  // init_tmc() not run yet
+        }
+
+        // set_motor_current() sets IRUN and IHOLD to the same scale;
+        // set_hold_current_percentage() then reduces IHOLD.
+        const uint16_t theta_ma = MotionConfig::theta_irun_ma();
+        const uint16_t rho_ma = MotionConfig::rho_irun_ma();
+
+        (void)theta_tmc_->set_motor_current(theta_ma);
+        (void)theta_tmc_->set_hold_current_percentage(kHoldCurrentPercent);
+        (void)rho_tmc_->set_motor_current(rho_ma);
+        (void)rho_tmc_->set_hold_current_percentage(kHoldCurrentPercent);
+
+        ESP_LOGI(TAG, "Applied motor current: theta=%umA, rho=%umA (hold %u%%)",
+            theta_ma, rho_ma, static_cast<unsigned>(kHoldCurrentPercent));
     }
 
     Result<void> MotionController::start() {
@@ -499,7 +554,7 @@ namespace sand_table {
         // Set default feedrate if not specified
         float actual_feedrate = feedrate;
         if (actual_feedrate <= 0) {
-            actual_feedrate = static_cast<float>(MotionConfig::RHO_MAX_SPEED_RPM);
+            actual_feedrate = static_cast<float>(MotionConfig::rho_max_rpm());
         }
 
         ESP_LOGD(TAG, "Queueing polar move: (%.4f, %.4f) -> (%.4f, %.4f) @ %.1f RPM",
@@ -544,7 +599,7 @@ namespace sand_table {
         // Set default feedrate if not specified
         float actual_feedrate = feedrate;
         if (actual_feedrate <= 0) {
-            actual_feedrate = static_cast<float>(MotionConfig::RHO_MAX_SPEED_RPM);
+            actual_feedrate = static_cast<float>(MotionConfig::rho_max_rpm());
         }
 
         ESP_LOGD(TAG, "Queueing linear move: (%.4f, %.4f) -> (%.4f, %.4f) @ %.1f RPM",

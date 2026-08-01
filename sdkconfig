@@ -954,6 +954,13 @@ CONFIG_KD_COMMON_SRP_FORMAT_STATIC=y
 # default:
 CONFIG_KD_COMMON_SRP_STATIC_PASSWORD="koiosdigital"
 # end of Provisioning Configuration
+
+#
+# Ethernet Configuration
+#
+# default:
+# CONFIG_KD_COMMON_ETH_ENABLE is not set
+# end of Ethernet Configuration
 # end of KD Common Configuration
 
 #

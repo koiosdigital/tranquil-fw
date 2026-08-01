@@ -1827,9 +1827,6 @@
           "microsteps": {
             "type": "integer"
           },
-          "pinion_diameter_mm": {
-            "type": "integer"
-          },
           "theta_max_rpm": {
             "type": "integer"
           },
@@ -1844,12 +1841,6 @@
           },
           "stallguard_threshold": {
             "type": "integer"
-          },
-          "default_accel_mm_s2": {
-            "type": "number"
-          },
-          "max_accel_mm_s2": {
-            "type": "number"
           }
         }
       },

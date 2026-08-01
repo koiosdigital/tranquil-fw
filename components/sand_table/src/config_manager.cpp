@@ -73,14 +73,11 @@ namespace sand_table {
         // These are only used on first boot before a preset is loaded
         motion_.steps_per_rev = 200;
         motion_.microsteps = 16;  // TMC2209 default
-        motion_.pinion_diameter_mm = 12;
         motion_.theta_max_rpm = 15;
         motion_.rho_max_rpm = 15;
         motion_.theta_current_ma = 400;
         motion_.rho_current_ma = 400;
         motion_.stallguard_threshold = 30;
-        motion_.default_accel = 100.0f;
-        motion_.max_accel = 200.0f;
 
         // LED defaults - assume LEDs present with typical tabletop config
         led_.has_leds = true;
@@ -105,21 +102,11 @@ namespace sand_table {
         // If any key is missing, we'll use the default value already set
         nvs.get_u32(kKeyStepsPerRev, &motion_.steps_per_rev);
         nvs.get_u16(kKeyMicrosteps, &motion_.microsteps);
-        nvs.get_i32(kKeyPinionDia, &motion_.pinion_diameter_mm);
         nvs.get_i32(kKeyThetaMaxRpm, &motion_.theta_max_rpm);
         nvs.get_i32(kKeyRhoMaxRpm, &motion_.rho_max_rpm);
         nvs.get_u16(kKeyThetaCurrMa, &motion_.theta_current_ma);
         nvs.get_u16(kKeyRhoCurrMa, &motion_.rho_current_ma);
         nvs.get_u8(kKeySgThreshold, &motion_.stallguard_threshold);
-
-        // Load floats as u32 bit representations
-        uint32_t accel_bits;
-        if (nvs.get_u32(kKeyAccelDefault, &accel_bits) == ESP_OK) {
-            memcpy(&motion_.default_accel, &accel_bits, sizeof(float));
-        }
-        if (nvs.get_u32(kKeyAccelMax, &accel_bits) == ESP_OK) {
-            memcpy(&motion_.max_accel, &accel_bits, sizeof(float));
-        }
 
         // Check if we found at least one key (to distinguish empty from missing)
         return nvs.find_key(kKeyStepsPerRev);
@@ -140,9 +127,6 @@ namespace sand_table {
         err = nvs.set_u16(kKeyMicrosteps, motion_.microsteps);
         if (err != ESP_OK) return err;
 
-        err = nvs.set_i32(kKeyPinionDia, motion_.pinion_diameter_mm);
-        if (err != ESP_OK) return err;
-
         err = nvs.set_i32(kKeyThetaMaxRpm, motion_.theta_max_rpm);
         if (err != ESP_OK) return err;
 
@@ -156,16 +140,6 @@ namespace sand_table {
         if (err != ESP_OK) return err;
 
         err = nvs.set_u8(kKeySgThreshold, motion_.stallguard_threshold);
-        if (err != ESP_OK) return err;
-
-        // Store floats as u32 bit representations
-        uint32_t accel_bits;
-        memcpy(&accel_bits, &motion_.default_accel, sizeof(float));
-        err = nvs.set_u32(kKeyAccelDefault, accel_bits);
-        if (err != ESP_OK) return err;
-
-        memcpy(&accel_bits, &motion_.max_accel, sizeof(float));
-        err = nvs.set_u32(kKeyAccelMax, accel_bits);
         if (err != ESP_OK) return err;
 
         return nvs.commit();
@@ -425,20 +399,6 @@ namespace sand_table {
         return ConfigManager::instance().motion_config().effective_steps_per_rev();
     }
 
-    int32_t MechanicalConfig::pinion_diameter_mm() {
-        return ConfigManager::instance().motion_config().pinion_diameter_mm;
-    }
-
-    double MechanicalConfig::pinion_circumference_mm() {
-        return ConfigManager::instance().motion_config().pinion_diameter_mm * M_PI;
-    }
-
-    double MechanicalConfig::rho_steps_per_mm() {
-        const auto& cfg = ConfigManager::instance().motion_config();
-        return static_cast<double>(cfg.effective_steps_per_rev()) /
-            (cfg.pinion_diameter_mm * M_PI);
-    }
-
     // =============================================================================
     // MotionConfig Runtime Accessors
     // =============================================================================
@@ -455,28 +415,12 @@ namespace sand_table {
         return ConfigManager::instance().motion_config().theta_current_ma;
     }
 
-    uint16_t MotionConfig::theta_ihold_ma() {
-        return ConfigManager::instance().motion_config().theta_current_ma / 2;
-    }
-
     uint16_t MotionConfig::rho_irun_ma() {
         return ConfigManager::instance().motion_config().rho_current_ma;
     }
 
-    uint16_t MotionConfig::rho_ihold_ma() {
-        return ConfigManager::instance().motion_config().rho_current_ma / 2;
-    }
-
     uint8_t MotionConfig::stallguard_threshold() {
         return ConfigManager::instance().motion_config().stallguard_threshold;
-    }
-
-    float MotionConfig::default_accel() {
-        return ConfigManager::instance().motion_config().default_accel;
-    }
-
-    float MotionConfig::max_accel() {
-        return ConfigManager::instance().motion_config().max_accel;
     }
 
 } // namespace sand_table

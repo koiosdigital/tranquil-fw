@@ -349,51 +349,6 @@ static void register_set_rho_max_rpm() {
     );
 }
 
-// --- set_accel ---
-static struct {
-    struct arg_dbl* accel;
-    struct arg_end* end;
-} set_accel_args;
-
-static int cmd_set_accel(int argc, char** argv) {
-    int nerrors = arg_parse(argc, argv, (void**)&set_accel_args);
-    if (nerrors != 0) {
-        arg_print_errors(stderr, set_accel_args.end, argv[0]);
-        return 1;
-    }
-
-    double val = set_accel_args.accel->dval[0];
-    if (val < 10.0 || val > 1000.0) {
-        printf("{\"error\":true,\"message\":\"Acceleration must be 10-1000 mm/s^2\"}\n");
-        return 1;
-    }
-
-    auto& cfg = ConfigManager::instance();
-    RuntimeMotionConfig motion = cfg.motion_config();
-    motion.default_accel = static_cast<float>(val);
-
-    esp_err_t err = cfg.set_motion_config(motion);
-    if (err != ESP_OK) {
-        printf("{\"error\":true,\"message\":\"Failed to save config\"}\n");
-        return 1;
-    }
-
-    printf("{\"error\":false,\"default_accel\":%.1f}\n", val);
-    return 0;
-}
-
-static void register_set_accel() {
-    set_accel_args.accel = arg_dbl1(NULL, NULL, "<mm/s^2>", "Default acceleration");
-    set_accel_args.end = arg_end(1);
-
-    kd_console_register_cmd_with_args(
-        "set_accel",
-        "Set default acceleration (mm/s^2)",
-        &cmd_set_accel,
-        &set_accel_args
-    );
-}
-
 // --- get_config ---
 static int cmd_get_config(int argc, char** argv) {
     auto& cfg = ConfigManager::instance();
@@ -402,14 +357,11 @@ static int cmd_get_config(int argc, char** argv) {
     printf("{\n");
     printf("  \"steps_per_rev\": %" PRIu32 ",\n", m.steps_per_rev);
     printf("  \"microsteps\": %u,\n", m.microsteps);
-    printf("  \"pinion_diameter_mm\": %" PRId32 ",\n", m.pinion_diameter_mm);
     printf("  \"theta_max_rpm\": %" PRId32 ",\n", m.theta_max_rpm);
     printf("  \"rho_max_rpm\": %" PRId32 ",\n", m.rho_max_rpm);
     printf("  \"theta_current_ma\": %u,\n", m.theta_current_ma);
     printf("  \"rho_current_ma\": %u,\n", m.rho_current_ma);
     printf("  \"stallguard_threshold\": %u,\n", m.stallguard_threshold);
-    printf("  \"default_accel\": %.1f,\n", m.default_accel);
-    printf("  \"max_accel\": %.1f,\n", m.max_accel);
     printf("  \"error\": false\n");
     printf("}\n");
     return 0;
@@ -452,7 +404,12 @@ static int cmd_set_theta_current(int argc, char** argv) {
         return 1;
     }
 
-    printf("{\"error\":false,\"theta_current_ma\":%d,\"note\":\"Restart required\"}\n", val);
+    // Push the new current to the TMC drivers immediately.
+    if (s_controller) {
+        s_controller->apply_motor_config();
+    }
+
+    printf("{\"error\":false,\"theta_current_ma\":%d}\n", val);
     return 0;
 }
 
@@ -497,7 +454,12 @@ static int cmd_set_rho_current(int argc, char** argv) {
         return 1;
     }
 
-    printf("{\"error\":false,\"rho_current_ma\":%d,\"note\":\"Restart required\"}\n", val);
+    // Push the new current to the TMC drivers immediately.
+    if (s_controller) {
+        s_controller->apply_motor_config();
+    }
+
+    printf("{\"error\":false,\"rho_current_ma\":%d}\n", val);
     return 0;
 }
 
@@ -600,7 +562,6 @@ void console_init(MotionController* controller) {
     register_set_rho_sgthrs();
     register_set_theta_max_rpm();
     register_set_rho_max_rpm();
-    register_set_accel();
     register_get_config();
 
     // Additional commands

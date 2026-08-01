@@ -141,10 +141,9 @@ playlist_patterns (
 ### NVS Namespace: `tranquil_cfg`
 
 **Motion Config**
-- steps_per_rev, microsteps, pinion_diameter_mm
+- steps_per_rev, microsteps
 - theta_max_rpm, rho_max_rpm
 - motor currents, StallGuard threshold
-- acceleration limits
 
 **LED Config**
 - has_leds, led_count, is_rgbw

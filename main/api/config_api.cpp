@@ -2,6 +2,8 @@
 #include "config_api.h"
 #include "api_common.h"
 #include "config_manager.h"
+#include "motion_controller.h"
+#include "SandTablePlayer.h"
 
 #include <esp_log.h>
 
@@ -22,16 +24,13 @@ static esp_err_t config_get_handler(httpd_req_t* req) {
 
     chunk_buf_printf(&cb,
         "{\"motion\":{\"steps_per_rev\":%lu,\"microsteps\":%u,"
-        "\"pinion_diameter_mm\":%ld,\"theta_max_rpm\":%ld,\"rho_max_rpm\":%ld,",
+        "\"theta_max_rpm\":%ld,\"rho_max_rpm\":%ld,",
         (unsigned long)motion.steps_per_rev, (unsigned)motion.microsteps,
-        (long)motion.pinion_diameter_mm,
         (long)motion.theta_max_rpm, (long)motion.rho_max_rpm);
     chunk_buf_printf(&cb,
-        "\"theta_current_ma\":%u,\"rho_current_ma\":%u,\"stallguard_threshold\":%u,"
-        "\"default_accel_mm_s2\":%.1f,\"max_accel_mm_s2\":%.1f},",
+        "\"theta_current_ma\":%u,\"rho_current_ma\":%u,\"stallguard_threshold\":%u},",
         (unsigned)motion.theta_current_ma, (unsigned)motion.rho_current_ma,
-        (unsigned)motion.stallguard_threshold,
-        (double)motion.default_accel, (double)motion.max_accel);
+        (unsigned)motion.stallguard_threshold);
     chunk_buf_printf(&cb,
         "\"led\":{\"has_leds\":%s,\"led_count\":%u,\"is_rgbw\":%s},",
         led.has_leds ? "true" : "false", (unsigned)led.led_count,
@@ -69,20 +68,24 @@ static esp_err_t config_patch_handler(httpd_req_t* req) {
         double v;
         if ((v = get_num("steps_per_rev", 0)) > 0) motion.steps_per_rev = (uint32_t)v;
         if ((v = get_num("microsteps", 0)) > 0) motion.microsteps = (uint16_t)v;
-        if ((v = get_num("pinion_diameter_mm", 0)) > 0) motion.pinion_diameter_mm = (int32_t)v;
         if ((v = get_num("theta_max_rpm", 0)) > 0) motion.theta_max_rpm = (int32_t)v;
         if ((v = get_num("rho_max_rpm", 0)) > 0) motion.rho_max_rpm = (int32_t)v;
         if ((v = get_num("theta_current_ma", 0)) > 0) motion.theta_current_ma = (uint16_t)v;
         if ((v = get_num("rho_current_ma", 0)) > 0) motion.rho_current_ma = (uint16_t)v;
         if ((v = get_num("stallguard_threshold", 0)) > 0) motion.stallguard_threshold = (uint8_t)v;
-        if ((v = get_num("default_accel_mm_s2", 0)) > 0) motion.default_accel = (float)v;
-        if ((v = get_num("max_accel_mm_s2", 0)) > 0) motion.max_accel = (float)v;
 
         esp_err_t ret = cfg.set_motion_config(motion);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Failed to set motion config: %s", esp_err_to_name(ret));
         } else {
             changed = true;
+            // Push run/hold current to the TMC drivers now so the change
+            // takes effect without a reboot. (Microstep resolution and the
+            // step calibration are boot-time; RPM/StallGuard are read live by
+            // motion/homing.)
+            if (auto* mc = SandTablePlayer::getMotionController()) {
+                mc->apply_motor_config();
+            }
         }
     }
 
@@ -175,6 +178,14 @@ static esp_err_t presets_load_handler(httpd_req_t* req) {
     esp_err_t ret = sand_table::ConfigManager::instance().load_preset(preset_id->valuestring);
     ESP_LOGI(TAG, "LoadPreset '%s': %s", preset_id->valuestring, esp_err_to_name(ret));
     cJSON_Delete(json);
+
+    // A preset changes motor current (among other things) — push it to the
+    // drivers immediately so it applies without a reboot.
+    if (ret == ESP_OK) {
+        if (auto* mc = SandTablePlayer::getMotionController()) {
+            mc->apply_motor_config();
+        }
+    }
 
     if (ret != ESP_OK) {
         if (ret == ESP_ERR_NOT_FOUND) {

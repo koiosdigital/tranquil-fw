@@ -143,7 +143,6 @@ namespace sand_table {
         float rho_entry_velocity = 0.0f;     // RPM
         float rho_exit_velocity = 0.0f;      // RPM
         float nominal_velocity = 0.0f;       // RPM (shared nominal/cruise target)
-        float acceleration = 0.0f;
 
         // The user feedrate this segment was planned at, WITHOUT transient
         // boosts (transit multipliers). The executor scales step intervals

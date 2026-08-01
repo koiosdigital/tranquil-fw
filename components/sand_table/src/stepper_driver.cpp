@@ -289,7 +289,7 @@ namespace sand_table {
         constexpr uint32_t PULSE_TICKS = HardwareConfig::MIN_STEP_PULSE_US * TICKS_PER_US;
         constexpr uint32_t MAX_DURATION = 32767;  // 15-bit max for RMT symbol duration
 
-        // Use uint32_t to avoid overflow (interval_us * 10 can exceed uint16_t max)
+        // Widen to uint32_t before scaling so the product can't wrap uint16_t.
         uint32_t total_ticks = static_cast<uint32_t>(interval_us) * TICKS_PER_US;
 
         // Clamp total ticks to max representable value
@@ -316,7 +316,7 @@ namespace sand_table {
         constexpr uint32_t PULSE_TICKS = HardwareConfig::MIN_STEP_PULSE_US * TICKS_PER_US;
         constexpr uint32_t MAX_DURATION = 32767;  // 15-bit max for RMT symbol duration
 
-        // Use uint32_t to avoid overflow (interval_us * 10 can exceed uint16_t max)
+        // Widen to uint32_t before scaling so the product can't wrap uint16_t.
         uint32_t total_ticks = static_cast<uint32_t>(interval_us) * TICKS_PER_US;
 
         // Clamp total ticks to max representable value

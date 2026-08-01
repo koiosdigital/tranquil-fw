@@ -14,10 +14,13 @@ struct Preset;
 // =============================================================================
 
 struct RuntimeMotionConfig {
-    // Mechanical
+    // Mechanical. steps_per_rev * microsteps is the only mechanical quantity
+    // the kinematics consume (rho coupling compensation); the rho radial scale
+    // comes from homing-observed calibration, so no pinion/lead geometry is
+    // stored. Acceleration is not configurable here either — the ramp shape is
+    // set by MotionConfig::STEP_ACCEL_STEPS_S2 (steps/s^2).
     uint32_t steps_per_rev = 200;
     uint16_t microsteps = 16;
-    int32_t pinion_diameter_mm = 12;
 
     // Velocity limits (RPM)
     int32_t theta_max_rpm = 15;
@@ -29,10 +32,6 @@ struct RuntimeMotionConfig {
 
     // StallGuard
     uint8_t stallguard_threshold = 30;
-
-    // Acceleration (mm/s^2)
-    float default_accel = 100.0f;
-    float max_accel = 200.0f;
 
     // Derived calculations
     uint32_t effective_steps_per_rev() const {
@@ -118,17 +117,16 @@ private:
     // NVS keys - Motion
     static constexpr const char* kKeyStepsPerRev = "steps_per_rev";
     static constexpr const char* kKeyMicrosteps = "microsteps";
-    // "theta_gear" was the legacy gear-ratio key; the coupling now derives
-    // from homing-observed calibration, so the key is no longer read (stale
-    // values may linger in NVS on upgraded devices — harmless).
-    static constexpr const char* kKeyPinionDia = "pinion_dia";
+    // Removed keys ("theta_gear" gear ratio, "pinion_dia" pinion diameter,
+    // "accel_def"/"accel_max" mm/s^2 acceleration) are no longer read: the
+    // coupling derives from homing-observed calibration and the ramp shape is
+    // a compile-time step acceleration. Stale values may linger in NVS on
+    // upgraded devices — harmless, they are simply ignored.
     static constexpr const char* kKeyThetaMaxRpm = "theta_rpm";
     static constexpr const char* kKeyRhoMaxRpm = "rho_rpm";
     static constexpr const char* kKeyThetaCurrMa = "theta_curr";
     static constexpr const char* kKeyRhoCurrMa = "rho_curr";
     static constexpr const char* kKeySgThreshold = "sg_thresh";
-    static constexpr const char* kKeyAccelDefault = "accel_def";
-    static constexpr const char* kKeyAccelMax = "accel_max";
 
     // NVS keys - LED
     static constexpr const char* kKeyHasLeds = "has_leds";

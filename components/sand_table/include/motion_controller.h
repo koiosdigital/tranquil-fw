@@ -57,6 +57,15 @@ namespace sand_table {
         /// Disable both motors
         void disable_motors();
 
+        /// Push the runtime motion config (motor run/hold current) to the TMC
+        /// drivers. Called once from init(), and again after a config change
+        /// (REST PATCH / preset load) so current settings take effect without
+        /// a reboot. Microstep resolution is applied at init only — changing
+        /// it invalidates the step-based calibration, so it takes a reboot and
+        /// a re-home. StallGuard sensitivity is owned by the homing controller
+        /// and re-read from config on each home.
+        void apply_motor_config();
+
         // =========================================================================
         // Homing
         // =========================================================================

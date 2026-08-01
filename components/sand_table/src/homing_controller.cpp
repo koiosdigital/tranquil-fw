@@ -39,7 +39,7 @@ namespace sand_table {
         ESP_LOGI(TAG, "Initializing homing controller...");
         ESP_LOGI(TAG, "  Hall sensor pin: GPIO%d", PinConfig::THETA_HALL);
         ESP_LOGI(TAG, "  Rho DIAG pin: GPIO%d", PinConfig::RHO_DIAG);
-        ESP_LOGI(TAG, "  StallGuard threshold: %d", MotionConfig::RHO_STALLGUARD_THRESHOLD);
+        ESP_LOGI(TAG, "  StallGuard threshold: %d", MotionConfig::stallguard_threshold());
         ESP_LOGI(TAG, "  Rho step interval: %lu us", kRhoHomingIntervalUs);
         ESP_LOGI(TAG, "  Theta step interval: %lu us", kThetaHomingIntervalUs);
 
@@ -92,7 +92,7 @@ namespace sand_table {
 
         // Configure StallGuard for rho axis
         ESP_LOGI(TAG, "Configuring TMC2209 StallGuard...");
-        (void)rho_tmc_.set_stallguard_threshold(MotionConfig::RHO_STALLGUARD_THRESHOLD);
+        (void)rho_tmc_.set_stallguard_threshold(MotionConfig::stallguard_threshold());
         // CRITICAL: Set TCOOLTHRS to enable StallGuard at all speeds
         (void)rho_tmc_.set_stallguard_min_speed(0xFFFFF);
 

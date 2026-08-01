@@ -1172,7 +1172,7 @@ void SandTablePlayer::sendMoveCommand(double theta_rad, double rho_normalized,
     // ball approaches the center.
     float feedrate_rpm = static_cast<float>(feed_rate_.load(std::memory_order_relaxed));
     if (feedrate_rpm <= 0) {
-        feedrate_rpm = static_cast<float>(sand_table::MotionConfig::RHO_MAX_SPEED_RPM);
+        feedrate_rpm = static_cast<float>(sand_table::MotionConfig::rho_max_rpm());
     }
     // base = the user's draw speed WITHOUT the transit boost. Live feedrate
     // changes rescale execution by (new feed / base), so boosted moves keep
