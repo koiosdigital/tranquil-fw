@@ -259,51 +259,6 @@ static void register_set_rho_sgthrs() {
     );
 }
 
-// --- set_theta_max_rpm ---
-static struct {
-    struct arg_int* rpm;
-    struct arg_end* end;
-} set_theta_rpm_args;
-
-static int cmd_set_theta_max_rpm(int argc, char** argv) {
-    int nerrors = arg_parse(argc, argv, (void**)&set_theta_rpm_args);
-    if (nerrors != 0) {
-        arg_print_errors(stderr, set_theta_rpm_args.end, argv[0]);
-        return 1;
-    }
-
-    int val = set_theta_rpm_args.rpm->ival[0];
-    if (val < 1 || val > 100) {
-        printf("{\"error\":true,\"message\":\"RPM must be 1-100\"}\n");
-        return 1;
-    }
-
-    auto& cfg = ConfigManager::instance();
-    RuntimeMotionConfig motion = cfg.motion_config();
-    motion.theta_max_rpm = val;
-
-    esp_err_t err = cfg.set_motion_config(motion);
-    if (err != ESP_OK) {
-        printf("{\"error\":true,\"message\":\"Failed to save config\"}\n");
-        return 1;
-    }
-
-    printf("{\"error\":false,\"theta_max_rpm\":%d}\n", val);
-    return 0;
-}
-
-static void register_set_theta_max_rpm() {
-    set_theta_rpm_args.rpm = arg_int1(NULL, NULL, "<rpm>", "Max theta speed in RPM");
-    set_theta_rpm_args.end = arg_end(1);
-
-    kd_console_register_cmd_with_args(
-        "set_theta_max_rpm",
-        "Set theta max speed (RPM)",
-        &cmd_set_theta_max_rpm,
-        &set_theta_rpm_args
-    );
-}
-
 // --- set_rho_max_rpm ---
 static struct {
     struct arg_int* rpm;
@@ -357,7 +312,6 @@ static int cmd_get_config(int argc, char** argv) {
     printf("{\n");
     printf("  \"steps_per_rev\": %" PRIu32 ",\n", m.steps_per_rev);
     printf("  \"microsteps\": %u,\n", m.microsteps);
-    printf("  \"theta_max_rpm\": %" PRId32 ",\n", m.theta_max_rpm);
     printf("  \"rho_max_rpm\": %" PRId32 ",\n", m.rho_max_rpm);
     printf("  \"theta_current_ma\": %u,\n", m.theta_current_ma);
     printf("  \"rho_current_ma\": %u,\n", m.rho_current_ma);
@@ -560,7 +514,6 @@ void console_init(MotionController* controller) {
 
     // Configuration commands
     register_set_rho_sgthrs();
-    register_set_theta_max_rpm();
     register_set_rho_max_rpm();
     register_get_config();
 

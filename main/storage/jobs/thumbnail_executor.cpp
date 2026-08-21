@@ -3,6 +3,7 @@
 #include "PatternReader.h"
 #include "ManifestDatabase.h"
 #include "download_progress.h"
+#include "pipeline_progress.h"
 #include "thumbnail/framebuffer.h"
 #include "thumbnail/bezier_renderer.h"
 #include "thumbnail/png_encoder.h"
@@ -42,13 +43,16 @@ namespace jobs {
             }
         }
 
-        // 90% = thumbnailer started, 100% = done. Only for store downloads —
-        // thumbnails also run for local uploads, which aren't tracked.
+        // Store download bar: 90 = thumbnailer started, 100 = done (only for
+        // tracked store downloads; thumbnails also run for local uploads).
         DownloadProgressBroadcaster::instance().reportIfTracked(pattern_uuid, 90);
+        // Upload flow: dedicated thumbnail report.
+        pipeline_progress::thumb(pattern_uuid, "rendering", 0);
 
         // Render the pattern using external_uuid (file path)
         JobResult result = renderPattern(pattern_uuid, data.encrypted, data.output_path);
         if (result.success) {
+            pipeline_progress::thumb(pattern_uuid, "complete", 100);
             DownloadProgressBroadcaster::instance().complete(pattern_uuid);
         }
         return result;
@@ -109,6 +113,7 @@ namespace jobs {
 
         size_t rendered_count = 0;
         size_t point_index = 0;
+        uint8_t last_pct = 0;
 
         while (reader->hasMore()) {
             PatternPoint pt = reader->readNext();
@@ -123,6 +128,15 @@ namespace jobs {
                 rendered_count++;
             }
             point_index++;
+
+            // Throttled progress: thumb report 0-100, download bar 90-99.
+            uint8_t pct = static_cast<uint8_t>((point_index * 100) / total_points);
+            if (pct > last_pct) {
+                last_pct = pct;
+                pipeline_progress::thumb(pattern_uuid, "rendering", pct);
+                DownloadProgressBroadcaster::instance().reportIfTracked(
+                    pattern_uuid, static_cast<uint8_t>(90 + pct / 12));
+            }
         }
 
         renderer.endPath();

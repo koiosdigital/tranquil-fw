@@ -38,6 +38,7 @@
 #include "PatternDownloader.h"
 #include "pattern_handler.h"
 #include "download_progress.h"
+#include "pipeline_progress.h"
 
 #include <koios/ota.h>
 
@@ -83,7 +84,8 @@ extern "C" void app_main(void)
                 job.pattern_external_uuid, result.success);
         }
         // A final failure anywhere in the download→conversion→thumbnail chain
-        // ends the pipeline — stop broadcasting progress for that pattern.
+        // ends the pipeline. Emit a terminal signal so clients clear their UI
+        // instead of leaving a spinner stuck at the last percent.
         if (!result.success) {
             std::string uuid = job.pattern_external_uuid;
             if (uuid.empty() && job.pattern_id != 0) {
@@ -91,7 +93,23 @@ extern "C" void app_main(void)
                 if (pattern) uuid = pattern->external_uuid;
             }
             if (!uuid.empty()) {
-                DownloadProgressBroadcaster::instance().drop(uuid);
+                switch (job.type) {
+                case jobs::JobType::Download:
+                    DownloadProgressBroadcaster::instance().fail(uuid, result.error);
+                    break;
+                case jobs::JobType::Conversion:
+                    // No .dat produced — the pattern is unusable.
+                    DownloadProgressBroadcaster::instance().fail(uuid, result.error);
+                    pipeline_progress::conversion(uuid, "failed", 0, result.error);
+                    break;
+                case jobs::JobType::Thumbnail:
+                    // The .dat exists and plays fine; only the (optional)
+                    // preview failed, and it regenerates on demand. Finish the
+                    // download bar rather than failing the whole download.
+                    DownloadProgressBroadcaster::instance().complete(uuid);
+                    pipeline_progress::thumb(uuid, "failed", 0, result.error);
+                    break;
+                }
             }
         }
         };

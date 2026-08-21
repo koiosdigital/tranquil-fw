@@ -377,19 +377,35 @@ namespace tmc {
     }
 
     bool TMC2209Stepper::is_stalled() {
-        return get_stallguard_result() == 0;
+        // The TMC2209 signals a stall when SG_RESULT drops to or below
+        // 2*SGTHRS (datasheet section 5.4 "StallGuard4"). The old test
+        // (SG_RESULT == 0) almost never fires — SG_RESULT rarely reaches
+        // exactly zero even in a hard stall — so it reported "not stalled"
+        // through real stalls. Homing does NOT depend on this path (it uses
+        // the DIAG pin); this only feeds the reported status flag.
+        const uint16_t sgthrs = static_cast<uint16_t>(shadow_.sgthrs & 0xFF);
+        if (sgthrs == 0) {
+            return false;  // Threshold unset: no meaningful stall comparison
+        }
+        return get_stallguard_result() <= static_cast<uint16_t>(sgthrs * 2);
     }
 
     uint16_t TMC2209Stepper::get_actual_current() {
-        auto mscuract_opt = bus_.read_register(addr_, static_cast<uint8_t>(Register::MSCURACT));
-        if (!mscuract_opt) {
+        // CS_ACTUAL (DRV_STATUS bits 16..20) is the current scale the driver is
+        // actually applying after CoolStep/StallGuard regulation. The old code
+        // read MSCURACT, which holds the instantaneous coil sine values
+        // (CUR_A/CUR_B) — not a current scale — so the returned mA was garbage.
+        auto status = get_driver_status();
+        if (!status) {
             return 0;
         }
 
-        const uint16_t cs = static_cast<uint16_t>(*mscuract_opt & 0x1FF);
-        // I = (CS+1) * Vfs / (32 * (Rs + Rint)) * 1000
-        const float irms = static_cast<float>(cs + 1) * kVfs / (32.0f * (kRsense + kRint)) * 1000.0f;
-        return static_cast<uint16_t>(std::round(irms));
+        const uint16_t cs = status->current_scaling();
+        // Inverse of calculate_current_scale():
+        //   I_rms = (CS+1) * Vfs / (32 * (Rsense + Rint) * sqrt(2))
+        const float irms_ma = static_cast<float>(cs + 1) * kVfs /
+            (32.0f * (kRsense + kRint) * kSqrt2) * 1000.0f;
+        return static_cast<uint16_t>(std::round(irms_ma));
     }
 
     bool TMC2209Stepper::is_stealthchop_active() {

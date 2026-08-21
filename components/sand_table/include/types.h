@@ -40,15 +40,6 @@ namespace sand_table {
 
         [[nodiscard]] MotionError error() const { return std::get<MotionError>(data_); }
 
-        // Monadic operations
-        template<typename F>
-        auto and_then(F&& f) -> Result<decltype(f(std::declval<T>()))> {
-            if (is_ok()) {
-                return Result<decltype(f(std::declval<T>()))>::ok(f(value()));
-            }
-            return Result<decltype(f(std::declval<T>()))>::err(error());
-        }
-
     private:
         explicit Result(T value) : data_(std::move(value)) {}
         explicit Result(MotionError error) : data_(error) {}
@@ -150,15 +141,6 @@ namespace sand_table {
         // to already-queued and in-flight segments instantly, and boosted
         // segments keep their boost ratio. 0 = exempt from live scaling.
         float base_feedrate = 0.0f;
-
-        [[nodiscard]] CartesianPosition direction() const noexcept {
-            // Convert polar delta to approximate Cartesian direction
-            // This is used for junction velocity calculations
-            return CartesianPosition{
-                static_cast<float>(delta_rho_norm),
-                static_cast<float>(delta_theta_rad)
-            }.normalized();
-        }
     };
 
     // =============================================================================
@@ -173,10 +155,6 @@ namespace sand_table {
         float cruise_velocity = 0.0f;  // steps/s
         float exit_velocity = 0.0f;    // steps/s
         float acceleration = 0.0f;     // steps/s^2
-
-        [[nodiscard]] uint32_t total_steps() const noexcept {
-            return accel_steps + cruise_steps + decel_steps;
-        }
     };
 
     // =============================================================================
@@ -200,7 +178,6 @@ namespace sand_table {
         int32_t position_steps = 0;
         bool is_enabled = false;
         bool is_homed = false;
-        bool is_stalled = false;
     };
 
     struct RobotStatus {

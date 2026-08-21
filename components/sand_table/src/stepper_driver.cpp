@@ -520,8 +520,7 @@ namespace sand_table {
         const uint16_t* intervals,
         uint32_t total_steps,
         std::atomic<int32_t>& theta_pos,
-        std::atomic<int32_t>& rho_pos,
-        uint32_t timeout_ms)
+        std::atomic<int32_t>& rho_pos)
     {
         if (!initialized_) {
             return Result<void>::err(MotionError::InvalidState);
@@ -650,7 +649,6 @@ namespace sand_table {
         // plan time, but a single 64-symbol pair is bounded by
         // 64 x 32.767ms ~= 2.1s even at the slowest interval. No pair
         // completing within the window means the hardware is wedged.
-        (void)timeout_ms;  // Superseded by per-pair progress timeout
         constexpr TickType_t kPairTimeout = pdMS_TO_TICKS(6000);
         for (;;) {
             if (xSemaphoreTake(completion_sem_, kPairTimeout) != pdTRUE) {
@@ -970,7 +968,13 @@ namespace sand_table {
             accel_dist = (v_peak * v_peak - entry_steps_s * entry_steps_s) / (2.0f * accel_steps_s2);
             decel_dist = total_dist - accel_dist;
 
-            profile.accel_steps = static_cast<uint32_t>(std::max(0.0f, accel_dist));
+            // Clamp accel to the segment length before the unsigned subtract.
+            // On a very short segment with entry << exit (reachable near the
+            // center: entry clamps to the floor while exit clamps to the step-
+            // rate ceiling), accel_dist can exceed total_steps, which would
+            // underflow decel_steps to ~4e9.
+            profile.accel_steps = std::min(
+                static_cast<uint32_t>(std::max(0.0f, accel_dist)), total_steps);
             profile.decel_steps = total_steps - profile.accel_steps;
             profile.cruise_steps = 0;
             profile.cruise_velocity = v_peak;
@@ -1046,12 +1050,6 @@ namespace sand_table {
             segment.delta_theta_steps, segment.delta_rho_steps,
             total_steps, profile.cruise_velocity, interval_table_.intervals[0]);
 
-        // Timeout: the interval table's summed duration with 2x margin plus a
-        // fixed floor. A fixed 30s timeout used to kill long slow segments
-        // (a max-length segment at minimum speed legitimately runs minutes).
-        const uint32_t expected_ms = static_cast<uint32_t>(interval_table_.total_us / 1000);
-        const uint32_t timeout_ms = expected_ms * 2 + 2000;
-
         // Live feedrate scaling reference: chunk intervals execute at
         // (live_feedrate / base_feedrate) x the planned speed, so feedrate
         // changes reach this segment even while it is running. The scale is
@@ -1085,8 +1083,7 @@ namespace sand_table {
             interval_table_.intervals,
             interval_table_.total_steps,
             theta_.position_,
-            rho_.position_,
-            timeout_ms
+            rho_.position_
         );
 
         return result;
@@ -1169,17 +1166,12 @@ namespace sand_table {
             const uint32_t chunk = std::min(total_steps - executed,
                 static_cast<uint32_t>(kMaxIntervalsPerSegment));
 
-            const uint32_t expected_ms = static_cast<uint32_t>(
-                (static_cast<uint64_t>(chunk) * clamped_interval) / 1000);
-            const uint32_t timeout_ms = expected_ms * 2 + 2000;
-
             auto result = rmt_sequencer_->execute(
                 bresenham_,
                 interval_table_.intervals,
                 chunk,
                 theta_.position_,
-                rho_.position_,
-                timeout_ms
+                rho_.position_
             );
             if (result.is_err()) {
                 return result;
@@ -1249,7 +1241,6 @@ namespace sand_table {
             }
 
             interval_table_.intervals[step] = static_cast<uint16_t>(interval_us);
-            interval_table_.total_us += interval_us;
         }
     }
 

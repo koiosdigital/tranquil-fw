@@ -18,10 +18,15 @@ public:
     JobType jobType() const override { return JobType::Conversion; }
 
 private:
-    // Single-pass ASCII THR to binary THRB conversion
+    // Single-pass ASCII THR to binary THRB conversion. Emits progress for
+    // `progress_uuid` (conversion report 0-100, and the download bar's 80-90
+    // band for store downloads) based on how far through the `input_size`-byte
+    // source we've read.
     esp_err_t convertToBinary(const char* input_path,
                                const char* output_path,
-                               size_t* out_point_count);
+                               size_t* out_point_count,
+                               const std::string& progress_uuid,
+                               size_t input_size);
 
     // Add pattern to database after successful conversion
     esp_err_t addPatternToDatabase(const std::string& uuid,

@@ -520,6 +520,29 @@ esp_err_t SandTablePlayer::skip() {
     return ESP_OK;
 }
 
+esp_err_t SandTablePlayer::previous() {
+    if (!initialized_) return ESP_ERR_INVALID_STATE;
+
+    raii::MutexGuard guard(state_mutex_, pdMS_TO_TICKS(1000));
+    if (!guard) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    // Only works in playlist mode
+    if (play_mode_ == PlayMode::SINGLE_PATTERN || playlist_patterns_.empty()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // Stop current pattern
+    unloadPatternFile();
+
+    // Step back
+    goToPreviousPattern();
+
+    ESP_LOGI(TAG, "Skipped to previous pattern");
+    return ESP_OK;
+}
+
 // =============================================================================
 // Configuration
 // =============================================================================
@@ -1066,6 +1089,23 @@ void SandTablePlayer::advanceToNextPattern() {
             ESP_LOGI(TAG, "Playlist finished");
             return;
         }
+    }
+
+    startCurrentPattern();
+}
+
+void SandTablePlayer::goToPreviousPattern() {
+    if (playlist_patterns_.empty()) return;
+
+    if (playlist_index_ == 0) {
+        // Nothing before the first track: wrap to the end when looping,
+        // otherwise just restart the first pattern.
+        if (is_loop_ && !playlist_order_.empty()) {
+            playlist_index_ = playlist_order_.size() - 1;
+        }
+    }
+    else {
+        playlist_index_--;
     }
 
     startCurrentPattern();

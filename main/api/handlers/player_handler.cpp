@@ -225,12 +225,17 @@ HandleResult PlayerHandler::handlePlaylistNavigate(
         ESP_LOGI(TAG, "PlaylistNavigate: next");
         ret = SandTablePlayer::skip();
     } else if (msg->direction == KD__V1__PLAYLIST_NAVIGATE_COMMAND__DIRECTION__DIRECTION_PREVIOUS) {
-        ESP_LOGW(TAG, "PlaylistNavigate: previous not implemented");
-        ret = ESP_ERR_NOT_SUPPORTED;
+        ESP_LOGI(TAG, "PlaylistNavigate: previous");
+        ret = SandTablePlayer::previous();
+    } else {
+        ESP_LOGW(TAG, "PlaylistNavigate: unspecified direction");
+        ret = ESP_ERR_INVALID_ARG;
     }
 
-    response = makeCommandResult(ret == ESP_OK,
-        ret == ESP_ERR_NOT_SUPPORTED ? "Previous not implemented" : nullptr);
+    const char* detail = nullptr;
+    if (ret == ESP_ERR_INVALID_STATE) detail = "Not in playlist mode";
+    else if (ret != ESP_OK) detail = "Navigation failed";
+    response = makeCommandResult(ret == ESP_OK, detail);
     return HandleResult::ok(true, true);
 }
 

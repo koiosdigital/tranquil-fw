@@ -13,6 +13,7 @@
 #include "drm/drm_license.h"
 #include "drm/drm_purchase.h"
 #include "ManifestDatabase.h"
+#include "download_progress.h"
 
 static const char* TAG = "cloud_handlers";
 
@@ -72,6 +73,13 @@ namespace {
         ESP_LOGI(TAG, "Pattern download response:");
         ESP_LOGI(TAG, "  UUID: %s", response->pattern_uuid ? response->pattern_uuid : "");
         ESP_LOGI(TAG, "  URL: %s", response->download_url ? response->download_url : "");
+
+        // Ensure the download is tracked from 0% even when it was cloud-initiated
+        // (no local RequestPatternDownload ran to call track()). No-op if already
+        // tracked from the local request path.
+        if (response->pattern_uuid) {
+            DownloadProgressBroadcaster::instance().track(response->pattern_uuid);
+        }
 
         // Queue the download with completion callback
         auto result = PatternDownloader::instance().queueDownload(response,

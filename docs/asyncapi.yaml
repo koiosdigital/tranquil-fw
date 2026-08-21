@@ -613,6 +613,12 @@ components:
                 type: string
               progress_pct:
                 type: integer
+              failed:
+                type: boolean
+                description: "Terminal failure: the entry is sent once with failed=true, then dropped. Clients should surface error and stop tracking."
+              error:
+                type: string
+                description: "Human-readable failure reason (set when failed=true)."
 
     PatternConversionProgressReport:
       type: object

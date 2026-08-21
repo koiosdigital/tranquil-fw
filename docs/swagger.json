@@ -1827,9 +1827,6 @@
           "microsteps": {
             "type": "integer"
           },
-          "theta_max_rpm": {
-            "type": "integer"
-          },
           "rho_max_rpm": {
             "type": "integer"
           },

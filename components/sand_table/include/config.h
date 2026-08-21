@@ -83,9 +83,8 @@ namespace sand_table {
         //   theta_irun_ma      - theta motor run current (TMC IRUN/IHOLD)
         //   rho_irun_ma        - rho motor run current
         //   stallguard_threshold - rho StallGuard sensitivity (homing)
-        // theta_max_rpm is retained for a future per-axis clamp (the theta
-        // spin rate is currently bounded by THETA_MAX_ROT_PER_MIN below).
-        static int32_t theta_max_rpm();
+        // The theta spin rate is bounded by the compile-time
+        // THETA_MAX_ROT_PER_MIN safety clamp below, not a runtime knob.
         static int32_t rho_max_rpm();
         static uint16_t theta_irun_ma();
         static uint16_t rho_irun_ma();

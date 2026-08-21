@@ -186,9 +186,9 @@ namespace sand_table {
             return result;
         }
 
-        // Set direction outward; keep both sensor ISRs off for the blanking
-        // move below
-        rho_.set_direction(true);
+        // Keep both sensor ISRs off for the blanking move below. The outward
+        // direction is set by execute_constant_speed from the positive rho
+        // step sign — no separate set_direction() needed.
         disable_hall_isr();
         disable_diag_isr();
 
@@ -247,9 +247,9 @@ namespace sand_table {
             return result;
         }
 
-        // Set direction inward; keep both sensor ISRs off for the blanking
-        // move below
-        rho_.set_direction(false);
+        // Keep both sensor ISRs off for the blanking move below. The inward
+        // direction is set by execute_constant_speed from the negative rho
+        // step sign — no separate set_direction() needed.
         disable_hall_isr();
         disable_diag_isr();
 
@@ -332,11 +332,11 @@ namespace sand_table {
         if (is_hall_triggered()) {
             ESP_LOGD(TAG, "Backing off Hall sensor...");
             hall_triggered_ = false;
-            theta_.set_direction(false);  // Reverse
-            rho_.set_direction(false);    // Rho follows theta due to coupling
 
-            // Move backward a moderate amount (hall field is small)
-            // Use ~5000 theta steps with coupled rho compensation
+            // Move backward a moderate amount (hall field is small).
+            // Use ~5000 theta steps with coupled rho compensation; direction
+            // (reverse, rho following theta) comes from the negative step
+            // signs passed to execute_constant_speed below.
             constexpr int32_t kBackoffSteps = 5000;
             int32_t rho_backoff = static_cast<int32_t>(std::lround(
                 kBackoffSteps * rho_steps_per_theta_step()));
@@ -366,8 +366,8 @@ namespace sand_table {
         // ISR will stop when we enter the hall field (NEGEDGE)
         ESP_LOGD(TAG, "Seeking first Hall edge...");
         hall_triggered_ = false;
-        theta_.set_direction(true);   // Forward
-        rho_.set_direction(true);     // Rho follows theta
+        // Forward direction (rho following theta) is set by the positive step
+        // signs passed to execute_constant_speed below.
 
         int32_t theta_before = theta_.position();
         int32_t rho_steps_for_full_rotation = static_cast<int32_t>(std::lround(
@@ -695,9 +695,9 @@ namespace sand_table {
             return result;
         }
 
-        // Move inward until we stall at center (rho=0.0)
+        // Move inward until we stall at center (rho=0.0). The inward direction
+        // is set by execute_constant_speed from the negative rho step sign below.
         rho_stall_triggered_ = false;
-        rho_.set_direction(false);  // Inward
 
         // Only enable stallguard ISR for this phase
         disable_hall_isr();
@@ -757,10 +757,10 @@ namespace sand_table {
         if (is_hall_triggered()) {
             ESP_LOGD(TAG, "Backing off Hall sensor...");
             hall_triggered_ = false;
-            theta_.set_direction(false);  // Reverse
-            rho_.set_direction(false);    // Rho follows theta due to coupling
 
-            // Move backward a moderate amount (hall field is small)
+            // Move backward a moderate amount (hall field is small). Direction
+            // (reverse, rho following theta) comes from the negative step signs
+            // passed to execute_constant_speed below.
             constexpr int32_t kBackoffSteps = 5000;
             int32_t rho_backoff = static_cast<int32_t>(std::lround(
                 kBackoffSteps * rho_steps_per_theta_step()));
@@ -790,8 +790,8 @@ namespace sand_table {
         // ISR will stop when we enter the hall field (NEGEDGE)
         ESP_LOGD(TAG, "Seeking Hall edge...");
         hall_triggered_ = false;
-        theta_.set_direction(true);   // Forward
-        rho_.set_direction(true);     // Rho follows theta
+        // Forward direction (rho following theta) is set by the positive step
+        // signs passed to execute_constant_speed below.
 
         int32_t theta_before = theta_.position();
         int32_t rho_steps_for_full_rotation = static_cast<int32_t>(std::lround(

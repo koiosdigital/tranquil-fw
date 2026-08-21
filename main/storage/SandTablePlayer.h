@@ -87,7 +87,8 @@ public:
     static esp_err_t resume();
     static esp_err_t stop();
     static esp_err_t emergencyStop();  // Immediate halt without state cleanup
-    static esp_err_t skip();  // Playlist only: skip to next pattern
+    static esp_err_t skip();      // Playlist only: skip to next pattern
+    static esp_err_t previous();  // Playlist only: return to previous pattern
 
     // Configuration
     static void setFeedRate(double feed_rate);
@@ -139,6 +140,7 @@ private:
     static void loadPlaylist(const char* playlist_uuid);
     static void startCurrentPattern();
     static void advanceToNextPattern();
+    static void goToPreviousPattern();
     static void shufflePlaylistOrder();
 
     // Motion processing

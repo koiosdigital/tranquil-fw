@@ -29,20 +29,26 @@ struct CurrentConfig {
     uint8_t iholddelay;
 };
 
+// Decodes the TMC2209 DRV_STATUS register (0x6F). NOTE: this layout is
+// specific to the 2209 and differs from the TMC2130/5160 — the 2209 has no
+// StallGuard result or dedicated stall bit in this register (StallGuard is
+// read from SG_RESULT 0x41, and a stall is reported on the DIAG pin), and the
+// short/open-load/over-temperature flags live in the low byte. Fields per the
+// TMC2209 datasheet (Rev 1.09), section 5.1 "DRV_STATUS".
 struct DriverStatus {
     uint32_t raw;
 
-    [[nodiscard]] bool stall() const noexcept { return (raw & (1U << 24)) != 0; }
-    [[nodiscard]] bool standstill() const noexcept { return (raw & (1U << 31)) != 0; }
-    [[nodiscard]] bool overtemperature_warning() const noexcept { return (raw & (1U << 26)) != 0; }
-    [[nodiscard]] bool overtemperature_shutdown() const noexcept { return (raw & (1U << 25)) != 0; }
-    [[nodiscard]] bool short_to_ground_a() const noexcept { return (raw & (1U << 27)) != 0; }
-    [[nodiscard]] bool short_to_ground_b() const noexcept { return (raw & (1U << 28)) != 0; }
-    [[nodiscard]] bool open_load_a() const noexcept { return (raw & (1U << 29)) != 0; }
-    [[nodiscard]] bool open_load_b() const noexcept { return (raw & (1U << 30)) != 0; }
-    [[nodiscard]] bool stealthchop_active() const noexcept { return (raw & (1U << 30)) != 0; }
-    [[nodiscard]] uint16_t stallguard_result() const noexcept { return static_cast<uint16_t>(raw & 0x3FF); }
-    [[nodiscard]] uint8_t current_scaling() const noexcept { return static_cast<uint8_t>((raw >> 16) & 0x1F); }
+    [[nodiscard]] bool overtemperature_warning() const noexcept { return (raw & (1U << 0)) != 0; }   // otpw
+    [[nodiscard]] bool overtemperature_shutdown() const noexcept { return (raw & (1U << 1)) != 0; }   // ot
+    [[nodiscard]] bool short_to_ground_a() const noexcept { return (raw & (1U << 2)) != 0; }          // s2ga
+    [[nodiscard]] bool short_to_ground_b() const noexcept { return (raw & (1U << 3)) != 0; }          // s2gb
+    [[nodiscard]] bool low_side_short_a() const noexcept { return (raw & (1U << 4)) != 0; }           // s2vsa
+    [[nodiscard]] bool low_side_short_b() const noexcept { return (raw & (1U << 5)) != 0; }           // s2vsb
+    [[nodiscard]] bool open_load_a() const noexcept { return (raw & (1U << 6)) != 0; }                // ola
+    [[nodiscard]] bool open_load_b() const noexcept { return (raw & (1U << 7)) != 0; }                // olb
+    [[nodiscard]] uint8_t current_scaling() const noexcept { return static_cast<uint8_t>((raw >> 16) & 0x1F); }  // CS_ACTUAL
+    [[nodiscard]] bool stealthchop_active() const noexcept { return (raw & (1U << 30)) != 0; }        // stealth
+    [[nodiscard]] bool standstill() const noexcept { return (raw & (1U << 31)) != 0; }                // stst
 };
 
 class TMC2209Stepper {

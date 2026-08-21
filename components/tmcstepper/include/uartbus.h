@@ -3,6 +3,8 @@
 #include "esp_err.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 #include <cstdint>
 #include <optional>
@@ -41,6 +43,13 @@ private:
 
     uart_port_t uart_port_ = UART_NUM_MAX;
     bool initialized_ = false;
+
+    // Serializes whole read/write transactions on the shared half-duplex bus.
+    // Both motor drivers and the status getters (is_stalled / get_*_current)
+    // share one UartBus; without this a status read from the API task could
+    // interleave with an apply_motor_config() write and corrupt a transaction
+    // (mismatched reply framing, wrong CRC).
+    SemaphoreHandle_t mutex_ = nullptr;
 };
 
 } // namespace tmc

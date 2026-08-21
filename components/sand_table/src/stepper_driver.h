@@ -147,16 +147,15 @@ namespace sand_table {
         /// @param total_steps Total steps on major axis
         /// @param theta_pos Atomic position counter for theta (updated during execution)
         /// @param rho_pos Atomic position counter for rho (updated during execution)
-        /// @param timeout_ms Completion timeout; pass the expected segment
-        ///        duration with margin (a fixed value spuriously kills long
-        ///        slow segments)
+        /// Completion is bounded by a fixed per-chunk-pair timeout (see execute()):
+        /// a plan-time duration estimate spuriously killed long, legitimately
+        /// slow segments, so no caller-supplied timeout is taken.
         [[nodiscard]] Result<void> execute(
             BresenhamState& bresenham,
             const uint16_t* intervals,
             uint32_t total_steps,
             std::atomic<int32_t>& theta_pos,
-            std::atomic<int32_t>& rho_pos,
-            uint32_t timeout_ms
+            std::atomic<int32_t>& rho_pos
         );
 
         /// Request stop: raises the stop flag and wakes execute(), which
@@ -416,9 +415,8 @@ namespace sand_table {
         struct IntervalTable {
             uint16_t* intervals = nullptr;  // Allocated from internal RAM (ISR-read)
             uint32_t total_steps = 0;
-            uint64_t total_us = 0;          // Sum of intervals (for timeout sizing)
 
-            void clear() { total_steps = 0; total_us = 0; }
+            void clear() { total_steps = 0; }
         };
         IntervalTable interval_table_;
 

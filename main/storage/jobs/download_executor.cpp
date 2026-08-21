@@ -131,10 +131,14 @@ JobResult DownloadExecutor::performDownload(const std::string& pattern_uuid,
         size_t bytes_written = 0;
         size_t next_progress_log = 0;
         uint8_t last_progress_pct = 0;
+        size_t expected_size = 0;  // metadata size, fallback when no Content-Length
         esp_err_t error = ESP_OK;
     };
 
     DownloadContext ctx = {&file, pattern_uuid.c_str()};
+    // Rough denominator for chunked responses that omit Content-Length; the
+    // server's metadata size is imperfect but keeps the bar moving.
+    ctx.expected_size = data.size_bytes;
 
     // Event handler that streams to file
     auto event_handler = [](esp_http_client_event_t* evt) -> esp_err_t {
@@ -144,6 +148,9 @@ JobResult DownloadExecutor::performDownload(const std::string& pattern_uuid,
         switch (evt->event_id) {
             case HTTP_EVENT_ON_CONNECTED:
                 ESP_LOGI(TAG, "HTTP connected");
+                // Bridge the 10 (picked up) -> 20 (first bytes) gap so the bar
+                // doesn't stall through TLS setup on a slow link.
+                DownloadProgressBroadcaster::instance().report(ctx->pattern_uuid, 15);
                 break;
             case HTTP_EVENT_ON_DATA:
                 if (evt->data && evt->data_len > 0) {
@@ -158,19 +165,28 @@ JobResult DownloadExecutor::performDownload(const std::string& pattern_uuid,
                         ESP_LOGI(TAG, "  received %zu bytes", ctx->bytes_written);
                         ctx->next_progress_log = ctx->bytes_written + 65536;
                     }
-                    // Map byte progress into the 20-80 band, in 5% steps
+                    // Map byte progress into the 20-80 band, in 5% steps.
                     {
                         int64_t total = esp_http_client_get_content_length(evt->client);
-                        if (total > 0) {
-                            uint8_t pct = 20 + static_cast<uint8_t>(
-                                (ctx->bytes_written * 60) / static_cast<size_t>(total));
+                        size_t denom = total > 0 ? static_cast<size_t>(total)
+                                                 : ctx->expected_size;
+                        uint8_t pct;
+                        if (denom > 0) {
+                            pct = 20 + static_cast<uint8_t>(
+                                (ctx->bytes_written * 60) / denom);
                             if (pct > 80) pct = 80;
-                            pct -= pct % 5;
-                            if (pct > ctx->last_progress_pct) {
-                                ctx->last_progress_pct = pct;
-                                DownloadProgressBroadcaster::instance().report(
-                                    ctx->pattern_uuid, pct);
-                            }
+                        } else {
+                            // Truly unknown length (chunked, no metadata): creep
+                            // 20->75 by volume (~+1% per 16 KiB) so the bar still
+                            // advances instead of freezing at 10 until 80.
+                            size_t creep = ctx->bytes_written / 16384;
+                            pct = 20 + static_cast<uint8_t>(creep > 55 ? 55 : creep);
+                        }
+                        pct -= pct % 5;
+                        if (pct > ctx->last_progress_pct) {
+                            ctx->last_progress_pct = pct;
+                            DownloadProgressBroadcaster::instance().report(
+                                ctx->pattern_uuid, pct);
                         }
                     }
                 }

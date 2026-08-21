@@ -73,7 +73,6 @@ namespace sand_table {
         // These are only used on first boot before a preset is loaded
         motion_.steps_per_rev = 200;
         motion_.microsteps = 16;  // TMC2209 default
-        motion_.theta_max_rpm = 15;
         motion_.rho_max_rpm = 15;
         motion_.theta_current_ma = 400;
         motion_.rho_current_ma = 400;
@@ -102,7 +101,6 @@ namespace sand_table {
         // If any key is missing, we'll use the default value already set
         nvs.get_u32(kKeyStepsPerRev, &motion_.steps_per_rev);
         nvs.get_u16(kKeyMicrosteps, &motion_.microsteps);
-        nvs.get_i32(kKeyThetaMaxRpm, &motion_.theta_max_rpm);
         nvs.get_i32(kKeyRhoMaxRpm, &motion_.rho_max_rpm);
         nvs.get_u16(kKeyThetaCurrMa, &motion_.theta_current_ma);
         nvs.get_u16(kKeyRhoCurrMa, &motion_.rho_current_ma);
@@ -125,9 +123,6 @@ namespace sand_table {
         if (err != ESP_OK) return err;
 
         err = nvs.set_u16(kKeyMicrosteps, motion_.microsteps);
-        if (err != ESP_OK) return err;
-
-        err = nvs.set_i32(kKeyThetaMaxRpm, motion_.theta_max_rpm);
         if (err != ESP_OK) return err;
 
         err = nvs.set_i32(kKeyRhoMaxRpm, motion_.rho_max_rpm);
@@ -402,10 +397,6 @@ namespace sand_table {
     // =============================================================================
     // MotionConfig Runtime Accessors
     // =============================================================================
-
-    int32_t MotionConfig::theta_max_rpm() {
-        return ConfigManager::instance().motion_config().theta_max_rpm;
-    }
 
     int32_t MotionConfig::rho_max_rpm() {
         return ConfigManager::instance().motion_config().rho_max_rpm;

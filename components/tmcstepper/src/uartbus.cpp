@@ -19,6 +19,21 @@ constexpr size_t kReadBufferSize = 12;
 constexpr uint32_t kTxTimeoutMs = 100;
 constexpr uint32_t kRxTimeoutMs = 200;
 constexpr uint32_t kResponseDelayUs = 500;
+constexpr uint32_t kBusLockTimeoutMs = 1000;
+
+// RAII lock for the shared-bus mutex; releases on every early-return path.
+class BusLock {
+public:
+    BusLock(SemaphoreHandle_t m, TickType_t timeout) noexcept
+        : mutex_(m), locked_(m == nullptr || xSemaphoreTake(m, timeout) == pdTRUE) {}
+    ~BusLock() { if (mutex_ && locked_) xSemaphoreGive(mutex_); }
+    BusLock(const BusLock&) = delete;
+    BusLock& operator=(const BusLock&) = delete;
+    [[nodiscard]] bool locked() const noexcept { return locked_; }
+private:
+    SemaphoreHandle_t mutex_;
+    bool locked_;
+};
 } // namespace
 
 namespace tmc {
@@ -57,6 +72,13 @@ esp_err_t UartBus::initialize(uart_port_t port, gpio_num_t tx_pin, gpio_num_t rx
         return err;
     }
 
+    mutex_ = xSemaphoreCreateMutex();
+    if (!mutex_) {
+        ESP_LOGE(TAG, "Failed to create bus mutex");
+        uart_driver_delete(port);
+        return ESP_ERR_NO_MEM;
+    }
+
     uart_port_ = port;
     initialized_ = true;
     ESP_LOGD(TAG, "UART initialized on port %d at %" PRIu32 " baud", port, baud);
@@ -70,6 +92,10 @@ void UartBus::deinitialize() noexcept {
     }
 
     uart_driver_delete(uart_port_);
+    if (mutex_) {
+        vSemaphoreDelete(mutex_);
+        mutex_ = nullptr;
+    }
     initialized_ = false;
     uart_port_ = UART_NUM_MAX;
 }
@@ -95,6 +121,12 @@ uint8_t UartBus::calculate_crc(const uint8_t* data, size_t length) noexcept {
 esp_err_t UartBus::write_register(uint8_t addr, uint8_t reg, uint32_t value) {
     if (!initialized_) {
         return ESP_ERR_INVALID_STATE;
+    }
+
+    BusLock lock(mutex_, pdMS_TO_TICKS(kBusLockTimeoutMs));
+    if (!lock.locked()) {
+        ESP_LOGW(TAG, "Bus busy: write addr=%u reg=0x%02X timed out", addr, reg);
+        return ESP_ERR_TIMEOUT;
     }
 
     std::array<uint8_t, kWritePacketSize> packet = {
@@ -126,6 +158,12 @@ esp_err_t UartBus::write_register(uint8_t addr, uint8_t reg, uint32_t value) {
 
 std::optional<uint32_t> UartBus::read_register(uint8_t addr, uint8_t reg) {
     if (!initialized_) {
+        return std::nullopt;
+    }
+
+    BusLock lock(mutex_, pdMS_TO_TICKS(kBusLockTimeoutMs));
+    if (!lock.locked()) {
+        ESP_LOGW(TAG, "Bus busy: read addr=%u reg=0x%02X timed out", addr, reg);
         return std::nullopt;
     }
 

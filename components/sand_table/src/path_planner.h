@@ -170,6 +170,21 @@ namespace sand_table {
             return Result<void>::err(MotionError::InvalidState);
         }
 
+        // Multi-rotation moves must stay spirals, even in linear mode. In a
+        // .thr theta-rho file every move between two points is an Archimedes
+        // spiral of constant dtheta/drho — e.g. "0 0" -> "314.1592 1" is the
+        // ~50-turn erase spiral from center to rim. Cartesian straight-line
+        // interpolation collapses that winding to a short chord (endpoints
+        // alias to nearby XY points) and then snaps current_position_ to the
+        // wound-up theta, leaving a permanent angular offset for the rest of
+        // the pattern. When a segment winds a full turn or more, plan it as a
+        // polar spiral so the table draws the intended path; ordinary drawing
+        // segments (|dtheta| < 2*pi) keep Cartesian interpolation. See the
+        // Sisyphus .thr spiral-interpolation semantics.
+        if (std::fabs(target.theta - current.theta) >= 2.0 * M_PI) {
+            return plan_polar_move(current, target, feedrate_rpm, base_feedrate_rpm);
+        }
+
         // SPECIAL CASE: Move to/from center (rho=0)
         // At center, theta is undefined - skip all trig and just move rho.
         // This avoids atan2 singularity and spurious theta commands.

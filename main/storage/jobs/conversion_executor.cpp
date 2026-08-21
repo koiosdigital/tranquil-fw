@@ -2,6 +2,8 @@
 #include "job_queue.h"
 #include "ManifestDatabase.h"
 #include "PatternReader.h"
+#include "download_progress.h"
+#include "pipeline_progress.h"
 #include "esp_log.h"
 #include <cstdio>
 #include <cstdlib>
@@ -47,6 +49,13 @@ JobResult ConversionExecutor::execute(const Job& job) {
         rollback_pattern();
         return JobResult::fail_permanent("Input file not found: " + data.temp_path);
     }
+    const size_t input_size = static_cast<size_t>(st.st_size);
+
+    // Conversion is the slowest stage of a store download (a full line-by-line
+    // reparse) and the only stage of a local upload. Announce it so neither bar
+    // freezes: the download bar advances 80->90 (reportIfTracked, store
+    // downloads only) and uploads get their own conversion report.
+    pipeline_progress::conversion(pattern_uuid, "converting", 0);
 
     // Build output paths (use external_uuid for file naming)
     char binary_path[128];
@@ -58,7 +67,8 @@ JobResult ConversionExecutor::execute(const Job& job) {
     // PERMANENT failure — unlinking it on a transient failure guarantees
     // every retry fails.
     size_t point_count = 0;
-    esp_err_t result = convertToBinary(data.temp_path.c_str(), binary_path, &point_count);
+    esp_err_t result = convertToBinary(data.temp_path.c_str(), binary_path,
+                                       &point_count, pattern_uuid, input_size);
 
     if (result != ESP_OK || point_count == 0) {
         unlink(binary_path);  // partial output is never useful
@@ -101,6 +111,10 @@ JobResult ConversionExecutor::execute(const Job& job) {
     // Success - delete temp file
     unlink(data.temp_path.c_str());
 
+    // Upload flow: conversion done. (Store downloads fall through to the
+    // thumbnail stage, which drives the 90/100 of the download bar.)
+    pipeline_progress::conversion(pattern_uuid, "complete", 100);
+
     ESP_LOGD(TAG, "Conversion complete: %s (%zu points)", pattern_uuid.c_str(), point_count);
 
     // Enqueue thumbnail generation job using pattern's internal ID
@@ -115,7 +129,9 @@ JobResult ConversionExecutor::execute(const Job& job) {
 
 esp_err_t ConversionExecutor::convertToBinary(const char* input_path,
                                                const char* output_path,
-                                               size_t* out_point_count) {
+                                               size_t* out_point_count,
+                                               const std::string& progress_uuid,
+                                               size_t input_size) {
     FILE* in = fopen(input_path, "r");
     FILE* out = fopen(output_path, "wb");
 
@@ -142,6 +158,24 @@ esp_err_t ConversionExecutor::convertToBinary(const char* input_path,
     BinaryPoint batch[BATCH_SIZE];
     size_t batch_idx = 0;
     size_t point_count = 0;
+
+    // Emit progress off how far through the source we've read. Throttled to
+    // whole-percent (conversion report) / the 80-90 download band so we don't
+    // flood the socket on multi-hundred-thousand-point files.
+    uint8_t last_conv_pct = 0;
+    auto emit_progress = [&]() {
+        if (input_size == 0 || progress_uuid.empty()) return;
+        long pos = ftell(in);
+        if (pos < 0) return;
+        uint8_t conv_pct = static_cast<uint8_t>(
+            std::min<size_t>(100, (static_cast<size_t>(pos) * 100) / input_size));
+        if (conv_pct <= last_conv_pct) return;
+        last_conv_pct = conv_pct;
+        pipeline_progress::conversion(progress_uuid, "converting", conv_pct);
+        // Store-download bar: conversion occupies 80-90.
+        DownloadProgressBroadcaster::instance().reportIfTracked(
+            progress_uuid, static_cast<uint8_t>(80 + conv_pct / 10));
+    };
 
     char line[256];
     while (fgets(line, sizeof(line), in)) {
@@ -180,6 +214,7 @@ esp_err_t ConversionExecutor::convertToBinary(const char* input_path,
                 return ESP_FAIL;
             }
             batch_idx = 0;
+            emit_progress();
         }
     }
 

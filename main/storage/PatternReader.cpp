@@ -119,45 +119,50 @@ size_t BinaryPatternReader::getCurrentLine() const {
 }
 
 PatternPoint BinaryPatternReader::readBinaryPoint() {
-    if (!file_ || read_failed_ || current_point_ >= header_.point_count) {
-        return PatternPoint();
+    // Consume and account for every record read (current_point_++ per fread),
+    // skipping corrupt ones until a valid point, the point-count bound, or a
+    // read failure. Advancing current_point_ per record — not per valid point —
+    // keeps the file position, the count bound, and the peek/read cache in
+    // agreement. Previously a skipped record left current_point_ behind the
+    // file, so a peekNext() that hit a bad point advanced the stream without
+    // caching, and the following readNext() re-read and dropped the next
+    // (valid) point (silently skipping it and mis-counting path length).
+    while (file_ && !read_failed_ && current_point_ < header_.point_count) {
+        BinaryPoint bp;
+        if (fread(&bp, sizeof(bp), 1, file_) != 1) {
+            ESP_LOGE(TAG, "Failed to read binary point at index %zu", current_point_);
+            read_failed_ = true;  // terminal: end playback cleanly instead of spinning
+            return PatternPoint();
+        }
+        ++current_point_;  // one record consumed, valid or not
+
+        // Reject garbage motion targets: theta must be a finite, sane angle
+        // (|theta| < 10000 rad is generous for multi-rotation patterns)
+        if (!std::isfinite(bp.theta) || std::fabs(bp.theta) >= 10000.0f) {
+            ESP_LOGW(TAG, "Invalid theta at point %zu, skipping", current_point_ - 1);
+            continue;  // skip the corrupt record and try the next one
+        }
+
+        // Convert uint16 rho to float 0.0-1.0 (in [0,1] by construction)
+        double rho = static_cast<double>(bp.rho) / 65535.0;
+        return PatternPoint(static_cast<double>(bp.theta), rho);
     }
 
-    BinaryPoint bp;
-    if (fread(&bp, sizeof(bp), 1, file_) != 1) {
-        ESP_LOGE(TAG, "Failed to read binary point at index %zu", current_point_);
-        read_failed_ = true;  // terminal: end playback cleanly instead of spinning
-        return PatternPoint();
-    }
-
-    // Reject garbage motion targets: theta must be a finite, sane angle
-    // (|theta| < 10000 rad is generous for multi-rotation patterns)
-    if (!std::isfinite(bp.theta) || std::fabs(bp.theta) >= 10000.0f) {
-        ESP_LOGW(TAG, "Invalid theta at point %zu, skipping", current_point_);
-        return PatternPoint();
-    }
-
-    // Convert uint16 rho to float 0.0-1.0 (in [0,1] by construction)
-    double rho = static_cast<double>(bp.rho) / 65535.0;
-
-    return PatternPoint(static_cast<double>(bp.theta), rho);
+    return PatternPoint();
 }
 
 PatternPoint BinaryPatternReader::readNext() {
     if (!file_) return PatternPoint();
 
-    // If we have a peeked value, return it and clear
+    // Return the peeked value if present. The record was already read and
+    // counted (current_point_ advanced) when peekNext() consumed it, so do
+    // not advance again here.
     if (has_peeked_) {
         has_peeked_ = false;
-        current_point_++;
         return peeked_point_;
     }
 
-    PatternPoint point = readBinaryPoint();
-    if (point.valid) {
-        current_point_++;
-    }
-    return point;
+    return readBinaryPoint();
 }
 
 PatternPoint BinaryPatternReader::peekNext() {

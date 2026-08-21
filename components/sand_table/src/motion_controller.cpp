@@ -790,7 +790,6 @@ namespace sand_table {
             status.rho.position_steps = rho_stepper_->position();
             status.rho.is_enabled = rho_stepper_->is_enabled();
             status.rho.is_homed = status.is_homed;
-            status.rho.is_stalled = rho_tmc_ ? rho_tmc_->is_stalled() : false;
         }
 
         return status;

@@ -24,9 +24,9 @@ static esp_err_t config_get_handler(httpd_req_t* req) {
 
     chunk_buf_printf(&cb,
         "{\"motion\":{\"steps_per_rev\":%lu,\"microsteps\":%u,"
-        "\"theta_max_rpm\":%ld,\"rho_max_rpm\":%ld,",
+        "\"rho_max_rpm\":%ld,",
         (unsigned long)motion.steps_per_rev, (unsigned)motion.microsteps,
-        (long)motion.theta_max_rpm, (long)motion.rho_max_rpm);
+        (long)motion.rho_max_rpm);
     chunk_buf_printf(&cb,
         "\"theta_current_ma\":%u,\"rho_current_ma\":%u,\"stallguard_threshold\":%u},",
         (unsigned)motion.theta_current_ma, (unsigned)motion.rho_current_ma,
@@ -68,7 +68,6 @@ static esp_err_t config_patch_handler(httpd_req_t* req) {
         double v;
         if ((v = get_num("steps_per_rev", 0)) > 0) motion.steps_per_rev = (uint32_t)v;
         if ((v = get_num("microsteps", 0)) > 0) motion.microsteps = (uint16_t)v;
-        if ((v = get_num("theta_max_rpm", 0)) > 0) motion.theta_max_rpm = (int32_t)v;
         if ((v = get_num("rho_max_rpm", 0)) > 0) motion.rho_max_rpm = (int32_t)v;
         if ((v = get_num("theta_current_ma", 0)) > 0) motion.theta_current_ma = (uint16_t)v;
         if ((v = get_num("rho_current_ma", 0)) > 0) motion.rho_current_ma = (uint16_t)v;

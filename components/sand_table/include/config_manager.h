@@ -22,8 +22,8 @@ struct RuntimeMotionConfig {
     uint32_t steps_per_rev = 200;
     uint16_t microsteps = 16;
 
-    // Velocity limits (RPM)
-    int32_t theta_max_rpm = 15;
+    // Velocity limit (RPM) — default path feedrate. Theta spin rate is bounded
+    // separately by the compile-time MotionConfig::THETA_MAX_ROT_PER_MIN clamp.
     int32_t rho_max_rpm = 15;
 
     // Motor current (mA)
@@ -118,11 +118,12 @@ private:
     static constexpr const char* kKeyStepsPerRev = "steps_per_rev";
     static constexpr const char* kKeyMicrosteps = "microsteps";
     // Removed keys ("theta_gear" gear ratio, "pinion_dia" pinion diameter,
-    // "accel_def"/"accel_max" mm/s^2 acceleration) are no longer read: the
-    // coupling derives from homing-observed calibration and the ramp shape is
-    // a compile-time step acceleration. Stale values may linger in NVS on
-    // upgraded devices — harmless, they are simply ignored.
-    static constexpr const char* kKeyThetaMaxRpm = "theta_rpm";
+    // "accel_def"/"accel_max" mm/s^2 acceleration, "theta_rpm" theta max RPM)
+    // are no longer read: the coupling derives from homing-observed
+    // calibration, the ramp shape is a compile-time step acceleration, and the
+    // theta spin rate is bounded by the compile-time THETA_MAX_ROT_PER_MIN
+    // clamp. Stale values may linger in NVS on upgraded devices — harmless,
+    // they are simply ignored.
     static constexpr const char* kKeyRhoMaxRpm = "rho_rpm";
     static constexpr const char* kKeyThetaCurrMa = "theta_curr";
     static constexpr const char* kKeyRhoCurrMa = "rho_curr";

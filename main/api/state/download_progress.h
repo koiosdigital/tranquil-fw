@@ -32,8 +32,13 @@ public:
     // Broadcast a final 100% for a tracked uuid and stop tracking it.
     void complete(const std::string& pattern_uuid);
 
-    // Stop tracking without a final broadcast (failure/cancel — the proto has
-    // no failure state, clients time out on their own).
+    // Broadcast a terminal failure (failed=true + error) for a tracked uuid,
+    // then stop tracking it. No-op for untracked uuids (e.g. local uploads,
+    // whose failures ride the conversion/thumbnail progress reports instead).
+    void fail(const std::string& pattern_uuid, const std::string& error);
+
+    // Stop tracking without any broadcast (cancel). Prefer fail() for real
+    // failures so clients can clear their UI instead of timing out.
     void drop(const std::string& pattern_uuid);
 
 private:
