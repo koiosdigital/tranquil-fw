@@ -6,6 +6,7 @@
 #include "manifest_internal.h"
 #include "esp_log.h"
 #include <algorithm>
+#include <utility>
 #include <cstdio>
 #include <unistd.h>
 
@@ -208,18 +209,38 @@ std::vector<Pattern> ManifestDatabase::getAllPatterns() {
 }
 
 PaginatedResult<Pattern> ManifestDatabase::getPatterns(int page, int per_page) {
-    auto all = getAllPatterns();
+    ManifestLock lock(impl_->mutex);
 
     PaginatedResult<Pattern> result;
-    result.pagination.total_items = static_cast<int>(all.size());
     result.pagination.page = page;
     result.pagination.per_page = per_page;
+    if (!impl_->initialized || per_page <= 0) return result;
+
+    // Build a lightweight {name, id} index rather than materializing every
+    // Pattern (9 std::strings each, all internal RAM) just to return one page.
+    // Only the page's rows are expanded to full Pattern objects below.
+    std::vector<std::pair<std::string, uint32_t>> index;
+    index.reserve(impl_->patterns.count());
+    impl_->patterns.foreach(
+        [](uint32_t id, const cJSON* obj, void* ctx) -> bool {
+            auto* idx = static_cast<std::vector<std::pair<std::string, uint32_t>>*>(ctx);
+            idx->emplace_back(storage_get_str(obj, "name"), id);
+            return true;
+        }, &index);
+
+    std::sort(index.begin(), index.end(),
+        [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    result.pagination.total_items = static_cast<int>(index.size());
     result.pagination.total_pages = (result.pagination.total_items + per_page - 1) / per_page;
 
     int start = page * per_page;
-    int end = std::min(start + per_page, static_cast<int>(all.size()));
+    int end = std::min(start + per_page, static_cast<int>(index.size()));
     for (int i = start; i < end; i++) {
-        result.items.push_back(std::move(all[i]));
+        cJSON* obj = impl_->patterns.get(index[i].second);
+        if (!obj) continue;  // removed between indexing and materialization
+        result.items.push_back(pattern_from_storage(obj));
+        cJSON_Delete(obj);
     }
     return result;
 }

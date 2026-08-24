@@ -17,6 +17,7 @@
 #include "kd_api.h"
 #include "kdc_heap_tracing.h"
 #include "kd_pixdriver.h"
+#include "cJSON.h"
 
 #include "sand_table.h"
 #include "config_manager.h"
@@ -46,8 +47,27 @@ static const char* TAG = "main";
 
 static sand_table::MotionController* g_motion_controller = nullptr;
 
+// Route every cJSON allocation to PSRAM. Parsed JSON trees (manifest records,
+// REST bodies, job payloads) are never DMA'd, so keeping them off the scarce
+// internal heap removes a recurring fragmentation source. heap_caps_free works
+// for both PSRAM and the internal fallback, so mixed lifetimes are safe.
+static void* cjson_psram_malloc(size_t sz)
+{
+    void* p = heap_caps_malloc(sz, MALLOC_CAP_SPIRAM);
+    return p ? p : malloc(sz);  // fall back to internal only if PSRAM is full
+}
+
+static void cjson_psram_free(void* p)
+{
+    heap_caps_free(p);
+}
+
 extern "C" void app_main(void)
 {
+    // Install the cJSON PSRAM allocator before any cJSON use anywhere.
+    cJSON_Hooks cjson_hooks = { cjson_psram_malloc, cjson_psram_free };
+    cJSON_InitHooks(&cjson_hooks);
+
     esp_event_loop_create_default();
 
     stusb_init();

@@ -2,6 +2,7 @@
 #include "message_dispatcher.h"
 #include "raii_utils.hpp"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include <cstring>
@@ -12,8 +13,9 @@ static const char* TAG = "ws_server";
 // Maximum concurrent WebSocket clients (memory constrained)
 static constexpr size_t MAX_CLIENTS = 4;
 
-// Maximum incoming frame size (16KB sufficient for local API)
-static constexpr size_t MAX_FRAME_SIZE = 1024 * 16;
+// Maximum incoming frame size. Inbound frames are small control/command
+// protobufs; 8KB matches the documented WS frame contract (CLAUDE.md).
+static constexpr size_t MAX_FRAME_SIZE = 1024 * 8;
 
 // Connected client socket file descriptors
 static int connected_clients[MAX_CLIENTS] = { -1, -1, -1, -1 };
@@ -152,8 +154,10 @@ static esp_err_t ws_handler(httpd_req_t* req) {
         return ESP_FAIL;
     }
 
-    // Allocate buffer for payload
-    uint8_t* buf = static_cast<uint8_t*>(malloc(ws_pkt.len));
+    // Allocate the inbound frame buffer in PSRAM — it is only memcpy'd into by
+    // the socket recv and read by the protobuf decoder, never DMA'd, so it does
+    // not need scarce internal RAM. (free() below is valid on SPIRAM pointers.)
+    uint8_t* buf = static_cast<uint8_t*>(heap_caps_malloc(ws_pkt.len, MALLOC_CAP_SPIRAM));
     if (!buf) {
         ESP_LOGE(TAG, "Failed to allocate %zu bytes", ws_pkt.len);
         return ESP_ERR_NO_MEM;
@@ -170,6 +174,15 @@ static esp_err_t ws_handler(httpd_req_t* req) {
     // Dispatch message through unified dispatcher
     // The dispatcher handles response routing via ResponseRouter
     int fd = httpd_req_to_sockfd(req);
+
+    // Self-heal client tracking. add_client() runs once on the GET handshake,
+    // but httpd's LRU/session teardown can fire free_ctx (-> remove_client) on
+    // a socket that stays open — dropping it from connected_clients while it
+    // keeps sending frames, so every broadcast reaches 0 targets. An inbound
+    // frame proves this fd is a live WS client, so re-register it (idempotent).
+    // Combined with the client keepalive ping this keeps broadcasts flowing.
+    add_client(fd);
+
     MessageContext ctx = MessageContext::localWS(fd);
 
     ret = MessageDispatcher::instance().dispatch(buf, ws_pkt.len, ctx);
@@ -314,8 +327,10 @@ esp_err_t websocket_send(int fd, const uint8_t* data, size_t len) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    // Copy data for async send
-    uint8_t* data_copy = static_cast<uint8_t*>(malloc(len));
+    // Copy data for async send. One broadcast fans this out to up to
+    // MAX_CLIENTS copies simultaneously; keep them in PSRAM (the payload is
+    // only read by the socket write, never DMA'd) to spare internal RAM.
+    uint8_t* data_copy = static_cast<uint8_t*>(heap_caps_malloc(len, MALLOC_CAP_SPIRAM));
     if (!data_copy) return ESP_ERR_NO_MEM;
     memcpy(data_copy, data, len);
 

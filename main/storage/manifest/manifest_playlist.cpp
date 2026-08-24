@@ -6,6 +6,7 @@
 #include "manifest_internal.h"
 #include "esp_log.h"
 #include <algorithm>
+#include <utility>
 
 static const char* TAG = MANIFEST_TAG;
 
@@ -157,18 +158,37 @@ std::vector<Playlist> ManifestDatabase::getAllPlaylists() {
 }
 
 PaginatedResult<Playlist> ManifestDatabase::getPlaylists(int page, int per_page) {
-    auto all = getAllPlaylists();
+    ManifestLock lock(impl_->mutex);
 
     PaginatedResult<Playlist> result;
-    result.pagination.total_items = static_cast<int>(all.size());
     result.pagination.page = page;
     result.pagination.per_page = per_page;
+    if (!impl_->initialized || per_page <= 0) return result;
+
+    // Lightweight {name, id} index instead of materializing every Playlist to
+    // return one page; only the page's rows are expanded below.
+    std::vector<std::pair<std::string, uint32_t>> index;
+    index.reserve(impl_->playlists.count());
+    impl_->playlists.foreach(
+        [](uint32_t id, const cJSON* obj, void* ctx) -> bool {
+            auto* idx = static_cast<std::vector<std::pair<std::string, uint32_t>>*>(ctx);
+            idx->emplace_back(storage_get_str(obj, "name"), id);
+            return true;
+        }, &index);
+
+    std::sort(index.begin(), index.end(),
+        [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    result.pagination.total_items = static_cast<int>(index.size());
     result.pagination.total_pages = (result.pagination.total_items + per_page - 1) / per_page;
 
     int start = page * per_page;
-    int end = std::min(start + per_page, static_cast<int>(all.size()));
+    int end = std::min(start + per_page, static_cast<int>(index.size()));
     for (int i = start; i < end; i++) {
-        result.items.push_back(std::move(all[i]));
+        cJSON* obj = impl_->playlists.get(index[i].second);
+        if (!obj) continue;  // removed between indexing and materialization
+        result.items.push_back(playlist_from_storage(obj));
+        cJSON_Delete(obj);
     }
     return result;
 }

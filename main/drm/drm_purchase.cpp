@@ -3,6 +3,7 @@
 
 #include <kd_common.h>
 #include <esp_log.h>
+#include <esp_heap_caps.h>
 #include <mbedtls/x509_crt.h>
 #include <mbedtls/platform_util.h>
 
@@ -44,9 +45,18 @@ static bool verify_device_binding(const char* for_device) {
         return false;
     }
 
-    char cert_pem[MAX_CERT_SIZE];
+    // PSRAM, not a 2 KB stack buffer: this runs on the pattern-open/playback
+    // path that also nests RSA key recovery, so keep the stack shallow (mirrors
+    // drm_license.cpp). Freed on every return path below.
+    char* cert_pem = static_cast<char*>(heap_caps_malloc(MAX_CERT_SIZE, MALLOC_CAP_SPIRAM));
+    if (!cert_pem) {
+        ESP_LOGE(TAG, "Failed to allocate cert buffer");
+        return false;
+    }
+
     if (kd_common_get_device_cert(cert_pem, &cert_len) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to get device certificate");
+        heap_caps_free(cert_pem);
         return false;
     }
 
@@ -78,6 +88,7 @@ static bool verify_device_binding(const char* for_device) {
     }
 
     mbedtls_x509_crt_free(&crt);
+    heap_caps_free(cert_pem);
     return match;
 }
 

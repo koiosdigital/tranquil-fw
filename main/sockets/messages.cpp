@@ -58,8 +58,11 @@ bool cloud_msg_queue(const Kd__V1__TranquilMessage* message) {
 }
 
 void cloud_msg_send_device_info() {
-    static Kd__V1__SystemInfo info = KD__V1__SYSTEM_INFO__INIT;
-    static char model[] = "tranquil";
+    // Locals, not statics: cloud_msg_queue() packs synchronously, but this can
+    // be invoked from multiple contexts and a shared static would race between
+    // get_packed_size() and pack().
+    Kd__V1__SystemInfo info = KD__V1__SYSTEM_INFO__INIT;
+    char model[] = "tranquil";
 
     const esp_app_desc_t* app_desc = esp_app_get_description();
 

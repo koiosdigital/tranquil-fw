@@ -78,8 +78,12 @@ HandleResult SystemHandler::handlePing(
 }
 
 HandleResult SystemHandler::handleGetSystemInfo(ResponseMessage& response) {
-    static Kd__V1__SystemInfo info = KD__V1__SYSTEM_INFO__INIT;
-    static char model[] = "tranquil";
+    // Locals, not statics: httpd, the cloudlink task, and the state broadcaster
+    // can run this concurrently, and two callers racing between
+    // get_packed_size() and pack() inside serialize() corrupt the message.
+    // These are tiny and only need to outlive the serialize() call below.
+    Kd__V1__SystemInfo info = KD__V1__SYSTEM_INFO__INIT;
+    char model[] = "tranquil";
 
     const esp_app_desc_t* app_desc = esp_app_get_description();
 
@@ -170,8 +174,10 @@ HandleResult SystemHandler::handleHomeRequest(
 
     ESP_LOGI(TAG, "Home request (force_full=%d)", force_full);
 
-    static Kd__V1__HomeResponse home_resp = KD__V1__HOME_RESPONSE__INIT;
-    static char error_buf[128];
+    // Locals, not statics: this handler can be dispatched concurrently from
+    // httpd and the cloudlink task; shared statics race in serialize().
+    Kd__V1__HomeResponse home_resp = KD__V1__HOME_RESPONSE__INIT;
+    char error_buf[128];
 
     auto* motion_controller = SandTablePlayer::getMotionController();
     if (!motion_controller) {

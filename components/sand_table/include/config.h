@@ -147,8 +147,12 @@ namespace sand_table {
     // =============================================================================
 
     struct TaskConfig {
-        // Stepper task - highest priority, runs on Core 1
-        static constexpr uint32_t STEPPER_TASK_STACK = 2048;
+        // Stepper task - highest priority, runs on Core 1.
+        // 4096 (not 2048): this task runs the full motion pipeline
+        // (float velocity profiling, interval-table prep, RMT transmit) plus
+        // ESP_LOGx with float args, at priority 24 where an overflow is a hard
+        // crash rather than a graceful failure.
+        static constexpr uint32_t STEPPER_TASK_STACK = 4096;
         static constexpr int STEPPER_TASK_PRIORITY = 24;  // configMAX_PRIORITIES - 1
         static constexpr int STEPPER_TASK_CORE = 1;
     };

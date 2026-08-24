@@ -1,8 +1,25 @@
 // Message dispatcher implementation
 #include "message_dispatcher.h"
 #include <esp_log.h>
+#include <esp_heap_caps.h>
 
 static const char* TAG = "msg_dispatcher";
+
+// Decoded protobuf trees for local WS frames land in PSRAM rather than scarce
+// internal RAM (mirrors the cloud path in sockets.cpp). Not DMA'd.
+namespace {
+void* pb_spiram_alloc(void*, size_t size) {
+    return heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
+}
+void pb_spiram_free(void*, void* ptr) {
+    heap_caps_free(ptr);
+}
+ProtobufCAllocator g_spiram_allocator = {
+    .alloc = pb_spiram_alloc,
+    .free = pb_spiram_free,
+    .allocator_data = nullptr,
+};
+}  // namespace
 
 MessageDispatcher& MessageDispatcher::instance() {
     static MessageDispatcher instance;
@@ -27,8 +44,8 @@ esp_err_t MessageDispatcher::dispatch(
         return ESP_ERR_INVALID_ARG;
     }
 
-    // Deserialize message
-    Kd__V1__TranquilMessage* msg = kd__v1__tranquil_message__unpack(nullptr, len, data);
+    // Deserialize message (decoded tree allocated in PSRAM)
+    Kd__V1__TranquilMessage* msg = kd__v1__tranquil_message__unpack(&g_spiram_allocator, len, data);
     if (!msg) {
         ESP_LOGE(TAG, "Failed to unpack message");
         return ESP_FAIL;
@@ -58,7 +75,7 @@ esp_err_t MessageDispatcher::dispatch(
         ResponseRouter::instance().route(response, ctx, result);
     }
 
-    kd__v1__tranquil_message__free_unpacked(msg, nullptr);
+    kd__v1__tranquil_message__free_unpacked(msg, &g_spiram_allocator);
     return ret;
 }
 

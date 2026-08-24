@@ -5,6 +5,7 @@
 #include <kd/v1/tranquil.pb-c.h>
 #include <esp_err.h>
 #include <esp_log.h>
+#include <esp_heap_caps.h>
 #include <memory>
 #include <vector>
 
@@ -151,7 +152,11 @@ protected:
             return ResponseMessage();
         }
 
-        uint8_t* buf = static_cast<uint8_t*>(malloc(len));
+        // PSRAM, not internal RAM: every handler response (up to 16 KB, and a
+        // pattern-list broadcast fans out several copies) is only read by the
+        // socket write / per-client copy, never DMA'd. ResponseMessage frees
+        // with free(), which is valid on SPIRAM pointers.
+        uint8_t* buf = static_cast<uint8_t*>(heap_caps_malloc(len, MALLOC_CAP_SPIRAM));
         if (!buf) return ResponseMessage();
 
         size_t packed = kd__v1__tranquil_message__pack(msg, buf);
