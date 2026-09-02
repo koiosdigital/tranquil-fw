@@ -40,7 +40,8 @@ namespace sand_table {
         ESP_LOGI(TAG, "  Hall sensor pin: GPIO%d", PinConfig::THETA_HALL);
         ESP_LOGI(TAG, "  Rho DIAG pin: GPIO%d", PinConfig::RHO_DIAG);
         ESP_LOGI(TAG, "  StallGuard threshold: %d", MotionConfig::stallguard_threshold());
-        ESP_LOGI(TAG, "  Rho step interval: %lu us", kRhoHomingIntervalUs);
+        ESP_LOGI(TAG, "  Rho step interval: fast %lu us, slow %lu us",
+            kRhoFastHomingIntervalUs, kRhoSlowHomingIntervalUs);
         ESP_LOGI(TAG, "  Theta step interval: %lu us", kThetaHomingIntervalUs);
 
         // Configure Hall sensor GPIO with interrupt
@@ -90,11 +91,8 @@ namespace sand_table {
             return Result<void>::err(MotionError::HardwareFault);
         }
 
-        // Configure StallGuard for rho axis
-        ESP_LOGI(TAG, "Configuring TMC2209 StallGuard...");
-        (void)rho_tmc_.set_stallguard_threshold(MotionConfig::stallguard_threshold());
-        // CRITICAL: Set TCOOLTHRS to enable StallGuard at all speeds
-        (void)rho_tmc_.set_stallguard_min_speed(0xFFFFF);
+        // Configure StallGuard for rho axis (see configure_stallguard).
+        configure_stallguard();
 
         // Disable both ISRs initially - they'll be enabled only during the appropriate homing phase
         // This prevents them from interfering with normal motion or each other during homing
@@ -106,6 +104,62 @@ namespace sand_table {
         ESP_LOGI(TAG, "Homing controller initialized");
 
         return Result<void>::ok();
+    }
+
+    bool HomingController::configure_stallguard() {
+        // Every setter here writes to the TMC over UART fire-and-forget. If the
+        // rho driver isn't answering (wrong TMC UART pins/wiring/address),
+        // SGTHRS and TCOOLTHRS stay at their 0 reset defaults - and TCOOLTHRS=0
+        // DISABLES StallGuard->DIAG entirely, so DIAG never asserts and every
+        // rho seek runs to kMaxHomingSteps and fails. Prove the bus works first
+        // by reading the rho driver's IOIN version, and check each write.
+        ESP_LOGI(TAG, "Configuring TMC2209 StallGuard (rho addr %u, UART TX=%d RX=%d)...",
+            rho_tmc_.address(), static_cast<int>(PinConfig::TMC_TX),
+            static_cast<int>(PinConfig::TMC_RX));
+
+        bool link_ok = false;
+        if (auto ver = rho_tmc_.read_version(); ver.has_value()) {
+            link_ok = (*ver == tmc::TMC2209Stepper::kExpectedVersion);
+            if (link_ok) {
+                ESP_LOGI(TAG, "  Rho TMC2209 UART link OK (IOIN version 0x%02X)", *ver);
+            }
+            else {
+                ESP_LOGW(TAG, "  Rho TMC IOIN version 0x%02X (expected 0x%02X) - "
+                    "wrong driver or address?", *ver,
+                    tmc::TMC2209Stepper::kExpectedVersion);
+            }
+        }
+        else {
+            ESP_LOGE(TAG, "  Rho TMC2209 NOT RESPONDING over UART - StallGuard "
+                "cannot be configured; sensorless rho homing will fail. Check "
+                "TMC UART wiring/pins and RHO_TMC_ADDR (%u).", rho_tmc_.address());
+        }
+
+        const uint8_t sgthrs = MotionConfig::stallguard_threshold();
+        if (auto err = rho_tmc_.set_stallguard_threshold(sgthrs); err != ESP_OK) {
+            ESP_LOGE(TAG, "  Failed to write SGTHRS=%u: %s", sgthrs, esp_err_to_name(err));
+        }
+        // CRITICAL: TCOOLTHRS must be non-zero for StallGuard to reach the DIAG
+        // pin; the max 20-bit value keeps it armed across the whole homing
+        // speed range (StallGuard is active while TSTEP <= TCOOLTHRS). It is
+        // write-only, so it cannot be read back - the proof it took is the
+        // DIAG pin actually firing at a hard stop (or `sgtest` while moving).
+        if (auto err = rho_tmc_.set_stallguard_min_speed(0xFFFFF); err != ESP_OK) {
+            ESP_LOGE(TAG, "  Failed to write TCOOLTHRS: %s", esp_err_to_name(err));
+        }
+        // Tuning: for the TMC2209's SGTHRS, HIGHER = more sensitive (DIAG
+        // asserts when SG_RESULT <= 2*SGTHRS). SG_RESULT falls as load rises,
+        // so if homing never detects the hard stop, RAISE the threshold. Note
+        // SG_RESULT is only meaningful while stepping - it reads 0 at standstill
+        // regardless of TCOOLTHRS.
+        ESP_LOGI(TAG, "  SGTHRS=%u -> DIAG asserts when SG_RESULT <= %u",
+            sgthrs, sgthrs * 2);
+        if (sgthrs <= 4) {
+            ESP_LOGW(TAG, "  SGTHRS=%u is very low - DIAG will almost never trip; "
+                "rho homing likely cannot detect the hard stop. Try 30-100.",
+                sgthrs);
+        }
+        return link_ok;
     }
 
     void IRAM_ATTR HomingController::hall_isr_handler(void* arg) {
@@ -137,7 +191,12 @@ namespace sand_table {
         if (theta_rot <= 0) {
             theta_rot = MechanicalConfig::NOMINAL_STEPS_PER_THETA_ROTATION;
         }
-        return static_cast<double>(MechanicalConfig::effective_steps_per_rev()) /
+        // SIGNED, same convention as CoordinateTransformer: COUPLING_SIGN
+        // flips the companion-move direction when exactly one axis has
+        // ROBOT_*_INVERT_DIRECTION set. The theta seeks below apply this
+        // ratio with the theta step sign, so the sign rides along.
+        return MechanicalConfig::COUPLING_SIGN *
+            static_cast<double>(MechanicalConfig::effective_steps_per_rev()) /
             static_cast<double>(theta_rot);
     }
 
@@ -174,140 +233,170 @@ namespace sand_table {
         state_.store(HomingState::Idle, std::memory_order_release);
     }
 
-    HomingController::HomingResult HomingController::seek_rho_max() {
-        ESP_LOGI(TAG, "Seeking rho max at %lu us/step (%lu steps/sec)...",
-            kRhoHomingIntervalUs, 1000000UL / kRhoHomingIntervalUs);
-        state_.store(HomingState::RhoSeekingMax, std::memory_order_release);
-
-        if (!stepper_controller_) {
-            ESP_LOGE(TAG, "No stepper controller set");
-            HomingResult result;
-            result.error = MotionError::InvalidState;
-            return result;
-        }
-
-        // Keep both sensor ISRs off for the blanking move below. The outward
-        // direction is set by execute_constant_speed from the positive rho
-        // step sign — no separate set_direction() needed.
+    HomingController::RhoSeek HomingController::rho_seek_stop(
+        bool outward, uint32_t max_steps, uint32_t interval_us)
+    {
+        // Both sensor ISRs off for the blanking move; the direction comes
+        // from the rho step sign passed to execute_constant_speed - no
+        // separate set_direction() needed.
         disable_hall_isr();
         disable_diag_isr();
 
-        // Record starting position (before blanking so it counts as travel)
-        int32_t rho_before = rho_.position();
+        const int32_t sign = outward ? 1 : -1;
+        const int32_t before = rho_.position();
 
         // Blanking: StallGuard is invalid at standstill/spin-up and DIAG can
         // still be asserted from a previous stall, which fired the ISR
         // instantly and reported a stall after ~0 steps. Move a short
         // distance blind before arming stall detection.
         (void)stepper_controller_->execute_constant_speed(
-            0, kStallBlankingSteps, kRhoHomingIntervalUs);
+            0, sign * kStallBlankingSteps, interval_us);
 
         rho_stall_triggered_ = false;
         enable_diag_isr();
 
-        // Execute a single large move - ISR will stop when stall detected
+        // Single large armed move - the DIAG ISR stops RMT on stall.
         (void)stepper_controller_->execute_constant_speed(
-            0, static_cast<int32_t>(kMaxHomingSteps), kRhoHomingIntervalUs);
+            0, sign * static_cast<int32_t>(max_steps), interval_us);
 
-        // Calculate actual steps moved
-        int32_t rho_after = rho_.position();
-        int32_t steps_moved = std::abs(rho_after - rho_before);
+        disable_diag_isr();
 
-        // Check if aborted
-        if (abort_requested_.load(std::memory_order_acquire)) {
-            HomingResult result;
-            result.error = MotionError::EmergencyStop;
-            return result;
-        }
-
-        // Check if stall was detected
-        if (rho_stall_triggered_) {
-            ESP_LOGI(TAG, "Rho max found at step %ld", steps_moved);
-            HomingResult result;
-            result.success = true;
-            result.position_steps = steps_moved;
-            return result;
-        }
-
-        // If we completed all steps without stall, that's a failure
-        ESP_LOGE(TAG, "Rho max not found within %lu steps", kMaxHomingSteps);
-        HomingResult result;
-        result.error = MotionError::HomingFailed;
-        return result;
+        RhoSeek seek;
+        seek.steps_moved = std::abs(rho_.position() - before);
+        seek.stalled = rho_stall_triggered_;
+        return seek;
     }
 
-    HomingController::HomingResult HomingController::seek_rho_min() {
-        ESP_LOGI(TAG, "Seeking rho min...");
-        state_.store(HomingState::RhoSeekingMin, std::memory_order_release);
+    bool HomingController::rho_slow_home(bool outward) {
+        // One motor revolution of backoff - a fixed distance regardless of
+        // where on the arm the carriage sits.
+        const int32_t backoff = static_cast<int32_t>(
+            MechanicalConfig::effective_steps_per_rev());
+        const int32_t sign = outward ? 1 : -1;
+
+        for (int attempt = 1; attempt <= kRhoSlowHomeAttempts; ++attempt) {
+            if (abort_requested_.load(std::memory_order_acquire)) {
+                return false;
+            }
+
+            // Back out of the stop (DIAG ISR off - this move ends in free air).
+            disable_diag_isr();
+            (void)stepper_controller_->execute_constant_speed(
+                0, -sign * backoff, kRhoSlowHomingIntervalUs);
+
+            // Settle: let the motor stop cleanly and StallGuard state clear.
+            vTaskDelay(pdMS_TO_TICKS(100));
+
+            if (abort_requested_.load(std::memory_order_acquire)) {
+                return false;
+            }
+
+            // Slow re-approach into the stop in the same direction, bounded
+            // to 2x the backoff so a missed stall can't grind for long.
+            auto seek = rho_seek_stop(outward,
+                static_cast<uint32_t>(2 * backoff), kRhoSlowHomingIntervalUs);
+
+            if (abort_requested_.load(std::memory_order_acquire)) {
+                return false;
+            }
+
+            // Plausibility: the stop is ~one backoff away. Much less is a
+            // false trigger right after arming; no stall at all means the
+            // slow approach missed the stop. Either way, retry.
+            if (seek.stalled && seek.steps_moved >= backoff / 2) {
+                ESP_LOGI(TAG, "Rho slow home %s: stop confirmed after %ld steps "
+                    "(attempt %d)", outward ? "out" : "in",
+                    seek.steps_moved, attempt);
+                return true;
+            }
+
+            ESP_LOGW(TAG, "Rho slow home %s attempt %d/%d failed (stalled=%d, "
+                "steps=%ld) - retrying", outward ? "out" : "in", attempt,
+                kRhoSlowHomeAttempts, seek.stalled ? 1 : 0, seek.steps_moved);
+        }
+        return false;
+    }
+
+    HomingController::HomingResult HomingController::calibrate_rho() {
+        HomingResult result;
 
         if (!stepper_controller_) {
             ESP_LOGE(TAG, "No stepper controller set");
-            HomingResult result;
             result.error = MotionError::InvalidState;
             return result;
         }
 
-        // Keep both sensor ISRs off for the blanking move below. The inward
-        // direction is set by execute_constant_speed from the negative rho
-        // step sign — no separate set_direction() needed.
-        disable_hall_isr();
-        disable_diag_isr();
+        // --- Edge (rho max): fast locate, then slow refine ---
+        state_.store(HomingState::RhoSeekingMax, std::memory_order_release);
+        ESP_LOGI(TAG, "Rho: fast seek to edge (%lu us/step)...",
+            kRhoFastHomingIntervalUs);
 
-        // Brief pause to let StallGuard clear from previous stall
-        vTaskDelay(pdMS_TO_TICKS(100));
-
-        // Record starting position (before blanking so it counts as travel)
-        int32_t rho_before = rho_.position();
-
-        // Blanking: this seek starts pressed against the max hard stop with
-        // DIAG potentially still asserted and StallGuard invalid at spin-up.
-        // Without it the "stall" fired immediately and rho_max was measured
-        // as ~0 steps of travel (and then saved as valid calibration).
-        (void)stepper_controller_->execute_constant_speed(
-            0, -kStallBlankingSteps, kRhoHomingIntervalUs);
-
-        rho_stall_triggered_ = false;
-        enable_diag_isr();
-
-        // Execute a single large move inward - ISR will stop when stall detected
-        (void)stepper_controller_->execute_constant_speed(
-            0, -static_cast<int32_t>(kMaxHomingSteps), kRhoHomingIntervalUs);
-
-        // Calculate actual steps moved
-        int32_t rho_after = rho_.position();
-        int32_t steps_moved = std::abs(rho_after - rho_before);
-
-        // Check if aborted
+        auto fast_out = rho_seek_stop(true, kMaxHomingSteps, kRhoFastHomingIntervalUs);
         if (abort_requested_.load(std::memory_order_acquire)) {
-            HomingResult result;
             result.error = MotionError::EmergencyStop;
             return result;
         }
-
-        // Check if stall was detected
-        if (rho_stall_triggered_) {
-            // A stall this early is a false trigger, not the inner hard
-            // stop - saving it would calibrate rho_max to ~0 and disable
-            // all rho motion.
-            if (steps_moved < kMinRhoTravelSteps) {
-                ESP_LOGE(TAG, "Rho min stall after only %ld steps (min %ld) - "
-                    "false trigger, calibration rejected", steps_moved,
-                    kMinRhoTravelSteps);
-                HomingResult result;
-                result.error = MotionError::HomingFailed;
-                return result;
+        if (!fast_out.stalled) {
+            ESP_LOGE(TAG, "Rho edge not found within %lu steps", kMaxHomingSteps);
+            result.error = MotionError::HomingFailed;
+            return result;
+        }
+        if (!rho_slow_home(true)) {
+            if (abort_requested_.load(std::memory_order_acquire)) {
+                result.error = MotionError::EmergencyStop;
             }
-            ESP_LOGI(TAG, "Rho min found - total travel: %ld steps", steps_moved);
-            HomingResult result;
-            result.success = true;
-            result.position_steps = steps_moved;
+            else {
+                ESP_LOGE(TAG, "Rho edge slow home failed after %d attempts",
+                    kRhoSlowHomeAttempts);
+                result.error = MotionError::HomingFailed;
+            }
+            return result;
+        }
+        const int32_t edge_pos = rho_.position();
+
+        vTaskDelay(pdMS_TO_TICKS(100));
+
+        // --- Center (rho min): fast locate, then slow refine ---
+        state_.store(HomingState::RhoSeekingMin, std::memory_order_release);
+        ESP_LOGI(TAG, "Rho: fast seek to center...");
+
+        auto fast_in = rho_seek_stop(false, kMaxHomingSteps, kRhoFastHomingIntervalUs);
+        if (abort_requested_.load(std::memory_order_acquire)) {
+            result.error = MotionError::EmergencyStop;
+            return result;
+        }
+        if (!fast_in.stalled) {
+            ESP_LOGE(TAG, "Rho center not found within %lu steps", kMaxHomingSteps);
+            result.error = MotionError::HomingFailed;
+            return result;
+        }
+        if (!rho_slow_home(false)) {
+            if (abort_requested_.load(std::memory_order_acquire)) {
+                result.error = MotionError::EmergencyStop;
+            }
+            else {
+                ESP_LOGE(TAG, "Rho center slow home failed after %d attempts",
+                    kRhoSlowHomeAttempts);
+                result.error = MotionError::HomingFailed;
+            }
+            return result;
+        }
+        const int32_t center_pos = rho_.position();
+
+        // Refined edge-to-center travel is the calibration. Reject
+        // implausibly small travel (false triggers at both ends) - saving it
+        // would calibrate rho_max to ~0 and disable all rho motion.
+        const int32_t travel = std::abs(edge_pos - center_pos);
+        if (travel < kMinRhoTravelSteps) {
+            ESP_LOGE(TAG, "Rho travel measured %ld steps (min %ld) - "
+                "calibration rejected", travel, kMinRhoTravelSteps);
+            result.error = MotionError::HomingFailed;
             return result;
         }
 
-        // If we completed all steps without stall, that's a failure
-        ESP_LOGE(TAG, "Rho min not found within %lu steps", kMaxHomingSteps);
-        HomingResult result;
-        result.error = MotionError::HomingFailed;
+        ESP_LOGI(TAG, "Rho calibrated: %ld steps edge-to-center", travel);
+        result.success = true;
+        result.position_steps = travel;
         return result;
     }
 
@@ -448,30 +537,20 @@ namespace sand_table {
         theta_.set_enabled(true);
         rho_.set_enabled(true);
 
-        // Seek max first
-        auto max_result = seek_rho_max();
-        if (!max_result.success) {
+        // Freshly arm StallGuard from live config (SGTHRS + TCOOLTHRS).
+        configure_stallguard();
+
+        // Two-pass calibration: fast+slow home the edge, then the center.
+        auto rho_result = calibrate_rho();
+        if (!rho_result.success) {
             disable_hall_isr();
             disable_diag_isr();
             homing_active_.store(false, std::memory_order_release);
             state_.store(HomingState::Error, std::memory_order_release);
-            return max_result;
+            return rho_result;
         }
 
-        // Brief pause
-        vTaskDelay(pdMS_TO_TICKS(100));
-
-        // Seek min to measure travel
-        auto min_result = seek_rho_min();
-        if (!min_result.success) {
-            disable_hall_isr();
-            disable_diag_isr();
-            homing_active_.store(false, std::memory_order_release);
-            state_.store(HomingState::Error, std::memory_order_release);
-            return min_result;
-        }
-
-        rho_max_steps_ = min_result.position_steps;
+        rho_max_steps_ = rho_result.position_steps;
         rho_.reset_position();
 
         // Disable ISRs after homing complete
@@ -482,7 +561,7 @@ namespace sand_table {
         state_.store(HomingState::Complete, std::memory_order_release);
 
         ESP_LOGI(TAG, "Rho homing complete: %ld steps travel", rho_max_steps_);
-        return min_result;
+        return rho_result;
     }
 
     HomingController::HomingResult HomingController::home_theta() {
@@ -547,28 +626,21 @@ namespace sand_table {
         theta_.set_enabled(true);
         rho_.set_enabled(true);
 
-        // Home rho first (for safety - moves to known position)
-        auto rho_max = seek_rho_max();
-        if (!rho_max.success) {
+        // Freshly arm StallGuard from live config (SGTHRS + TCOOLTHRS).
+        configure_stallguard();
+
+        // Home rho first (for safety - moves to known position).
+        // Two-pass: fast+slow home the edge, then the center.
+        auto rho_result = calibrate_rho();
+        if (!rho_result.success) {
             disable_hall_isr();
             disable_diag_isr();
             homing_active_.store(false, std::memory_order_release);
             state_.store(HomingState::Error, std::memory_order_release);
-            return Result<void>::err(rho_max.error);
+            return Result<void>::err(rho_result.error);
         }
 
-        vTaskDelay(pdMS_TO_TICKS(100));
-
-        auto rho_min = seek_rho_min();
-        if (!rho_min.success) {
-            disable_hall_isr();
-            disable_diag_isr();
-            homing_active_.store(false, std::memory_order_release);
-            state_.store(HomingState::Error, std::memory_order_release);
-            return Result<void>::err(rho_min.error);
-        }
-
-        rho_max_steps_ = rho_min.position_steps;
+        rho_max_steps_ = rho_result.position_steps;
 
         vTaskDelay(pdMS_TO_TICKS(100));
 
@@ -624,6 +696,9 @@ namespace sand_table {
         // Enable motors
         theta_.set_enabled(true);
         rho_.set_enabled(true);
+
+        // Freshly arm StallGuard from live config (SGTHRS + TCOOLTHRS).
+        configure_stallguard();
 
         rho_.set_direction(true);  // Outwards
         rho_.step_fixed_rate(50, 500);
@@ -695,41 +770,37 @@ namespace sand_table {
             return result;
         }
 
-        // Move inward until we stall at center (rho=0.0). The inward direction
-        // is set by execute_constant_speed from the negative rho step sign below.
-        rho_stall_triggered_ = false;
-
-        // Only enable stallguard ISR for this phase
-        disable_hall_isr();
-        enable_diag_isr();
-
-        // Record starting position
-        int32_t rho_before = rho_.position();
-
-        // Execute a single large move inward - ISR will stop when stall detected
-        (void)stepper_controller_->execute_constant_speed(
-            0, -static_cast<int32_t>(kMaxHomingSteps), kRhoHomingIntervalUs);
-
-        // Calculate actual steps moved
-        int32_t rho_after = rho_.position();
-        int32_t steps_moved = std::abs(rho_after - rho_before);
-
-        // Check if aborted
+        // Fast seek inward to the center hard stop, then slow-home refine it
+        // exactly like full calibration does - the quick-home zero MUST be
+        // established the same way as the calibrated zero, or the two would
+        // differ by the (speed-dependent) DIAG detection latency.
+        auto fast_in = rho_seek_stop(false, kMaxHomingSteps, kRhoFastHomingIntervalUs);
         if (abort_requested_.load(std::memory_order_acquire)) {
             HomingResult result;
             result.error = MotionError::EmergencyStop;
             return result;
         }
-
-        // Check if stall was detected
-        if (!rho_stall_triggered_) {
-            ESP_LOGE(TAG, "Rho center not found");
+        if (!fast_in.stalled) {
+            ESP_LOGE(TAG, "Rho center not found within %lu steps", kMaxHomingSteps);
             HomingResult result;
             result.error = MotionError::HomingFailed;
             return result;
         }
 
-        ESP_LOGI(TAG, "Rho homed to center after %ld steps", steps_moved);
+        if (!rho_slow_home(false)) {
+            HomingResult result;
+            result.error = abort_requested_.load(std::memory_order_acquire)
+                ? MotionError::EmergencyStop
+                : MotionError::HomingFailed;
+            if (result.error == MotionError::HomingFailed) {
+                ESP_LOGE(TAG, "Rho center slow home failed after %d attempts",
+                    kRhoSlowHomeAttempts);
+            }
+            return result;
+        }
+
+        ESP_LOGI(TAG, "Rho homed to center (fast %ld steps + slow refine)",
+            fast_in.steps_moved);
 
         HomingResult result;
         result.success = true;

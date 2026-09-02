@@ -45,8 +45,16 @@ struct RuntimeMotionConfig {
 
 struct RuntimeLEDConfig {
     bool has_leds = true;
-    uint16_t led_count = 143;
-    bool is_rgbw = true;
+    uint16_t led_count = 84;
+    bool is_rgbw = false;  // legacy convenience; kept in sync with format==RGBW
+
+    // Strip type / wiring. Stored as small ints so this header stays free of the
+    // kd_pixdriver enums; translated to LedICType / PixelFormat / ColorOrder at
+    // the driver boundary (main.cpp) and the REST API (config_api.cpp).
+    uint8_t ic_type = 2;      // 0=WS2812, 1=SK6812, 2=FW1906
+    uint8_t format = 5;       // color channels: 3=RGB, 4=RGBW, 5=RGBCCT
+    uint8_t color_order = 0;  // 0=RGB,1=RBG,2=GRB,3=GBR,4=BRG,5=BGR
+    bool white_swap = true;   // RGBCCT: swap warm/cool white bytes
 };
 
 // =============================================================================
@@ -132,7 +140,11 @@ private:
     // NVS keys - LED
     static constexpr const char* kKeyHasLeds = "has_leds";
     static constexpr const char* kKeyLedCount = "led_count";
-    static constexpr const char* kKeyLedIsRgbw = "led_rgbw";
+    static constexpr const char* kKeyLedIsRgbw = "led_rgbw";  // legacy (migration)
+    static constexpr const char* kKeyLedIcType = "led_ic";
+    static constexpr const char* kKeyLedFormat = "led_fmt";
+    static constexpr const char* kKeyLedColorOrder = "led_order";
+    static constexpr const char* kKeyLedWhiteSwap = "led_wswap";
 
     // NVS keys - Calibration
     static constexpr const char* kKeyCalThetaSteps = "cal_theta";

@@ -60,8 +60,9 @@ namespace sand_table {
 
         ESP_LOGI(TAG, "ConfigManager initialized - motion: steps/rev=%lu x%u, theta_curr=%dmA",
             motion_.steps_per_rev, motion_.microsteps, motion_.theta_current_ma);
-        ESP_LOGI(TAG, "LED config: has_leds=%d, count=%d, rgbw=%d",
-            led_.has_leds, led_.led_count, led_.is_rgbw);
+        ESP_LOGI(TAG, "LED config: has_leds=%d, count=%d, ic=%u, format=%u, order=%u, wswap=%d",
+            led_.has_leds, led_.led_count, led_.ic_type, led_.format,
+            led_.color_order, led_.white_swap);
         ESP_LOGI(TAG, "Calibration: valid=%d, theta_steps=%d, rho_max=%d",
             calibration_.is_valid, calibration_.theta_steps_per_rotation, calibration_.rho_max_steps);
 
@@ -78,10 +79,16 @@ namespace sand_table {
         motion_.rho_current_ma = 400;
         motion_.stallguard_threshold = 30;
 
-        // LED defaults - assume LEDs present with typical tabletop config
+        // LED defaults - current hardware: FW1906 RGBCCT, 84 px, RGB order,
+        // warm/cool white swapped. (0=WS2812/1=SK6812/2=FW1906; format 3/4/5;
+        // color_order 0=RGB..5=BGR.)
         led_.has_leds = true;
-        led_.led_count = 143;
-        led_.is_rgbw = true;
+        led_.led_count = 84;
+        led_.ic_type = 2;       // FW1906
+        led_.format = 5;        // RGBCCT
+        led_.color_order = 0;   // RGB
+        led_.white_swap = true; // swap WW & CW
+        led_.is_rgbw = false;   // RGBCCT is dual-white, not single-white RGBW
 
         // Calibration starts invalid
         calibration_ = CalibrationData{};
@@ -166,6 +173,26 @@ namespace sand_table {
             led_.is_rgbw = (val != 0);
         }
 
+        // New strip-layout keys. If the format key is absent (device upgraded
+        // from a build that only stored led_rgbw), derive it from is_rgbw so
+        // existing installs keep working.
+        if (nvs.get_u8(kKeyLedFormat, &val) == ESP_OK) {
+            led_.format = val;
+        } else {
+            led_.format = led_.is_rgbw ? 4 : 3;
+        }
+        if (nvs.get_u8(kKeyLedIcType, &val) == ESP_OK) {
+            led_.ic_type = val;
+        }
+        if (nvs.get_u8(kKeyLedColorOrder, &val) == ESP_OK) {
+            led_.color_order = val;
+        }
+        if (nvs.get_u8(kKeyLedWhiteSwap, &val) == ESP_OK) {
+            led_.white_swap = (val != 0);
+        }
+        // Keep the legacy flag consistent with the resolved format.
+        led_.is_rgbw = (led_.format == 4);
+
         return nvs.find_key(kKeyHasLeds);
     }
 
@@ -183,7 +210,20 @@ namespace sand_table {
         err = nvs.set_u16(kKeyLedCount, led_.led_count);
         if (err != ESP_OK) return err;
 
-        err = nvs.set_u8(kKeyLedIsRgbw, led_.is_rgbw ? 1 : 0);
+        // Keep legacy flag consistent so older readers still work.
+        err = nvs.set_u8(kKeyLedIsRgbw, (led_.format == 4) ? 1 : 0);
+        if (err != ESP_OK) return err;
+
+        err = nvs.set_u8(kKeyLedIcType, led_.ic_type);
+        if (err != ESP_OK) return err;
+
+        err = nvs.set_u8(kKeyLedFormat, led_.format);
+        if (err != ESP_OK) return err;
+
+        err = nvs.set_u8(kKeyLedColorOrder, led_.color_order);
+        if (err != ESP_OK) return err;
+
+        err = nvs.set_u8(kKeyLedWhiteSwap, led_.white_swap ? 1 : 0);
         if (err != ESP_OK) return err;
 
         return nvs.commit();

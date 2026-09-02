@@ -1693,7 +1693,8 @@
           },
           "type": {
             "type": "string",
-            "description": "LED strip type"
+            "enum": ["RGB", "RGBW", "RGBCCT"],
+            "description": "LED strip pixel format. RGBCCT = RGB + warm/cool white (e.g. FW1906)."
           }
         }
       },
@@ -1736,6 +1737,18 @@
           "color": {
             "type": "string",
             "description": "RGB color in hex format (e.g., '#FF0000')"
+          },
+          "w": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 255,
+            "description": "Warm white level (RGBCCT channels only; omitted otherwise)"
+          },
+          "cw": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 255,
+            "description": "Cool white level (RGBCCT channels only; omitted otherwise)"
           }
         }
       },
@@ -1763,6 +1776,18 @@
           "color": {
             "type": "string",
             "description": "RGB color in hex format (e.g., '#FF0000')"
+          },
+          "w": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 255,
+            "description": "Warm white level (RGBCCT channels only)"
+          },
+          "cw": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 255,
+            "description": "Cool white level (RGBCCT channels only)"
           }
         }
       },
@@ -1843,15 +1868,37 @@
       },
       "LEDHardwareConfig": {
         "type": "object",
+        "description": "Runtime LED strip config (NVS-backed). Strip type/layout changes take effect on reboot. Also settable over the device console via `led_config`.",
         "properties": {
           "has_leds": {
             "type": "boolean"
           },
           "led_count": {
-            "type": "integer"
+            "type": "integer",
+            "description": "Number of pixels on the strip (1-2000)."
           },
           "is_rgbw": {
-            "type": "boolean"
+            "type": "boolean",
+            "description": "Legacy convenience flag; true iff format is rgbw. Prefer `format`. On PATCH, an explicit `format` overrides this."
+          },
+          "ic_type": {
+            "type": "string",
+            "enum": ["ws2812", "sk6812", "fw1906"],
+            "description": "LED controller IC family. FW1906 is a 5-channel (RGB + dual white) IC. Accepts the raw int code (0/1/2) on PATCH."
+          },
+          "format": {
+            "type": "string",
+            "enum": ["rgb", "rgbw", "rgbcct"],
+            "description": "Color channels per pixel: rgb=3, rgbw=4 (single white), rgbcct=5 (warm+cool white). Accepts the raw int code (3/4/5) on PATCH."
+          },
+          "color_order": {
+            "type": "string",
+            "enum": ["rgb", "rbg", "grb", "gbr", "brg", "bgr"],
+            "description": "Wire order of the R/G/B bytes. Accepts the raw int code (0-5) on PATCH."
+          },
+          "white_swap": {
+            "type": "boolean",
+            "description": "RGBCCT only: swap the warm/cool white bytes on the wire."
           }
         }
       },

@@ -21,9 +21,13 @@ namespace sand_table {
             // drags the rho drive by exactly one rho motor revolution. The
             // homing-observed steps-per-drum-rev therefore fully determines
             // the rho steps induced per theta motor step — no configured
-            // gear ratio involved.
+            // gear ratio involved. SIGNED: COUPLING_SIGN flips the logical
+            // pairing when exactly one axis has ROBOT_*_INVERT_DIRECTION set
+            // (see config.h); every consumer of this ratio (compensation,
+            // position readout, wrap unwind) inherits the sign from here.
             rho_steps_per_theta_step_ = (steps_per_theta_rot_ > 0)
-                ? static_cast<double>(MechanicalConfig::effective_steps_per_rev()) /
+                ? MechanicalConfig::COUPLING_SIGN *
+                    static_cast<double>(MechanicalConfig::effective_steps_per_rev()) /
                     static_cast<double>(steps_per_theta_rot_)
                 : 0.0;
         }

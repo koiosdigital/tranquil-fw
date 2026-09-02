@@ -84,6 +84,19 @@ namespace sand_table {
         /// @param rho_max Steps for full rho travel
         void _set_homed(int32_t theta_steps_per_rot, int32_t rho_max);
 
+        /// Print a one-shot StallGuard diagnostic for the rho driver as JSON:
+        /// confirms the UART link (IOIN version), the configured SGTHRS and
+        /// its resulting DIAG trip point, the live SG_RESULT, the DIAG line
+        /// level, and the driver-status flags. Use it to verify sensorless
+        /// homing is wired and configured before/without running a home.
+        void log_stallguard_diagnostics();
+
+        /// Re-apply the rho StallGuard registers (SGTHRS from current config +
+        /// TCOOLTHRS) to the driver immediately - e.g. after changing the
+        /// threshold via console/API - so it takes effect without a reboot or
+        /// re-home. Returns false if the rho driver did not answer over UART.
+        bool apply_stallguard_config();
+
         // =========================================================================
         // Motion Commands
         // =========================================================================

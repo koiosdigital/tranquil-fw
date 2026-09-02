@@ -107,6 +107,18 @@ public:
     [[nodiscard]] std::optional<DriverStatus> get_driver_status();
     [[nodiscard]] bool is_stalled();
     [[nodiscard]] uint16_t get_stallguard_result();
+
+    // Connectivity diagnostics. All the config setters above write to the bus
+    // fire-and-forget, so a wiring/pin fault reads back as "everything OK".
+    // These reads confirm the driver is actually answering:
+    //   read_ioin()  - raw IOIN (0x06): input pin states + version byte
+    //   read_version() - IOIN[31:24]; a real TMC2209 always reports 0x21
+    //   get_interface_count() - IFCNT (0x02), increments on every successful
+    //                           register WRITE, so it proves the write path
+    [[nodiscard]] std::optional<uint32_t> read_ioin();
+    [[nodiscard]] std::optional<uint8_t> read_version();
+    [[nodiscard]] std::optional<uint8_t> get_interface_count();
+    static constexpr uint8_t kExpectedVersion = 0x21;  // TMC2209 IOIN VERSION
     [[nodiscard]] uint16_t get_actual_current();
     [[nodiscard]] bool is_stealthchop_active();
     [[nodiscard]] std::optional<CurrentConfig> get_current_config() const noexcept;

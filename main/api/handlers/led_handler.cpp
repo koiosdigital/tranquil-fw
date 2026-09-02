@@ -63,26 +63,41 @@ HandleResult LEDHandler::handleLEDConfigRequest(ResponseMessage& response) {
     std::vector<int32_t> channel_ids = PixelDriver::getChannelIds();
     bool has_leds = !channel_ids.empty();
     uint32_t total_leds = 0;
-    bool is_rgbw = false;
+    Kd__V1__LEDFormat format = KD__V1__LEDFORMAT__LED_FORMAT_UNSPECIFIED;
 
     for (int32_t id : channel_ids) {
         const PixelChannel* ch = PixelDriver::getChannel(id);
         if (ch) {
             ChannelConfig cfg = ch->getConfig();
             total_leds += cfg.pixel_count;
-            if (cfg.format == PixelFormat::RGBW) {
-                is_rgbw = true;
+            switch (cfg.format) {
+                case PixelFormat::RGB:
+                    format = KD__V1__LEDFORMAT__LED_FORMAT_RGB;
+                    break;
+                case PixelFormat::RGBW:
+                    format = KD__V1__LEDFORMAT__LED_FORMAT_RGBW;
+                    break;
+                case PixelFormat::RGBCCT:
+                    format = KD__V1__LEDFORMAT__LED_FORMAT_RGBCCT;
+                    break;
             }
         }
     }
 
     config.has_leds = has_leds;
     config.led_count = total_leds;
-    config.is_rgbw = is_rgbw;
+    // Legacy flag for old clients; format is the authoritative field. The
+    // field is marked deprecated in the proto - we still populate it on
+    // purpose, so silence the self-inflicted warning.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    config.is_rgbw = (format == KD__V1__LEDFORMAT__LED_FORMAT_RGBW);
+#pragma GCC diagnostic pop
+    config.format = format;
     config.pixdriver_version = version;
 
-    ESP_LOGI(TAG, "LEDConfigRequest: has_leds=%d, count=%u, rgbw=%d",
-        has_leds, total_leds, is_rgbw);
+    ESP_LOGI(TAG, "LEDConfigRequest: has_leds=%d, count=%u, format=%d",
+        has_leds, total_leds, static_cast<int>(format));
 
     Kd__V1__TranquilMessage resp = KD__V1__TRANQUIL_MESSAGE__INIT;
     resp.message_case = KD__V1__TRANQUIL_MESSAGE__MESSAGE_LED_CONFIG;
@@ -122,7 +137,8 @@ HandleResult LEDHandler::handleSetLEDChannel(
         eff_cfg.color.r = msg->color->r;
         eff_cfg.color.g = msg->color->g;
         eff_cfg.color.b = msg->color->b;
-        eff_cfg.color.w = msg->color->w;
+        eff_cfg.color.w = msg->color->w;    // single white (RGBW) / warm (RGBCCT)
+        eff_cfg.color.cw = msg->color->cw;  // cool white (RGBCCT)
     }
 
     ch->setEffect(eff_cfg);

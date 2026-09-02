@@ -75,7 +75,9 @@ namespace sand_table {
             return Result<void>::err(MotionError::HardwareFault);
         }
         gpio_set_drive_capability(pins_.dir, GPIO_DRIVE_CAP_3);  // 40mA max drive
-        gpio_set_level(pins_.dir, 0);
+        // Initial level = logical negative for this axis (invert-aware).
+        gpio_set_level(pins_.dir, dir_pin_level(false) ? 1 : 0);
+        direction_positive_ = false;
 
         // Configure enable pin (active low typically)
         gpio_config_t enable_config = {
@@ -108,8 +110,10 @@ namespace sand_table {
     }
 
     void StepperDriver::set_direction(bool positive) {
+        // direction_positive_ stays LOGICAL (drives position counting in
+        // step_once); only the pin level is inverted per Kconfig.
         direction_positive_ = positive;
-        gpio_set_level(pins_.dir, positive ? 1 : 0);
+        gpio_set_level(pins_.dir, dir_pin_level(positive) ? 1 : 0);
     }
 
     void StepperDriver::step_once() {

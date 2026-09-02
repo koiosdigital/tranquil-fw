@@ -9,6 +9,8 @@
 
 #include <cstdio>
 #include <cinttypes>
+#include <cstdlib>
+#include <strings.h>
 
 namespace sand_table {
 
@@ -243,7 +245,13 @@ static int cmd_set_rho_sgthrs(int argc, char** argv) {
         return 1;
     }
 
-    printf("{\"error\":false,\"stallguard_threshold\":%d}\n", val);
+    // Push the new threshold to the rho driver now so it takes effect without
+    // a reboot or re-home (the driver register is otherwise only written at
+    // boot and at the start of each home).
+    bool applied = s_controller && s_controller->apply_stallguard_config();
+
+    printf("{\"error\":false,\"stallguard_threshold\":%d,\"applied_live\":%s}\n",
+        val, applied ? "true" : "false");
     return 0;
 }
 
@@ -304,10 +312,23 @@ static void register_set_rho_max_rpm() {
     );
 }
 
+// --- LED config name <-> code mapping helpers ---
+static const char* led_ic_name(uint8_t v) {
+    switch (v) { case 0: return "ws2812"; case 1: return "sk6812"; case 2: return "fw1906"; default: return "unknown"; }
+}
+static const char* led_format_name(uint8_t v) {
+    switch (v) { case 3: return "rgb"; case 4: return "rgbw"; case 5: return "rgbcct"; default: return "unknown"; }
+}
+static const char* led_order_name(uint8_t v) {
+    static const char* n[] = { "rgb", "rbg", "grb", "gbr", "brg", "bgr" };
+    return v < 6 ? n[v] : "unknown";
+}
+
 // --- get_config ---
 static int cmd_get_config(int argc, char** argv) {
     auto& cfg = ConfigManager::instance();
     const auto& m = cfg.motion_config();
+    const auto& led = cfg.led_config();
 
     printf("{\n");
     printf("  \"steps_per_rev\": %" PRIu32 ",\n", m.steps_per_rev);
@@ -316,6 +337,11 @@ static int cmd_get_config(int argc, char** argv) {
     printf("  \"theta_current_ma\": %u,\n", m.theta_current_ma);
     printf("  \"rho_current_ma\": %u,\n", m.rho_current_ma);
     printf("  \"stallguard_threshold\": %u,\n", m.stallguard_threshold);
+    printf("  \"led\": {\"has_leds\": %s, \"led_count\": %u, \"ic_type\": \"%s\", "
+           "\"format\": \"%s\", \"color_order\": \"%s\", \"white_swap\": %s},\n",
+        led.has_leds ? "true" : "false", (unsigned)led.led_count,
+        led_ic_name(led.ic_type), led_format_name(led.format),
+        led_order_name(led.color_order), led.white_swap ? "true" : "false");
     printf("  \"error\": false\n");
     printf("}\n");
     return 0;
@@ -498,9 +524,131 @@ static void register_motor_disable() {
     kd_console_register_cmd("motor_disable", "Disable motors", &cmd_motor_disable);
 }
 
+// --- sgtest ---
+// One-shot rho StallGuard diagnostic: proves the TMC UART link, shows the
+// configured SGTHRS and its DIAG trip point, and reads the live SG_RESULT +
+// DIAG level. Run this first when sensorless homing "does nothing" - if
+// comms_ok is false, StallGuard was never configured (bad UART pins/addr)
+// and no home can detect a stall.
+static int cmd_sgtest(int argc, char** argv) {
+    (void)argc;
+    (void)argv;
+    if (!s_controller) {
+        printf("{\"error\":true,\"message\":\"Motion controller not initialized\"}\n");
+        return 1;
+    }
+    s_controller->log_stallguard_diagnostics();
+    return 0;
+}
+
+static void register_sgtest() {
+    kd_console_register_cmd(
+        "sgtest",
+        "Rho StallGuard diagnostics (UART link, SGTHRS, live SG_RESULT, DIAG)",
+        &cmd_sgtest);
+}
+
 // =============================================================================
 // Initialization
 // =============================================================================
+
+// --- led_config ---
+static void print_led_config_json(const RuntimeLEDConfig& led) {
+    printf("{\"error\":false,\"led\":{\"has_leds\":%s,\"led_count\":%u,"
+           "\"ic_type\":\"%s\",\"format\":\"%s\",\"color_order\":\"%s\","
+           "\"white_swap\":%s},\"note\":\"reboot to apply strip changes\"}\n",
+        led.has_leds ? "true" : "false", (unsigned)led.led_count,
+        led_ic_name(led.ic_type), led_format_name(led.format),
+        led_order_name(led.color_order), led.white_swap ? "true" : "false");
+}
+
+static bool led_parse_bool(const char* s, bool& out) {
+    if (!strcasecmp(s, "on") || !strcasecmp(s, "true") || !strcmp(s, "1")) { out = true; return true; }
+    if (!strcasecmp(s, "off") || !strcasecmp(s, "false") || !strcmp(s, "0")) { out = false; return true; }
+    return false;
+}
+static int led_ic_code(const char* s) {
+    if (!strcasecmp(s, "ws2812")) return 0;
+    if (!strcasecmp(s, "sk6812")) return 1;
+    if (!strcasecmp(s, "fw1906")) return 2;
+    if (s[0] >= '0' && s[0] <= '2' && s[1] == '\0') return s[0] - '0';
+    return -1;
+}
+static int led_format_code(const char* s) {
+    if (!strcasecmp(s, "rgb")) return 3;
+    if (!strcasecmp(s, "rgbw")) return 4;
+    if (!strcasecmp(s, "rgbcct")) return 5;
+    if (s[0] >= '3' && s[0] <= '5' && s[1] == '\0') return s[0] - '0';
+    return -1;
+}
+static int led_order_code(const char* s) {
+    static const char* n[] = { "rgb", "rbg", "grb", "gbr", "brg", "bgr" };
+    for (int i = 0; i < 6; ++i) if (!strcasecmp(s, n[i])) return i;
+    return -1;
+}
+
+static int cmd_led_config(int argc, char** argv) {
+    auto& cfg = ConfigManager::instance();
+    RuntimeLEDConfig led = cfg.led_config();
+
+    if (argc < 2) {  // no args -> print current config
+        print_led_config_json(led);
+        return 0;
+    }
+    if (argc != 3) {
+        printf("{\"error\":true,\"message\":\"Usage: led_config [<enabled|count|ic|format|order|swap> <value>]\"}\n");
+        return 1;
+    }
+
+    const char* key = argv[1];
+    const char* val = argv[2];
+
+    if (!strcasecmp(key, "enabled")) {
+        bool b;
+        if (!led_parse_bool(val, b)) { printf("{\"error\":true,\"message\":\"enabled: on|off\"}\n"); return 1; }
+        led.has_leds = b;
+    } else if (!strcasecmp(key, "count")) {
+        int c = atoi(val);
+        if (c < 1 || c > 2000) { printf("{\"error\":true,\"message\":\"count must be 1-2000\"}\n"); return 1; }
+        led.led_count = static_cast<uint16_t>(c);
+    } else if (!strcasecmp(key, "ic")) {
+        int v = led_ic_code(val);
+        if (v < 0) { printf("{\"error\":true,\"message\":\"ic: ws2812|sk6812|fw1906\"}\n"); return 1; }
+        led.ic_type = static_cast<uint8_t>(v);
+    } else if (!strcasecmp(key, "format")) {
+        int v = led_format_code(val);
+        if (v < 0) { printf("{\"error\":true,\"message\":\"format: rgb|rgbw|rgbcct\"}\n"); return 1; }
+        led.format = static_cast<uint8_t>(v);
+    } else if (!strcasecmp(key, "order")) {
+        int v = led_order_code(val);
+        if (v < 0) { printf("{\"error\":true,\"message\":\"order: rgb|rbg|grb|gbr|brg|bgr\"}\n"); return 1; }
+        led.color_order = static_cast<uint8_t>(v);
+    } else if (!strcasecmp(key, "swap")) {
+        bool b;
+        if (!led_parse_bool(val, b)) { printf("{\"error\":true,\"message\":\"swap: on|off\"}\n"); return 1; }
+        led.white_swap = b;
+    } else {
+        printf("{\"error\":true,\"message\":\"Unknown key '%s'\"}\n", key);
+        return 1;
+    }
+
+    led.is_rgbw = (led.format == 4);  // keep legacy flag consistent
+
+    esp_err_t err = cfg.set_led_config(led);
+    if (err != ESP_OK) {
+        printf("{\"error\":true,\"message\":\"Failed to save config\"}\n");
+        return 1;
+    }
+    print_led_config_json(led);
+    return 0;
+}
+
+static void register_led_config() {
+    kd_console_register_cmd(
+        "led_config",
+        "Get/set LED strip: led_config [<enabled|count|ic|format|order|swap> <value>]",
+        &cmd_led_config);
+}
 
 void console_init(MotionController* controller) {
     s_controller = controller;
@@ -516,6 +664,7 @@ void console_init(MotionController* controller) {
     register_set_rho_sgthrs();
     register_set_rho_max_rpm();
     register_get_config();
+    register_led_config();
 
     // Additional commands
     register_set_theta_current();
@@ -524,6 +673,7 @@ void console_init(MotionController* controller) {
     register_clear_calibration();
     register_motor_enable();
     register_motor_disable();
+    register_sgtest();
 }
 
 } // namespace sand_table

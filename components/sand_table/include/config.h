@@ -18,13 +18,13 @@ namespace sand_table {
         // Theta Axis (Stage Rotation)
         static constexpr gpio_num_t THETA_STEP = static_cast<gpio_num_t>(CONFIG_ROBOT_THETA_STEP_PIN);
         static constexpr gpio_num_t THETA_DIR = static_cast<gpio_num_t>(CONFIG_ROBOT_THETA_DIR_PIN);
-        static constexpr gpio_num_t THETA_ENABLE = static_cast<gpio_num_t>(CONFIG_ROBOT_COMMON_ENABLE_PIN);
+        static constexpr gpio_num_t THETA_ENABLE = static_cast<gpio_num_t>(CONFIG_ROBOT_THETA_ENABLE_PIN);
         static constexpr gpio_num_t THETA_HALL = static_cast<gpio_num_t>(CONFIG_ROBOT_THETA_ENDSTOP_PIN);
 
         // Rho Axis (Radial Movement)
         static constexpr gpio_num_t RHO_STEP = static_cast<gpio_num_t>(CONFIG_ROBOT_RHO_STEP_PIN);
         static constexpr gpio_num_t RHO_DIR = static_cast<gpio_num_t>(CONFIG_ROBOT_RHO_DIR_PIN);
-        static constexpr gpio_num_t RHO_ENABLE = static_cast<gpio_num_t>(CONFIG_ROBOT_COMMON_ENABLE_PIN);
+        static constexpr gpio_num_t RHO_ENABLE = static_cast<gpio_num_t>(CONFIG_ROBOT_RHO_ENABLE_PIN);
 
         // TMC2209 UART (shared bus)
         static constexpr gpio_num_t TMC_TX = static_cast<gpio_num_t>(CONFIG_ROBOT_TMC_UART_TX_PIN);
@@ -37,6 +37,22 @@ namespace sand_table {
         // StallGuard DIAG pins
         static constexpr gpio_num_t RHO_DIAG = static_cast<gpio_num_t>(CONFIG_ROBOT_RHO_STALLGUARD_DIAG_PIN);
         static constexpr gpio_num_t THETA_DIAG = static_cast<gpio_num_t>(CONFIG_ROBOT_THETA_STALLGUARD_DIAG_PIN);
+
+        // Per-axis direction inversion (Kconfig bools; the macro is absent
+        // when unset). ALL motion code works in LOGICAL directions (positive
+        // rho = outward toward the edge, positive theta = forward);
+        // StepperDriver::dir_pin_level() flips the physical DIR level per
+        // these flags. Nothing outside StepperDriver may touch the DIR pin.
+#ifdef CONFIG_ROBOT_THETA_INVERT_DIRECTION
+        static constexpr bool THETA_INVERT_DIR = true;
+#else
+        static constexpr bool THETA_INVERT_DIR = false;
+#endif
+#ifdef CONFIG_ROBOT_RHO_INVERT_DIRECTION
+        static constexpr bool RHO_INVERT_DIR = true;
+#else
+        static constexpr bool RHO_INVERT_DIR = false;
+#endif
     };
 
     // =============================================================================
@@ -70,6 +86,19 @@ namespace sand_table {
         // just bounds the very first homing run and the path planner's
         // uncalibrated fallback.
         static constexpr int32_t NOMINAL_STEPS_PER_THETA_ROTATION = 25760;
+
+        // Sign of the theta->rho coupling compensation in LOGICAL step space.
+        // The mechanism couples PHYSICAL rotations (one drum revolution drags
+        // the rho drive by one rho motor revolution); the +theta/+rho pairing
+        // hardcoded throughout this codebase is the baseline with NEITHER
+        // axis inverted. Honoring ROBOT_*_INVERT_DIRECTION flips that axis's
+        // logical direction relative to physical, so the logical pairing
+        // flips with the XOR of the two flags. Every coupling consumer (the
+        // coordinate transformer AND the homing companion moves) must use
+        // the SIGNED ratio - a consumer using the unsigned ratio on an
+        // inverted axis DOUBLES the drag instead of canceling it.
+        static constexpr double COUPLING_SIGN =
+            (PinConfig::THETA_INVERT_DIR != PinConfig::RHO_INVERT_DIR) ? -1.0 : 1.0;
     };
 
     // =============================================================================

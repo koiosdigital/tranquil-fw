@@ -58,6 +58,14 @@ namespace sand_table {
         /// Initialize homing hardware (Hall sensor GPIO, StallGuard)
         [[nodiscard]] Result<void> init();
 
+        /// (Re)write the rho StallGuard registers (SGTHRS from live config +
+        /// TCOOLTHRS) to the driver and verify the UART link. Idempotent.
+        /// Called from init(), at the start of every home (so a threshold
+        /// change takes effect without a reboot and TCOOLTHRS is freshly
+        /// armed), and directly after set_rho_sgthrs. Returns false if the
+        /// rho driver did not acknowledge over UART.
+        bool configure_stallguard();
+
         /// Set the stepper controller for RMT-based motion
         void set_stepper_controller(CoordinatedStepperController* controller) {
             stepper_controller_ = controller;
@@ -156,17 +164,40 @@ namespace sand_table {
         static constexpr int32_t kMinThetaStepsPerRotation =
             MechanicalConfig::NOMINAL_STEPS_PER_THETA_ROTATION / 2;
 
-        // Homing step intervals (constant speed, no acceleration)
-        // These are CRITICAL for StallGuard to work reliably
-        static constexpr uint32_t kRhoHomingIntervalUs = 750;   // 750µs/step = 1333 steps/sec
-        static constexpr uint32_t kThetaHomingIntervalUs = 400; // 400µs/step = 2500 steps/sec
+        // Rho homing is two-pass, 3D-printer style: a FAST seek locates each
+        // hard stop, then up to kRhoSlowHomeAttempts SLOW homes refine it
+        // (back out one motor revolution, slowly re-approach into the stop in
+        // the same direction). The slow pass makes the reference position
+        // repeatable: the stop point overshoots the true stop by the DIAG
+        // detection latency, which scales with speed.
+        //
+        // Speeds are CRITICAL for StallGuard. TMC2209 datasheet Rev 1.03
+        // section 11.5 "Limits of StallGuard4 Operation": SG_RESULT is
+        // unstable below ~1 motor revolution/second (low back-EMF). At
+        // 200 fullstep/rev x 16 microstep = 3200 microstep/rev, 1 rev/s =
+        // 312us/step:
+        //  - Fast pass 250us -> 4000 steps/s = 1.25 rev/s, comfortably above
+        //    the floor. Bounded below by the motor's pull-in rate (no ramp).
+        //  - Slow pass 400us -> 2500 steps/s = 0.78 rev/s, slightly under the
+        //    nominal floor but only used for a short, known re-approach with
+        //    built-in retries; slower = smaller DIAG-latency overshoot =
+        //    tighter reference. Pull toward 312us if slow-pass stalls prove
+        //    unreliable on this motor.
+        static constexpr uint32_t kRhoFastHomingIntervalUs = 250;  // 4000 steps/s ~= 1.25 rev/s
+        static constexpr uint32_t kRhoSlowHomingIntervalUs = 400;  // 2500 steps/s ~= 0.78 rev/s
+        static constexpr int kRhoSlowHomeAttempts = 3;
+        // Theta homes on the Hall sensor, NOT StallGuard, so the 1 rev/s floor
+        // does not apply; this only trades edge-detection latency vs mechanical
+        // safety. 400us -> 2500 steps/s ~= 0.78 motor rev/s.
+        static constexpr uint32_t kThetaHomingIntervalUs = 400; // 2500 steps/s ~= 0.78 rev/s (theta motor)
 
         // Rho motor steps mechanically dragged per theta motor step (one
-        // rho motor revolution per theta drum revolution). Prefers the
-        // observed steps-per-drum-rev — this run's, then cached
-        // calibration — and only falls back to the nominal constant for
-        // the first-ever calibration, where it merely bounds the seek
-        // moves' companion rho compensation.
+        // rho motor revolution per theta drum revolution). SIGNED with
+        // MechanicalConfig::COUPLING_SIGN, same convention as the
+        // CoordinateTransformer. Prefers the observed steps-per-drum-rev —
+        // this run's, then cached calibration — and only falls back to the
+        // nominal constant for the first-ever calibration, where it merely
+        // bounds the seek moves' companion rho compensation.
         [[nodiscard]] double rho_steps_per_theta_step() const;
 
         // ISR handlers - these directly stop RMT transmission when sensors trigger
@@ -184,9 +215,31 @@ namespace sand_table {
         // would poison the coupling denominator).
         [[nodiscard]] static bool calibration_plausible(const CalibrationData& calib);
 
+        // --- Rho two-pass homing primitives ---
+
+        // One armed seek toward a rho hard stop: blanking move (DIAG ISR off,
+        // StallGuard invalid at spin-up), then arm the DIAG ISR and drive
+        // until stall or max_steps. outward=true seeks the edge (+rho),
+        // false seeks the center (-rho). Leaves the DIAG ISR disabled.
+        struct RhoSeek {
+            bool stalled = false;
+            int32_t steps_moved = 0;   // including the blanking move
+        };
+        RhoSeek rho_seek_stop(bool outward, uint32_t max_steps, uint32_t interval_us);
+
+        // Slow-home refinement at a stop just found by a fast seek: back out
+        // one motor revolution, then slowly re-approach in the SAME direction
+        // until the stop re-triggers (3D-printer style). Retries up to
+        // kRhoSlowHomeAttempts times if the slow approach doesn't produce a
+        // plausible stall. On success the carriage rests pressed against the
+        // stop at slow-approach precision.
+        bool rho_slow_home(bool outward);
+
+        // Full rho calibration: fast+slow home the edge, then fast+slow home
+        // the center; position_steps = refined edge-to-center travel.
+        HomingResult calibrate_rho();
+
         // Internal homing methods (full calibration)
-        HomingResult seek_rho_max();
-        HomingResult seek_rho_min();
         HomingResult calibrate_theta();
 
         // Internal homing methods (quick mode - uses cached values)

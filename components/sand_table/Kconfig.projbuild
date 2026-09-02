@@ -41,9 +41,13 @@ menu "TMC Stepper Configuration"
         int "Rho Direction Pin"
         default 10
 
-    config ROBOT_COMMON_ENABLE_PIN
-        int "Common Enable Pin"
-        default 21
+    config ROBOT_THETA_ENABLE_PIN
+        int "Theta Enable Pin"
+        default 33
+
+    config ROBOT_RHO_ENABLE_PIN
+        int "Rho Enable Pin"
+        default 14
 
     config ROBOT_RHO_STALLGUARD_DIAG_PIN
         int "Rho StallGuard Diag Pin"
@@ -68,7 +72,7 @@ menu "Theta Axis Hardware"
 
         config ROBOT_THETA_ENDSTOP_PIN
             int "Theta Endstop Pin"
-            default 17
+            default 34
 
         config ROBOT_THETA_ENDSTOP_INVERT
             bool "Invert Endstop Logic"

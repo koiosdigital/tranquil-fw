@@ -38,6 +38,10 @@ inline constexpr Preset kPresetTranquil4Tabletop = {
         .has_leds = true,
         .led_count = 143,
         .is_rgbw = true,
+        .ic_type = 1,      // SK6812
+        .format = 4,       // RGBW
+        .color_order = 2,  // GRB
+        .white_swap = false,
     },
 };
 
@@ -58,6 +62,10 @@ inline constexpr Preset kPresetTranquil4Coffee = {
         .has_leds = true,
         .led_count = 200,
         .is_rgbw = true,
+        .ic_type = 1,      // SK6812
+        .format = 4,       // RGBW
+        .color_order = 2,  // GRB
+        .white_swap = false,
     },
 };
 

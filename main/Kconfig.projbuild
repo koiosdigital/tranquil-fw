@@ -2,7 +2,7 @@ menu "LED Configuration"
 
 config LED_PIN
     int "LED Pin"
-    default 18
+    default 35
     help
         GPIO pin number for the LED strip data line.
 
@@ -11,5 +11,51 @@ config LED_PIN
 config MBEDTLS_PK_RSA_ALT_SUPPORT
     bool
     default y
+
+endmenu
+
+menu "SD Card Configuration"
+
+config SD_PIN_CLK
+    int "SD CLK Pin"
+    default 5
+    help
+        GPIO pin for the SD/MMC CLK line.
+
+config SD_PIN_CMD
+    int "SD CMD Pin"
+    default 6
+    help
+        GPIO pin for the SD/MMC CMD line.
+
+config SD_PIN_D0
+    int "SD D0 Pin"
+    default 4
+    help
+        GPIO pin for the SD/MMC DAT0 line.
+
+config SD_PIN_D1
+    int "SD D1 Pin"
+    default 2
+    help
+        GPIO pin for the SD/MMC DAT1 line.
+
+config SD_PIN_D2
+    int "SD D2 Pin"
+    default 8
+    help
+        GPIO pin for the SD/MMC DAT2 line.
+
+config SD_PIN_D3
+    int "SD D3 Pin"
+    default 7
+    help
+        GPIO pin for the SD/MMC DAT3 line.
+
+config SD_PIN_CD
+    int "SD Card Detect Pin"
+    default 1
+    help
+        GPIO pin for the SD card-detect (CD) line.
 
 endmenu

@@ -349,11 +349,17 @@ namespace tmc {
     }
 
     esp_err_t TMC2209Stepper::set_stallguard_threshold(uint8_t threshold) {
-        // Note: Lower values = MORE sensitive (easier stall detection)
-        //       Higher values = LESS sensitive (requires more load)
-        //       Typical range: 50-100 for normal operation
+        // TMC2209 SGTHRS sense (opposite of the TMC2130's signed SGT):
+        //   DIAG asserts a stall when SG_RESULT <= 2*SGTHRS. SG_RESULT falls
+        //   as mechanical load rises, so:
+        //     HIGHER SGTHRS = MORE sensitive (trips under lighter load)
+        //     LOWER  SGTHRS = LESS sensitive (needs a harder stop to trip)
+        //   Tune by watching SG_RESULT while homing (see the SG monitor):
+        //   set SGTHRS to roughly half the SG_RESULT seen at the hard stop.
+        //   Typical usable range ~30-150 depending on motor/current/speed.
         if (threshold < 30) {
-            ESP_LOGW(TAG, "SGTHRS %u may be too sensitive, consider 30-100 range", threshold);
+            ESP_LOGW(TAG, "SGTHRS %u is low (insensitive) - may not trip on stall; "
+                "consider raising toward 30-150", threshold);
         }
 
         shadow_.sgthrs = threshold;
@@ -374,6 +380,26 @@ namespace tmc {
             return 0;
         }
         return static_cast<uint16_t>(*result_opt & 0x3FF);
+    }
+
+    std::optional<uint32_t> TMC2209Stepper::read_ioin() {
+        return bus_.read_register(addr_, static_cast<uint8_t>(Register::IOIN));
+    }
+
+    std::optional<uint8_t> TMC2209Stepper::read_version() {
+        auto ioin = read_ioin();
+        if (!ioin) {
+            return std::nullopt;
+        }
+        return static_cast<uint8_t>((*ioin >> 24) & 0xFF);
+    }
+
+    std::optional<uint8_t> TMC2209Stepper::get_interface_count() {
+        auto ifcnt = bus_.read_register(addr_, static_cast<uint8_t>(Register::IFCNT));
+        if (!ifcnt) {
+            return std::nullopt;
+        }
+        return static_cast<uint8_t>(*ifcnt & 0xFF);
     }
 
     bool TMC2209Stepper::is_stalled() {

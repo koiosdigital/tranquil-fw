@@ -747,8 +747,16 @@ components:
           type: integer
         is_rgbw:
           type: boolean
+          deprecated: true
+          description: "Legacy flag - superseded by format; still populated for old clients"
         pixdriver_version:
           type: string
+        format:
+          type: integer
+          description: >-
+            Protobuf enum kd.v1.LEDFormat: 0=UNSPECIFIED, 1=RGB, 2=RGBW,
+            3=RGBCCT (RGB + warm/cool white, e.g. FW1906)
+          enum: [0, 1, 2, 3]
 
     SetLEDChannel:
       type: object
@@ -766,6 +774,7 @@ components:
           type: boolean
         color:
           type: object
+          description: "Protobuf: kd.v1.LEDColor"
           properties:
             r:
               type: integer
@@ -775,6 +784,10 @@ components:
               type: integer
             w:
               type: integer
+              description: "Single white (RGBW) / warm white (RGBCCT)"
+            cw:
+              type: integer
+              description: "Cool white (RGBCCT only)"
 
     GetLEDEffects:
       type: object

@@ -6,10 +6,40 @@
 #include "SandTablePlayer.h"
 
 #include <esp_log.h>
+#include <strings.h>
 
 static const char* TAG = "config_api";
 
 using namespace api_common;
+
+// LED strip enum <-> string mapping (mirrors the `led_config` console command).
+static const char* led_ic_name(uint8_t v) {
+    switch (v) { case 0: return "ws2812"; case 1: return "sk6812"; case 2: return "fw1906"; default: return "unknown"; }
+}
+static const char* led_format_name(uint8_t v) {
+    switch (v) { case 3: return "rgb"; case 4: return "rgbw"; case 5: return "rgbcct"; default: return "unknown"; }
+}
+static const char* led_order_name(uint8_t v) {
+    static const char* n[] = { "rgb", "rbg", "grb", "gbr", "brg", "bgr" };
+    return v < 6 ? n[v] : "unknown";
+}
+static int led_ic_code(const char* s) {
+    if (!strcasecmp(s, "ws2812")) return 0;
+    if (!strcasecmp(s, "sk6812")) return 1;
+    if (!strcasecmp(s, "fw1906")) return 2;
+    return -1;
+}
+static int led_format_code(const char* s) {
+    if (!strcasecmp(s, "rgb")) return 3;
+    if (!strcasecmp(s, "rgbw")) return 4;
+    if (!strcasecmp(s, "rgbcct")) return 5;
+    return -1;
+}
+static int led_order_code(const char* s) {
+    static const char* n[] = { "rgb", "rbg", "grb", "gbr", "brg", "bgr" };
+    for (int i = 0; i < 6; ++i) if (!strcasecmp(s, n[i])) return i;
+    return -1;
+}
 
 // GET /api/config
 static esp_err_t config_get_handler(httpd_req_t* req) {
@@ -32,9 +62,12 @@ static esp_err_t config_get_handler(httpd_req_t* req) {
         (unsigned)motion.theta_current_ma, (unsigned)motion.rho_current_ma,
         (unsigned)motion.stallguard_threshold);
     chunk_buf_printf(&cb,
-        "\"led\":{\"has_leds\":%s,\"led_count\":%u,\"is_rgbw\":%s},",
+        "\"led\":{\"has_leds\":%s,\"led_count\":%u,\"is_rgbw\":%s,"
+        "\"ic_type\":\"%s\",\"format\":\"%s\",\"color_order\":\"%s\",\"white_swap\":%s},",
         led.has_leds ? "true" : "false", (unsigned)led.led_count,
-        led.is_rgbw ? "true" : "false");
+        led.is_rgbw ? "true" : "false",
+        led_ic_name(led.ic_type), led_format_name(led.format),
+        led_order_name(led.color_order), led.white_swap ? "true" : "false");
     chunk_buf_printf(&cb,
         "\"calibration\":{\"theta_steps_per_rotation\":%ld,\"rho_max_steps\":%ld,"
         "\"is_valid\":%s,\"timestamp\":%lu},",
@@ -98,8 +131,28 @@ static esp_err_t config_patch_handler(httpd_req_t* req) {
         if (led_count && cJSON_IsNumber(led_count) && led_count->valueint > 0) {
             led.led_count = (uint16_t)led_count->valueint;
         }
+        // Legacy is_rgbw first so an explicit `format` below always wins.
         cJSON* is_rgbw = cJSON_GetObjectItem(led_json, "is_rgbw");
-        if (is_rgbw && cJSON_IsBool(is_rgbw)) led.is_rgbw = cJSON_IsTrue(is_rgbw);
+        if (is_rgbw && cJSON_IsBool(is_rgbw)) led.format = cJSON_IsTrue(is_rgbw) ? 4 : 3;
+
+        // Strip type/layout. ic_type/format/color_order accept either the
+        // string name (e.g. "fw1906", "rgbcct", "grb") or the raw int code.
+        cJSON* ic = cJSON_GetObjectItem(led_json, "ic_type");
+        if (ic && cJSON_IsString(ic)) { int v = led_ic_code(ic->valuestring); if (v >= 0) led.ic_type = (uint8_t)v; }
+        else if (ic && cJSON_IsNumber(ic) && ic->valueint >= 0 && ic->valueint <= 2) led.ic_type = (uint8_t)ic->valueint;
+
+        cJSON* fmt = cJSON_GetObjectItem(led_json, "format");
+        if (fmt && cJSON_IsString(fmt)) { int v = led_format_code(fmt->valuestring); if (v >= 0) led.format = (uint8_t)v; }
+        else if (fmt && cJSON_IsNumber(fmt) && fmt->valueint >= 3 && fmt->valueint <= 5) led.format = (uint8_t)fmt->valueint;
+
+        cJSON* order = cJSON_GetObjectItem(led_json, "color_order");
+        if (order && cJSON_IsString(order)) { int v = led_order_code(order->valuestring); if (v >= 0) led.color_order = (uint8_t)v; }
+        else if (order && cJSON_IsNumber(order) && order->valueint >= 0 && order->valueint <= 5) led.color_order = (uint8_t)order->valueint;
+
+        cJSON* wswap = cJSON_GetObjectItem(led_json, "white_swap");
+        if (wswap && cJSON_IsBool(wswap)) led.white_swap = cJSON_IsTrue(wswap);
+
+        led.is_rgbw = (led.format == 4);  // keep legacy flag consistent
 
         esp_err_t ret = cfg.set_led_config(led);
         if (ret != ESP_OK) {

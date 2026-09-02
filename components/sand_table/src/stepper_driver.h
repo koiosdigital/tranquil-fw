@@ -29,6 +29,9 @@ namespace sand_table {
             gpio_num_t step;
             gpio_num_t dir;
             gpio_num_t enable;
+            // Invert the physical DIR level for this axis (Kconfig
+            // ROBOT_*_INVERT_DIRECTION, via PinConfig::*_INVERT_DIR).
+            bool invert_dir = false;
         };
 
         StepperDriver(const Pins& pins, const char* name);
@@ -45,9 +48,18 @@ namespace sand_table {
         void set_enabled(bool enabled);
         [[nodiscard]] bool is_enabled() const noexcept { return enabled_; }
 
-        /// Set step direction (true = positive/CW, false = negative/CCW)
+        /// Set step direction (true = positive/CW, false = negative/CCW).
+        /// `positive` is the LOGICAL direction; the physical DIR level is
+        /// derived via dir_pin_level(), honoring per-axis Kconfig inversion.
         void set_direction(bool positive);
         [[nodiscard]] bool get_direction() const noexcept { return direction_positive_; }
+
+        /// Helper: map a logical direction to the physical DIR pin level,
+        /// inverting when Kconfig ROBOT_*_INVERT_DIRECTION is set for this
+        /// axis. Position counting always uses the logical direction.
+        [[nodiscard]] bool dir_pin_level(bool logical_positive) const noexcept {
+            return pins_.invert_dir ? !logical_positive : logical_positive;
+        }
 
         /// Generate a single blocking step
         void step_once();

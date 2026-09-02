@@ -28,7 +28,6 @@
 
 #include "api.h"
 #include "app_console.h"
-#include "usb_pd.h"
 #include "drm/drm_license.h"
 #include "sockets.h"
 #include "storage/jobs/job_queue.h"
@@ -69,8 +68,6 @@ extern "C" void app_main(void)
     cJSON_InitHooks(&cjson_hooks);
 
     esp_event_loop_create_default();
-
-    stusb_init();
 
     kd_common_init();
     kd_common_set_device_info("tranquil", FIRMWARE_VARIANT);
@@ -166,9 +163,21 @@ extern "C" void app_main(void)
     if (led_config.has_leds && led_config.led_count > 0) {
         PixelDriver::initialize(60);
 
-        PixelFormat format = led_config.is_rgbw ? PixelFormat::RGBW : PixelFormat::RGB;
-        // LED pin stays in sdkconfig (hardware config)
-        PixelDriver::addChannel(ChannelConfig((gpio_num_t)CONFIG_LED_PIN, led_config.led_count, format));
+        // Map the NVS-persisted strip config (small int codes) to the driver
+        // enums. Values are validated on entry, but clamp defensively.
+        const uint8_t fmt_code = (led_config.format >= 3 && led_config.format <= 5)
+            ? led_config.format : 3;
+        const PixelFormat format = static_cast<PixelFormat>(fmt_code);
+        const LedICType ic_type = (led_config.ic_type <= 2)
+            ? static_cast<LedICType>(led_config.ic_type) : LedICType::WS2812;
+        const ColorOrder color_order = (led_config.color_order <= 5)
+            ? static_cast<ColorOrder>(led_config.color_order) : ColorOrder::GRB;
+
+        // LED pin stays in sdkconfig (hardware config); strip type/layout is
+        // runtime config from NVS (console: `led_config`, REST: /api/config).
+        PixelDriver::addChannel(ChannelConfig(
+            (gpio_num_t)CONFIG_LED_PIN, led_config.led_count, format, "",
+            ic_type, color_order, led_config.white_swap));
         PixelDriver::setCurrentLimit(1750);
         PixelDriver::start();
 

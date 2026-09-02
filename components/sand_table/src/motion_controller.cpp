@@ -8,6 +8,7 @@
 #include "esp_log.h"
 
 #include <cmath>
+#include <cstdio>
 
 namespace sand_table {
 
@@ -76,12 +77,15 @@ namespace sand_table {
             return tmc_result;
         }
 
-        // Create stepper drivers
+        // Create stepper drivers. invert_dir applies the Kconfig
+        // ROBOT_*_INVERT_DIRECTION flags at the DIR-pin level so all motion
+        // code stays in logical directions (positive rho = outward).
         theta_stepper_ = std::make_unique<StepperDriver>(
             StepperDriver::Pins{
                 PinConfig::THETA_STEP,
                 PinConfig::THETA_DIR,
-                PinConfig::THETA_ENABLE
+                PinConfig::THETA_ENABLE,
+                PinConfig::THETA_INVERT_DIR
             },
             "Theta"
         );
@@ -90,10 +94,14 @@ namespace sand_table {
             StepperDriver::Pins{
                 PinConfig::RHO_STEP,
                 PinConfig::RHO_DIR,
-                PinConfig::RHO_ENABLE
+                PinConfig::RHO_ENABLE,
+                PinConfig::RHO_INVERT_DIR
             },
             "Rho"
         );
+
+        ESP_LOGI(TAG, "Direction inversion: theta=%d, rho=%d",
+            PinConfig::THETA_INVERT_DIR ? 1 : 0, PinConfig::RHO_INVERT_DIR ? 1 : 0);
 
         // Initialize stepper drivers
         auto theta_result = theta_stepper_->init();
@@ -227,6 +235,65 @@ namespace sand_table {
 
         ESP_LOGI(TAG, "Applied motor current: theta=%umA, rho=%umA (hold %u%%)",
             theta_ma, rho_ma, static_cast<unsigned>(kHoldCurrentPercent));
+    }
+
+    void MotionController::log_stallguard_diagnostics() {
+        if (!rho_tmc_) {
+            printf("{\"error\":true,\"message\":\"TMC not initialized\"}\n");
+            return;
+        }
+
+        const auto ver = rho_tmc_->read_version();       // UART read: proves the link
+        const bool comms_ok = ver.has_value();
+        const uint8_t sgthrs = MotionConfig::stallguard_threshold();
+        const uint16_t sg_result = rho_tmc_->get_stallguard_result();
+        const int diag_level = gpio_get_level(PinConfig::RHO_DIAG);
+        const bool stalled = rho_tmc_->is_stalled();
+        const auto status = rho_tmc_->get_driver_status();
+
+        printf("{\"error\":false,"
+               "\"rho_tmc_addr\":%u,"
+               "\"comms_ok\":%s,"
+               "\"ioin_version\":%d,"
+               "\"version_expected\":%d,"
+               "\"sgthrs\":%u,"
+               "\"diag_trips_at_sg_result\":%u,"
+               "\"sg_result\":%u,"
+               "\"diag_level\":%d,"
+               "\"stalled\":%s,"
+               "\"drv_status\":%lu}\n",
+            rho_tmc_->address(),
+            comms_ok ? "true" : "false",
+            comms_ok ? static_cast<int>(*ver) : -1,
+            static_cast<int>(tmc::TMC2209Stepper::kExpectedVersion),
+            sgthrs,
+            static_cast<unsigned>(sgthrs) * 2u,
+            sg_result,
+            diag_level,
+            stalled ? "true" : "false",
+            status.has_value() ? static_cast<unsigned long>(status->raw) : 0UL);
+
+        if (!comms_ok) {
+            ESP_LOGE(TAG, "SGtest: rho TMC (addr %u) not answering over UART - "
+                "StallGuard is UNCONFIGURED (SGTHRS/TCOOLTHRS at reset 0), so no "
+                "home can detect a stall. Check TMC UART pins/wiring and "
+                "RHO_TMC_ADDR.", rho_tmc_->address());
+        }
+        else {
+            ESP_LOGI(TAG, "SGtest: rho TMC ver=0x%02X SGTHRS=%u (DIAG trips when "
+                "SG_RESULT<=%u) live SG_RESULT=%u DIAG=%d stalled=%d",
+                *ver, sgthrs, sgthrs * 2, sg_result, diag_level, stalled ? 1 : 0);
+            ESP_LOGI(TAG, "SGtest note: SG_RESULT is only valid while the motor "
+                "is stepping - 0 at standstill is normal. Run sgtest during a "
+                "move (e.g. rotate) to read the live load value.");
+        }
+    }
+
+    bool MotionController::apply_stallguard_config() {
+        if (!homing_controller_) {
+            return false;
+        }
+        return homing_controller_->configure_stallguard();
     }
 
     Result<void> MotionController::start() {
