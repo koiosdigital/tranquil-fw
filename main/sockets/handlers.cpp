@@ -14,6 +14,7 @@
 #include "drm/drm_purchase.h"
 #include "ManifestDatabase.h"
 #include "download_progress.h"
+#include "download_tracker.h"
 
 static const char* TAG = "cloud_handlers";
 
@@ -74,6 +75,19 @@ namespace {
         ESP_LOGI(TAG, "  UUID: %s", response->pattern_uuid ? response->pattern_uuid : "");
         ESP_LOGI(TAG, "  URL: %s", response->download_url ? response->download_url : "");
 
+        // An empty download_url is the server's terminal decline (device not
+        // claimed to an account, pattern missing from the catalog, ...). Fail
+        // the tracked download so clients clear their UI instead of hanging
+        // at 0%, and drop the requester routing.
+        if (response->pattern_uuid &&
+            (response->download_url == nullptr || response->download_url[0] == '\0')) {
+            ESP_LOGW(TAG, "Cloud declined pattern download for %s", response->pattern_uuid);
+            DownloadProgressBroadcaster::instance().fail(
+                response->pattern_uuid, "Download refused by server");
+            DownloadTracker::instance().removeDownload(response->pattern_uuid);
+            return;
+        }
+
         // Ensure the download is tracked from 0% even when it was cloud-initiated
         // (no local RequestPatternDownload ran to call track()). No-op if already
         // tracked from the local request path.
@@ -104,6 +118,14 @@ namespace {
         else {
             ESP_LOGE(TAG, "Failed to queue download: %s - %s",
                 downloadStatusToString(result.status), result.error.c_str());
+            // Never reached the job queue, so the job-complete failure path
+            // won't fire — emit the terminal signal here.
+            if (response->pattern_uuid) {
+                DownloadProgressBroadcaster::instance().fail(
+                    response->pattern_uuid,
+                    result.error.empty() ? "Failed to queue download" : result.error);
+                DownloadTracker::instance().removeDownload(response->pattern_uuid);
+            }
         }
     }
 

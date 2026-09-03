@@ -277,8 +277,9 @@ HandleResult PatternHandler::handleRequestPatternDownload(
         return HandleResult::forwardToCloud();
     }
 
-    // If request is from cloud (unlikely but handle it), forward back
-    // This case shouldn't normally happen
-    ESP_LOGW(TAG, "Pattern download request from cloud? Forwarding anyway");
+    // From cloud: this is the designed round-trip for cloud-initiated
+    // downloads (app → cloud command → us → forward back → cloud replies
+    // with a PatternDownloadResponse; see tranquil.proto message 6).
+    ESP_LOGI(TAG, "Cloud-initiated download, forwarding back for download URL");
     return HandleResult::forwardToCloud();
 }
