@@ -21,6 +21,8 @@ struct Snapshot {
     uint32_t uptime_s;
     int32_t wifi_rssi;          // dBm; 0 when not associated
     char ip_address[16];
+    bool quiet_hours_active;    // a quiet-hours window is active right now
+    const char* timezone;       // IANA zone the schedule runs in
 };
 
 // Fill a snapshot. `out` must outlive any use of the string pointers

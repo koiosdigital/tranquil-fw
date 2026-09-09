@@ -35,8 +35,10 @@ static esp_err_t system_info_handler(httpd_req_t* req) {
     chunk_buf_printf(&cb, ",\"is_homed\":%s,\"is_homing\":%s,\"free_heap\":%lu,\"free_psram\":%lu,",
         s.is_homed ? "true" : "false", s.is_homing ? "true" : "false",
         (unsigned long)s.free_heap, (unsigned long)s.free_psram);
-    chunk_buf_printf(&cb, "\"uptime_s\":%lu,\"wifi_rssi\":%ld}",
-        (unsigned long)s.uptime_s, (long)s.wifi_rssi);
+    chunk_buf_printf(&cb, "\"uptime_s\":%lu,\"wifi_rssi\":%ld,\"quiet_hours_active\":%s,\"timezone\":",
+        (unsigned long)s.uptime_s, (long)s.wifi_rssi, s.quiet_hours_active ? "true" : "false");
+    chunk_buf_write_json_string(&cb, s.timezone);
+    chunk_buf_write(&cb, "}", 1);
     chunk_buf_finish(&cb);
     return ESP_OK;
 }

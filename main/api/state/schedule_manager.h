@@ -1,4 +1,12 @@
-// Schedule manager - stores and executes scheduled actions
+// Schedule manager - stores and executes scheduled actions, and enforces
+// quiet hours.
+//
+// Model: a flat list of items (day mask + time of day + action), replaced as
+// a whole by whichever transport wrote last (REST, LAN WS, cloud). Items carry
+// a stable id so clients can key, toggle and run them; ids of 0 are assigned
+// here. Quiet hours are a small set of windows during which items that honour
+// them are skipped; entering a window can also stop the table and turn the
+// lights off.
 #pragma once
 
 #include <esp_err.h>
@@ -6,11 +14,15 @@
 #include <kd/v1/tranquil.pb-c.h>
 #include <vector>
 #include <string>
+#include <optional>
+#include <map>
 #include <cstdint>
+#include <ctime>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
 #include "handler_base.h"
+#include "kd_pixdriver.h"
 
 // Day of week bitmask (bit 0 = Sunday, bit 6 = Saturday)
 namespace DayOfWeek {
@@ -24,88 +36,170 @@ namespace DayOfWeek {
     constexpr uint32_t ALL_DAYS  = 0x7F;
 }
 
+using ScheduleActionType = Kd__V1__ScheduleAction__ScheduleActionType;
+
+// Partial LED patch for SET_LED_STATE; nullopt = leave unchanged.
+struct ScheduleLedState {
+    std::optional<std::string> effect_id;
+    std::optional<uint8_t> brightness;
+    std::optional<uint8_t> speed;
+    std::optional<bool> enabled;
+    std::optional<PixelColor> color;
+
+    bool empty() const {
+        return !effect_id && !brightness && !speed && !enabled && !color;
+    }
+};
+
+struct ScheduleAction {
+    ScheduleActionType type = KD__V1__SCHEDULE_ACTION__SCHEDULE_ACTION_TYPE__SCHEDULE_ACTION_TYPE_UNSPECIFIED;
+    std::string uuid;           // PLAY_PLAYLIST / PLAY_PATTERN
+    ScheduleLedState led;       // SET_LED_STATE
+    float feed_rate = 0.0f;     // SET_SPEED (1.0-5.0)
+    bool shuffle = false;       // PLAY_PLAYLIST
+    bool loop = false;          // PLAY_PLAYLIST
+};
+
 struct ScheduleItem {
-    uint32_t days_of_week;  // Bitmask: bit 0=Sun, bit 6=Sat
-    uint32_t time_of_day;   // Seconds since local midnight (0-86399)
-    Kd__V1__ScheduleAction__ScheduleActionType action_type;
-    std::string uuid;       // For PLAY_PATTERN or PLAY_PLAYLIST
+    uint32_t id = 0;            // stable; 0 = unassigned
+    std::string name;
+    uint32_t days_of_week = 0;  // Bitmask: bit 0=Sun, bit 6=Sat
+    uint32_t time_of_day = 0;   // Seconds since local midnight (0-86399)
+    bool enabled = true;
+    bool obey_quiet_hours = true;
+    ScheduleAction action;
 
     bool matches_day(int day) const {
-        return (days_of_week & (1 << day)) != 0;
+        return (days_of_week & (1u << day)) != 0;
     }
+};
+
+// A window whose end is before its start wraps past midnight; day_mask names
+// the day the window starts on.
+struct QuietWindow {
+    uint32_t day_mask = 0;      // bit 0=Sun .. bit 6=Sat
+    uint16_t start_min = 0;     // minutes since local midnight
+    uint16_t end_min = 0;
+    bool enabled = true;
+};
+
+struct QuietHours {
+    std::vector<QuietWindow> windows;
+    bool stop_playback = false; // stop the table when a window starts
+    bool lights_off = false;    // LEDs off when a window starts, restored when it ends
+};
+
+// Owns every buffer a packed TranquilSchedule points into. Keep it alive
+// until the message has been serialized.
+struct ScheduleProtoScratch {
+    Kd__V1__TranquilSchedule schedule;
+    Kd__V1__TranquilQuietHours quiet;
+    std::vector<ScheduleItem> snapshot;          // string storage
+    QuietHours quiet_snapshot;
+    std::vector<Kd__V1__TranquilScheduleItem> items;
+    std::vector<Kd__V1__TranquilScheduleItem*> item_ptrs;
+    std::vector<Kd__V1__ScheduleAction> actions;
+    std::vector<Kd__V1__ScheduleLedState> leds;
+    std::vector<Kd__V1__LEDColor> colors;
+    std::vector<Kd__V1__TranquilQuietWindow> windows;
+    std::vector<Kd__V1__TranquilQuietWindow*> window_ptrs;
 };
 
 class ScheduleManager {
 public:
+    static constexpr size_t kMaxItems = 32;
+    static constexpr size_t kMaxQuietWindows = 4;
+    static constexpr size_t kMaxNameLen = 32;
+    static constexpr size_t kMaxUuidLen = 64;
+    static constexpr size_t kMaxEffectLen = 32;
+    static constexpr float kFeedRateMin = 1.0f;
+    static constexpr float kFeedRateMax = 5.0f;
+
+    struct RunResult {
+        bool ok;
+        const char* detail;
+    };
+
     static ScheduleManager& instance();
 
-    // Initialize - loads schedule from NVS and starts the scheduler task
+    // Initialize - loads schedule from NVS and starts the scheduler timer
     esp_err_t init();
-
-    // Shutdown - stops the scheduler task
     void shutdown();
 
-    // Get a copy of the current schedule (the live vector is replaced from
-    // httpd / cloudlink tasks while the timer task iterates it).
+    // Copies: the live state is replaced from httpd / cloudlink tasks while
+    // the timer task iterates it.
     std::vector<ScheduleItem> getSchedule() const;
+    QuietHours getQuietHours() const;
 
-    // Packed TranquilMessage{schedule} with the current items.
+    // True while a quiet-hours window is active (false until time is synced).
+    bool isQuietNow() const;
+
+    // Packed TranquilMessage{schedule} with the current items + quiet hours.
     ResponseMessage buildScheduleMessage() const;
 
-    // Set entire schedule (replaces existing)
-    esp_err_t setSchedule(const std::vector<ScheduleItem>& items);
+    // Fill a TranquilSchedule from the live state into caller-owned scratch.
+    void toProto(ScheduleProtoScratch& scratch) const;
 
-    // Add a single schedule item
-    esp_err_t addItem(const ScheduleItem& item);
-
-    // Clear all schedule items
+    // Replace the item list (validates, clamps, assigns missing ids) and,
+    // when given, the quiet-hours config. Persists and notifies listeners.
+    // ESP_ERR_INVALID_SIZE when over the caps.
+    esp_err_t setSchedule(std::vector<ScheduleItem> items,
+                          const std::optional<QuietHours>& quiet = std::nullopt);
     esp_err_t clearSchedule();
 
-    // Save schedule to NVS
-    esp_err_t saveSchedule();
+    // Execute an action now. Honours quiet hours unless `force`. Safe to
+    // call from httpd / socket tasks (play() touches the SD card and motion).
+    RunResult runAction(const ScheduleAction& action, bool force);
 
-    // Load schedule from NVS
-    esp_err_t loadSchedule();
+    // Protobuf conversions
+    static ScheduleAction actionFromProto(const Kd__V1__ScheduleAction* proto);
+    static ScheduleItem itemFromProto(const Kd__V1__TranquilScheduleItem* proto);
+    static std::vector<ScheduleItem> itemsFromProto(const Kd__V1__TranquilSchedule* proto);
+    static std::optional<QuietHours> quietFromProto(const Kd__V1__TranquilSchedule* proto);
 
-    // Convert protobuf schedule to internal format
-    static std::vector<ScheduleItem> fromProto(const Kd__V1__TranquilSchedule* proto);
-
-    // Convert internal format to protobuf (caller must manage memory)
-    void toProto(Kd__V1__TranquilSchedule* proto,
-                 std::vector<Kd__V1__TranquilScheduleItem>& items_storage,
-                 std::vector<Kd__V1__TranquilScheduleItem*>& item_ptrs,
-                 std::vector<Kd__V1__ScheduleAction>& actions_storage) const;
+    static const char* actionName(ScheduleActionType type);
 
 private:
     ScheduleManager() = default;
 
-    // Timer callback for checking schedule
     static void timerCallback(void* arg);
-
-    // Check current time against schedule and execute if needed
     void checkAndExecute();
 
-    // Execute a schedule action (runs on a short-lived task, never on the
-    // esp_timer task: play() loads a file from SD and drains motion).
-    void executeAction(const ScheduleItem& item);
+    // Off the esp_timer task: play() loads a file from SD and drains motion.
+    void spawnAction(const ScheduleItem& item);
     static void actionTask(void* arg);
+    static void quietEdgeTask(void* arg);
+    void onQuietEdge(bool entering);
 
-    // Get current local time components
-    bool getCurrentTime(int& day_of_week, uint32_t& seconds_since_midnight);
+    bool getCurrentTime(int& day_of_week, uint32_t& seconds_since_midnight, time_t& now) const;
+    bool quietNowLocked(int day_of_week, uint32_t seconds_since_midnight) const;
+    static void sanitize(ScheduleItem& item);
+    static void sanitize(QuietHours& quiet);
+
+    esp_err_t saveLocked();
+    esp_err_t loadLegacyV1(const uint8_t* data, size_t len);
+    bool loadV2(const uint8_t* data, size_t len);
 
     std::vector<ScheduleItem> schedule_;
+    QuietHours quiet_;
     mutable SemaphoreHandle_t mutex_ = nullptr;
     esp_timer_handle_t timer_ = nullptr;
     bool initialized_ = false;
 
-    // Track last executed time to avoid re-executing same action
-    int last_executed_day_ = -1;
-    uint32_t last_executed_time_ = 0xFFFFFFFF;
+    // Per-item last fire, so two items at the same time both fire and one
+    // item never fires twice for the same tick window.
+    std::map<uint32_t, time_t> last_fired_;
 
-    // Check interval (30 seconds)
+    // Quiet-hours edge tracking (timer task only)
+    bool quiet_active_ = false;
+    // Channels we switched off on window entry, to restore on exit.
+    std::vector<uint32_t> quiet_dimmed_channels_;
+
     static constexpr int64_t CHECK_INTERVAL_US = 30 * 1000 * 1000LL;
+    static constexpr int32_t FIRE_WINDOW_S = 30;
+    static constexpr time_t REFIRE_GUARD_S = 120;
 
-    // NVS namespace and key
     static constexpr const char* kNamespace = "tranquil_sched";
-    static constexpr const char* kKeySchedule = "schedule";
+    static constexpr const char* kKeyLegacy = "schedule";   // v1 blob (pre-ids)
+    static constexpr const char* kKeySchedule = "sched_v2";
 };

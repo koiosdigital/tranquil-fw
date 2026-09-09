@@ -1179,7 +1179,7 @@
           "Schedule"
         ],
         "summary": "Replace schedule",
-        "description": "Replaces the entire schedule. Change is broadcast to WebSocket clients and synced to the cloud.",
+        "description": "Replaces the item list (max 32). `quiet_hours` is replaced only when present. Items with id 0 get one assigned; the saved schedule is returned. The change is pushed to WebSocket clients and the cloud.",
         "operationId": "putSchedule",
         "requestBody": {
           "required": true,
@@ -1203,7 +1203,7 @@
             }
           },
           "400": {
-            "description": "Malformed items"
+            "description": "Malformed items, or over the item / quiet-window caps"
           }
         }
       }
@@ -1226,6 +1226,41 @@
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "/api/schedule/run": {
+      "post": {
+        "tags": [
+          "Schedule"
+        ],
+        "summary": "Run a schedule action now",
+        "description": "Executes one action immediately (Run now / Test). Honours quiet hours unless `force` is true.",
+        "operationId": "runScheduleAction",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScheduleRunRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Result; success=false with a detail when blocked or the action could not start",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleRunResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed action"
           }
         }
       }
@@ -1909,6 +1944,15 @@
           "ip_address": {
             "type": "string",
             "description": "Current IPv4 address (empty when none)"
+          },
+          "quiet_hours_active": {
+            "type": "boolean",
+            "description": "A quiet-hours window is active right now"
+          },
+          "timezone": {
+            "type": "string",
+            "description": "IANA zone the schedule is evaluated in",
+            "example": "America/New_York"
           }
         }
       },
@@ -2148,25 +2192,47 @@
         "type": "object",
         "required": [
           "days_of_week",
-          "time_of_day",
-          "action_type"
+          "time_of_day"
         ],
         "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Stable id. Send 0 (or omit) to have the device assign one; keep it on edits."
+          },
+          "name": {
+            "type": "string",
+            "maxLength": 32
+          },
           "days_of_week": {
             "type": "integer",
             "description": "Bitmask, bit 0 = Sunday .. bit 6 = Saturday (0x7F = all days)"
           },
           "time_of_day": {
             "type": "integer",
-            "description": "Seconds since local midnight (0-86399)"
+            "description": "Seconds since local midnight (0-86399), in the device's timezone"
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          },
+          "obey_quiet_hours": {
+            "type": "boolean",
+            "default": true,
+            "description": "Skip this item while a quiet-hours window is active"
+          },
+          "action": {
+            "$ref": "#/components/schemas/ScheduleAction"
           },
           "action_type": {
             "type": "integer",
-            "description": "0=unspecified, 1=led_off, 2=led_on, 3=play_random_pattern, 4=play_playlist, 5=play_pattern"
+            "deprecated": true,
+            "description": "Legacy flat form, accepted on PUT when `action` is absent"
           },
           "uuid": {
             "type": "string",
-            "description": "Pattern/playlist UUID for play_pattern / play_playlist"
+            "deprecated": true,
+            "description": "Legacy flat form"
           }
         }
       },
@@ -2175,9 +2241,18 @@
         "properties": {
           "items": {
             "type": "array",
+            "maxItems": 32,
             "items": {
               "$ref": "#/components/schemas/ScheduleItem"
             }
+          },
+          "quiet_hours": {
+            "$ref": "#/components/schemas/QuietHours"
+          },
+          "quiet_now": {
+            "type": "boolean",
+            "readOnly": true,
+            "description": "A quiet-hours window is active right now"
           }
         }
       },
@@ -2199,6 +2274,158 @@
             "items": {
               "type": "string"
             }
+          }
+        }
+      },
+      "ScheduleLedState": {
+        "type": "object",
+        "description": "Partial LED patch applied to every channel by action type 6 (set_led_state). Absent fields are left unchanged.",
+        "properties": {
+          "on": {
+            "type": "boolean"
+          },
+          "effect_id": {
+            "type": "string",
+            "example": "SOLID"
+          },
+          "brightness": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 255
+          },
+          "speed": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10,
+            "description": "Effect speed"
+          },
+          "color": {
+            "type": "string",
+            "description": "Hex RGB (#rrggbb) or RGBW (#rrggbbww); an {r,g,b,w,cw} object is also accepted",
+            "example": "#ff8800"
+          },
+          "w": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 255,
+            "description": "White / warm white"
+          },
+          "cw": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 255,
+            "description": "Cool white (RGBCCT)"
+          }
+        }
+      },
+      "ScheduleAction": {
+        "type": "object",
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "type": "integer",
+            "description": "0=unspecified, 1=led_off, 2=led_on, 3=play_random_pattern, 4=play_playlist, 5=play_pattern, 6=set_led_state, 7=set_speed, 8=stop"
+          },
+          "uuid": {
+            "type": "string",
+            "description": "Pattern/playlist UUID for play_pattern / play_playlist"
+          },
+          "shuffle": {
+            "type": "boolean",
+            "description": "play_playlist"
+          },
+          "loop": {
+            "type": "boolean",
+            "description": "play_playlist"
+          },
+          "feed_rate": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 5,
+            "description": "set_speed: ball speed multiplier"
+          },
+          "led": {
+            "$ref": "#/components/schemas/ScheduleLedState"
+          }
+        }
+      },
+      "QuietWindow": {
+        "type": "object",
+        "required": [
+          "day_mask",
+          "start_min",
+          "end_min"
+        ],
+        "properties": {
+          "day_mask": {
+            "type": "integer",
+            "description": "Bitmask of the days the window STARTS on, bit 0 = Sunday .. bit 6 = Saturday"
+          },
+          "start_min": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1439,
+            "description": "Minutes since local midnight"
+          },
+          "end_min": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1439,
+            "description": "Minutes since local midnight; an end before the start wraps past midnight"
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          }
+        }
+      },
+      "QuietHours": {
+        "type": "object",
+        "properties": {
+          "windows": {
+            "type": "array",
+            "maxItems": 4,
+            "items": {
+              "$ref": "#/components/schemas/QuietWindow"
+            }
+          },
+          "stop_playback": {
+            "type": "boolean",
+            "description": "Stop the table when a window starts"
+          },
+          "lights_off": {
+            "type": "boolean",
+            "description": "Turn the LEDs off when a window starts; channels turned off this way are restored when it ends"
+          }
+        }
+      },
+      "ScheduleRunRequest": {
+        "type": "object",
+        "required": [
+          "action"
+        ],
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/ScheduleAction"
+          },
+          "force": {
+            "type": "boolean",
+            "default": false,
+            "description": "Run even while quiet hours are active"
+          }
+        }
+      },
+      "ScheduleRunResult": {
+        "type": "object",
+        "properties": {
+          "success": {
+            "type": "boolean"
+          },
+          "detail": {
+            "type": "string",
+            "description": "Why it did not run (e.g. \"Quiet hours active\"); empty on success"
           }
         }
       }

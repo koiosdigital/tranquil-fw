@@ -21,4 +21,5 @@ private:
 
     HandleResult handleScheduleRequest(const MessageContext& ctx, ResponseMessage& response);
     HandleResult handleSetSchedule(const Kd__V1__TranquilSchedule* msg, const MessageContext& ctx, ResponseMessage& response);
+    HandleResult handleRunAction(const Kd__V1__RunScheduleAction* msg, const MessageContext& ctx, ResponseMessage& response);
 };

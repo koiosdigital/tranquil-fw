@@ -1,6 +1,7 @@
 // SystemInfo builder implementation
 #include "system_info.h"
 #include "homing_service.h"
+#include "schedule_manager.h"
 #include "SandTablePlayer.h"
 
 #include <esp_app_desc.h>
@@ -11,6 +12,7 @@
 #include <esp_wifi.h>
 #include <kd_common.h>
 #include <kd_wifi.h>
+#include <kd_ntp.h>
 
 #include <cstdio>
 #include <cstring>
@@ -67,6 +69,9 @@ void snapshot(Snapshot& out) {
     out.uptime_s = static_cast<uint32_t>(esp_timer_get_time() / 1000000LL);
     out.wifi_rssi = read_rssi();
     fill_ip(out.ip_address, sizeof(out.ip_address));
+    out.quiet_hours_active = ScheduleManager::instance().isQuietNow();
+    const char* tz = kd_common_get_timezone();
+    out.timezone = tz ? tz : "";
 }
 
 ResponseMessage build_message() {
@@ -85,6 +90,8 @@ ResponseMessage build_message() {
     info.uptime_s = s.uptime_s;
     info.wifi_rssi = s.wifi_rssi;
     info.ip_address = s.ip_address;
+    info.quiet_hours_active = s.quiet_hours_active;
+    info.timezone = const_cast<char*>(s.timezone);
 
     Kd__V1__TranquilMessage msg = KD__V1__TRANQUIL_MESSAGE__INIT;
     msg.message_case = KD__V1__TRANQUIL_MESSAGE__MESSAGE_SYSTEM_INFO;
