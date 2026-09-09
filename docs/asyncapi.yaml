@@ -61,6 +61,8 @@ channels:
           - $ref: '#/components/messages/SetPaused'
           - $ref: '#/components/messages/StopPlayback'
           - $ref: '#/components/messages/PlaylistPlay'
+          - $ref: '#/components/messages/PlayRandom'
+          - $ref: '#/components/messages/SetRandomLoop'
           - $ref: '#/components/messages/SetShuffle'
           - $ref: '#/components/messages/SetLoop'
           - $ref: '#/components/messages/SetFeedRate'
@@ -153,6 +155,20 @@ components:
       summary: Start playing a playlist
       payload:
         $ref: '#/components/schemas/PlaylistPlay'
+
+    PlayRandom:
+      name: PlayRandom
+      title: Play Random
+      summary: Play a random library pattern now; with loop, chain random patterns forever. Responds with CommandResult.
+      payload:
+        $ref: '#/components/schemas/PlayRandom'
+
+    SetRandomLoop:
+      name: SetRandomLoop
+      title: Set Random Loop
+      summary: Toggle random-loop mode without interrupting the current pattern. Responds with CommandResult.
+      payload:
+        $ref: '#/components/schemas/SetRandomLoop'
 
     SetShuffle:
       name: SetShuffle
@@ -474,6 +490,22 @@ components:
       description: "Protobuf: kd.v1.StopPlayback"
       properties: {}
 
+    PlayRandom:
+      type: object
+      description: "Protobuf: kd.v1.PlayRandom"
+      properties:
+        loop:
+          type: boolean
+          description: Keep chaining random patterns after each one completes (PLAY_MODE_RANDOM_LOOP)
+
+    SetRandomLoop:
+      type: object
+      description: "Protobuf: kd.v1.SetRandomLoop"
+      properties:
+        enabled:
+          type: boolean
+          description: On keeps the current pattern and chains random ones after it (starts one if idle); off finishes the current pattern then stops
+
     PlaylistPlay:
       type: object
       description: "Protobuf: kd.v1.PlaylistPlay"
@@ -541,7 +573,7 @@ components:
           enum: [PLAYBACK_STATE_UNSPECIFIED, PLAYBACK_STATE_STOPPED, PLAYBACK_STATE_PLAYING, PLAYBACK_STATE_PAUSED]
         mode:
           type: string
-          enum: [PLAY_MODE_UNSPECIFIED, PLAY_MODE_SINGLE, PLAY_MODE_PLAYLIST, PLAY_MODE_PLAYLIST_LOOP, PLAY_MODE_PLAYLIST_SHUFFLE]
+          enum: [PLAY_MODE_UNSPECIFIED, PLAY_MODE_SINGLE, PLAY_MODE_PLAYLIST, PLAY_MODE_PLAYLIST_LOOP, PLAY_MODE_PLAYLIST_SHUFFLE, PLAY_MODE_RANDOM_LOOP]
         current_pattern_uuid:
           type: string
         current_playlist_uuid:

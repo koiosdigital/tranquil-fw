@@ -119,7 +119,7 @@
           "Player"
         ],
         "summary": "Start playback",
-        "description": "Start playing a pattern or playlist. Provide either pattern_uuid (single pattern) or playlist_uuid (with optional shuffle/loop).",
+        "description": "Start playing a pattern, a playlist, or a random pattern. Provide pattern_uuid (single pattern), playlist_uuid (with optional shuffle/loop), or random (with optional loop).",
         "operationId": "play",
         "requestBody": {
           "required": true,
@@ -1339,8 +1339,10 @@
               "SINGLE_PATTERN",
               "PLAYLIST",
               "PLAYLIST_LOOP",
-              "PLAYLIST_SHUFFLE"
-            ]
+              "PLAYLIST_SHUFFLE",
+              "RANDOM_LOOP"
+            ],
+            "description": "RANDOM_LOOP: a random library pattern follows each one until stopped"
           },
           "current_pattern_uuid": {
             "type": "string"
@@ -1401,6 +1403,10 @@
           "playlist_uuid": {
             "type": "string",
             "description": "Start playing this playlist"
+          },
+          "random_loop": {
+            "type": "boolean",
+            "description": "Random-loop mode. On: keep the current pattern and chain random patterns after it (or start one if idle). Off: let the current pattern finish, then stop. Playing a pattern or playlist by hand also turns it off."
           }
         }
       },
@@ -1422,9 +1428,14 @@
           "loop": {
             "type": "boolean",
             "default": false
+          },
+          "random": {
+            "type": "boolean",
+            "default": false,
+            "description": "Play a random library pattern now (pattern_uuid / playlist_uuid ignored). With loop, another random pattern follows each one (mode RANDOM_LOOP)."
           }
         },
-        "description": "Provide either pattern_uuid OR playlist_uuid. If both provided, starts playlist from the specified pattern."
+        "description": "Provide pattern_uuid, playlist_uuid, or random. If pattern_uuid and playlist_uuid are both provided, starts the playlist from that pattern."
       },
       "StopRequest": {
         "type": "object",

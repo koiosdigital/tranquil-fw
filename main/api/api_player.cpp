@@ -35,6 +35,7 @@ static esp_err_t handle_get_state(httpd_req_t* req) {
 //   { "pattern_uuid": "..." } - play single pattern
 //   { "playlist_uuid": "...", "shuffle": bool, "loop": bool } - play playlist from start
 //   { "playlist_uuid": "...", "pattern_uuid": "...", "shuffle": bool, "loop": bool } - play playlist from pattern
+//   { "random": true, "loop": bool } - play a random library pattern; loop = keep chaining random patterns
 static esp_err_t handle_play(httpd_req_t* req) {
     // Full body read (a truncated single recv left the remainder to be
     // parsed as the NEXT request on the keep-alive connection).
@@ -43,13 +44,15 @@ static esp_err_t handle_play(httpd_req_t* req) {
 
     cJSON* pattern_uuid = cJSON_GetObjectItem(root, "pattern_uuid");
     cJSON* playlist_uuid = cJSON_GetObjectItem(root, "playlist_uuid");
+    cJSON* random_item = cJSON_GetObjectItem(root, "random");
 
     bool has_pattern = pattern_uuid && cJSON_IsString(pattern_uuid) && strlen(pattern_uuid->valuestring) > 0;
     bool has_playlist = playlist_uuid && cJSON_IsString(playlist_uuid) && strlen(playlist_uuid->valuestring) > 0;
+    bool random = random_item && cJSON_IsBool(random_item) && cJSON_IsTrue(random_item);
 
-    if (!has_pattern && !has_playlist) {
+    if (!has_pattern && !has_playlist && !random) {
         cJSON_Delete(root);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing pattern_uuid or playlist_uuid");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing pattern_uuid, playlist_uuid or random");
         return ESP_FAIL;
     }
 
@@ -67,7 +70,9 @@ static esp_err_t handle_play(httpd_req_t* req) {
 
     esp_err_t ret;
 
-    if (has_playlist && has_pattern) {
+    if (random) {
+        ret = SandTablePlayer::playRandom(loop);
+    } else if (has_playlist && has_pattern) {
         // Playlist with pattern: start playlist from specific pattern
         ret = SandTablePlayer::playPlaylistFromPattern(
             playlist_uuid->valuestring, pattern_uuid->valuestring, shuffle, loop);
@@ -101,6 +106,7 @@ static esp_err_t handle_play(httpd_req_t* req) {
 //   loop: bool - set loop mode
 //   shuffle: bool - set shuffle mode
 //   feed_rate: number - set feed rate
+//   random_loop: bool - random-loop mode (on: chain random patterns after the current one, or start one if idle; off: finish the current pattern then stop)
 //   pattern_uuid: string - set playing pattern (stops current, plays new)
 //   playlist_uuid: string - set playing playlist (stops current, plays new)
 // If both pattern_uuid and playlist_uuid provided, starts playlist from pattern
@@ -145,6 +151,24 @@ static esp_err_t handle_patch(httpd_req_t* req) {
     cJSON* feed_rate = cJSON_GetObjectItem(root, "feed_rate");
     if (feed_rate && cJSON_IsNumber(feed_rate)) {
         SandTablePlayer::setFeedRate(feed_rate->valuedouble);
+    }
+
+    // Handle random_loop
+    cJSON* random_loop = cJSON_GetObjectItem(root, "random_loop");
+    if (random_loop && cJSON_IsBool(random_loop)) {
+        ret = SandTablePlayer::setRandomLoop(cJSON_IsTrue(random_loop));
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to set random loop: %s", esp_err_to_name(ret));
+            cJSON_Delete(root);
+            if (ret == ESP_ERR_NOT_FOUND) {
+                httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "No playable patterns");
+            } else if (ret == ESP_ERR_INVALID_STATE) {
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Not homed or not initialized");
+            } else {
+                httpd_resp_send_500(req);
+            }
+            return ESP_FAIL;
+        }
     }
 
     // Handle pattern/playlist changes (these start new playback)

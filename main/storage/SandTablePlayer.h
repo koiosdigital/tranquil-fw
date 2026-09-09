@@ -27,7 +27,8 @@ enum class PlayMode {
     SINGLE_PATTERN,
     PLAYLIST,
     PLAYLIST_LOOP,
-    PLAYLIST_SHUFFLE
+    PLAYLIST_SHUFFLE,
+    RANDOM_LOOP      // a random library pattern after each one finishes, until stopped
 };
 
 struct PatternLine {
@@ -81,6 +82,16 @@ public:
     // Pattern playback
     static esp_err_t playPattern(const char* pattern_uuid);
 
+    // Random playback: start a random playable library pattern now. With
+    // loop, another random pattern follows each one (PlayMode::RANDOM_LOOP).
+    static esp_err_t playRandom(bool loop);
+    // Random-loop toggle. Enabling while something plays keeps it running and
+    // chains random patterns after it (a playlist is abandoned); enabling
+    // while stopped starts a random pattern. Disabling lets the current
+    // pattern finish, then stops. playPattern/playPlaylist/stop also clear it.
+    static esp_err_t setRandomLoop(bool enabled);
+    static bool isRandomLoop();
+
     // Playlist playback
     static esp_err_t playPlaylist(const char* playlist_uuid, bool shuffle = false, bool loop = false);
     // Start playlist from a specific pattern (even if shuffled, starts at this pattern)
@@ -91,7 +102,7 @@ public:
     static esp_err_t resume();
     static esp_err_t stop();
     static esp_err_t emergencyStop();  // Immediate halt without state cleanup
-    static esp_err_t skip();      // Playlist only: skip to next pattern
+    static esp_err_t skip();      // Playlist / random loop: skip to next pattern
     static esp_err_t previous();  // Playlist only: return to previous pattern
 
     // Configuration
@@ -139,6 +150,11 @@ private:
     static PatternLine peekNextLine();
     static void popLine();
     static bool hasMoreLines();
+
+    // Random playback (state_mutex_ held)
+    static bool pickRandomPattern(std::string& out_uuid);
+    static void startRandomPattern();
+    static void clearPlaylistState();
 
     // Playlist management
     static void loadPlaylist(const char* playlist_uuid);

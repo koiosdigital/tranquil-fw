@@ -43,6 +43,12 @@ HandleResult PlayerHandler::handle(
         case KD__V1__TRANQUIL_MESSAGE__MESSAGE_SET_LOOP:
             return handleSetLoop(msg->set_loop, response);
 
+        case KD__V1__TRANQUIL_MESSAGE__MESSAGE_PLAY_RANDOM:
+            return handlePlayRandom(msg->play_random, response);
+
+        case KD__V1__TRANQUIL_MESSAGE__MESSAGE_SET_RANDOM_LOOP:
+            return handleSetRandomLoop(msg->set_random_loop, response);
+
         case KD__V1__TRANQUIL_MESSAGE__MESSAGE_SET_FEED_RATE:
             return handleSetFeedRate(msg->set_feed_rate, response);
 
@@ -65,6 +71,8 @@ bool PlayerHandler::canHandle(Kd__V1__TranquilMessage__MessageCase msg_case) con
         case KD__V1__TRANQUIL_MESSAGE__MESSAGE_PLAYLIST_PLAY:
         case KD__V1__TRANQUIL_MESSAGE__MESSAGE_SET_SHUFFLE:
         case KD__V1__TRANQUIL_MESSAGE__MESSAGE_SET_LOOP:
+        case KD__V1__TRANQUIL_MESSAGE__MESSAGE_PLAY_RANDOM:
+        case KD__V1__TRANQUIL_MESSAGE__MESSAGE_SET_RANDOM_LOOP:
         case KD__V1__TRANQUIL_MESSAGE__MESSAGE_SET_FEED_RATE:
         case KD__V1__TRANQUIL_MESSAGE__MESSAGE_PLAYLIST_NAVIGATE_COMMAND:
         case KD__V1__TRANQUIL_MESSAGE__MESSAGE_GET_PLAYER_STATE:
@@ -82,6 +90,8 @@ std::vector<Kd__V1__TranquilMessage__MessageCase> PlayerHandler::supportedMessag
         KD__V1__TRANQUIL_MESSAGE__MESSAGE_PLAYLIST_PLAY,
         KD__V1__TRANQUIL_MESSAGE__MESSAGE_SET_SHUFFLE,
         KD__V1__TRANQUIL_MESSAGE__MESSAGE_SET_LOOP,
+        KD__V1__TRANQUIL_MESSAGE__MESSAGE_PLAY_RANDOM,
+        KD__V1__TRANQUIL_MESSAGE__MESSAGE_SET_RANDOM_LOOP,
         KD__V1__TRANQUIL_MESSAGE__MESSAGE_SET_FEED_RATE,
         KD__V1__TRANQUIL_MESSAGE__MESSAGE_PLAYLIST_NAVIGATE_COMMAND,
         KD__V1__TRANQUIL_MESSAGE__MESSAGE_GET_PLAYER_STATE
@@ -188,6 +198,44 @@ HandleResult PlayerHandler::handleSetLoop(
     return HandleResult::ok();
 }
 
+HandleResult PlayerHandler::handlePlayRandom(
+    const Kd__V1__PlayRandom* msg,
+    ResponseMessage& response
+) {
+    if (!msg) {
+        response = makeCommandResult(false, "Invalid message");
+        return HandleResult::ok();
+    }
+
+    ESP_LOGI(TAG, "PlayRandom: loop=%d", msg->loop);
+    esp_err_t ret = SandTablePlayer::playRandom(msg->loop != 0);
+    const char* detail = nullptr;
+    if (ret == ESP_ERR_NOT_FOUND) detail = "No playable patterns";
+    else if (ret == ESP_ERR_INVALID_STATE) detail = "Not homed";
+    else if (ret != ESP_OK) detail = "Failed to start";
+    response = makeCommandResult(ret == ESP_OK, detail);
+    return HandleResult::ok();
+}
+
+HandleResult PlayerHandler::handleSetRandomLoop(
+    const Kd__V1__SetRandomLoop* msg,
+    ResponseMessage& response
+) {
+    if (!msg) {
+        response = makeCommandResult(false, "Invalid message");
+        return HandleResult::ok();
+    }
+
+    ESP_LOGI(TAG, "SetRandomLoop: %s", msg->enabled ? "true" : "false");
+    esp_err_t ret = SandTablePlayer::setRandomLoop(msg->enabled != 0);
+    const char* detail = nullptr;
+    if (ret == ESP_ERR_NOT_FOUND) detail = "No playable patterns";
+    else if (ret == ESP_ERR_INVALID_STATE) detail = "Not homed";
+    else if (ret != ESP_OK) detail = "Failed";
+    response = makeCommandResult(ret == ESP_OK, detail);
+    return HandleResult::ok();
+}
+
 HandleResult PlayerHandler::handleSetFeedRate(
     const Kd__V1__SetFeedRate* msg,
     ResponseMessage& response
@@ -284,6 +332,9 @@ ResponseMessage PlayerHandler::buildPlayerStateResponse() {
             break;
         case PlayMode::PLAYLIST_SHUFFLE:
             state.mode = KD__V1__PLAYER_STATE__PLAY_MODE__PLAY_MODE_PLAYLIST_SHUFFLE;
+            break;
+        case PlayMode::RANDOM_LOOP:
+            state.mode = KD__V1__PLAYER_STATE__PLAY_MODE__PLAY_MODE_RANDOM_LOOP;
             break;
     }
 

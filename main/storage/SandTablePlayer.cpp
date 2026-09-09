@@ -4,6 +4,7 @@
 #include "raii_utils.hpp"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_random.h"
 #include "nvs.h"
 #include <cstdio>
 #include <cstdlib>
@@ -258,6 +259,137 @@ esp_err_t SandTablePlayer::playPattern(const char* pattern_uuid) {
 }
 
 // =============================================================================
+// Random Playback
+// =============================================================================
+
+void SandTablePlayer::clearPlaylistState() {
+    memset(current_playlist_uuid_, 0, sizeof(current_playlist_uuid_));
+    playlist_patterns_.clear();
+    playlist_order_.clear();
+    playlist_index_ = 0;
+}
+
+// Any library pattern the table is allowed to draw, never the one that just
+// played when there is a choice. False when the library has nothing playable.
+bool SandTablePlayer::pickRandomPattern(std::string& out_uuid) {
+    auto patterns = ManifestDatabase::instance().getAllPatterns();
+    std::vector<const Pattern*> candidates;
+    candidates.reserve(patterns.size());
+    for (const auto& p : patterns) {
+        if (p.external_uuid.empty()) continue;
+        if (p.encrypted && !drm_purchase_is_valid(p.external_uuid.c_str()) && !drm_license_is_valid()) continue;
+        candidates.push_back(&p);
+    }
+    if (candidates.empty()) return false;
+    if (candidates.size() > 1 && current_pattern_uuid_[0]) {
+        candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+            [](const Pattern* p) { return p->external_uuid == current_pattern_uuid_; }),
+            candidates.end());
+        if (candidates.empty()) return false;
+    }
+    out_uuid = candidates[esp_random() % candidates.size()]->external_uuid;
+    return true;
+}
+
+// Load and start the next random pattern (state_mutex_ held). A pattern
+// whose file fails to load is skipped; after a few misses playback stops.
+void SandTablePlayer::startRandomPattern() {
+    for (int attempt = 0; attempt < 4; attempt++) {
+        std::string uuid;
+        if (!pickRandomPattern(uuid)) break;
+        if (loadPatternFile(uuid.c_str()) != ESP_OK) {
+            ESP_LOGW(TAG, "Random: failed to load %s, picking another", uuid.c_str());
+            continue;
+        }
+        current_pattern_ = ManifestDatabase::instance().getPatternByExternalUuid(uuid);
+        strncpy(current_pattern_uuid_, uuid.c_str(), MAX_UUID_LEN - 1);
+        current_pattern_uuid_[MAX_UUID_LEN - 1] = '\0';
+        motion_controller_->reset_progress_counters();
+        pattern_position_ = PatternPosition();
+        playback_state_ = PlaybackState::PLAYING;
+        ESP_LOGI(TAG, "Random loop: starting %s (%s)",
+            current_pattern_ ? current_pattern_->name.c_str() : "?", uuid.c_str());
+        return;
+    }
+    ESP_LOGW(TAG, "Random loop: nothing playable, stopping");
+    playback_state_ = PlaybackState::STOPPED;
+    play_mode_ = PlayMode::SINGLE_PATTERN;
+}
+
+esp_err_t SandTablePlayer::playRandom(bool loop) {
+    if (!initialized_) return ESP_ERR_INVALID_STATE;
+    if (!motion_controller_->is_homed()) return ESP_ERR_INVALID_STATE;
+
+    raii::MutexGuard guard(state_mutex_, pdMS_TO_TICKS(1000));
+    if (!guard) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    std::string uuid;
+    if (!pickRandomPattern(uuid)) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    if (playback_state_ != PlaybackState::STOPPED) {
+        playback_state_ = PlaybackState::STOPPED;
+        motion_controller_->halt_and_drain();
+    }
+    clearPlaylistState();
+
+    esp_err_t ret = loadPatternFile(uuid.c_str());
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    current_pattern_ = ManifestDatabase::instance().getPatternByExternalUuid(uuid);
+    if (!current_pattern_.has_value()) {
+        unloadPatternFile();
+        return ESP_ERR_NOT_FOUND;
+    }
+    strncpy(current_pattern_uuid_, uuid.c_str(), MAX_UUID_LEN - 1);
+    current_pattern_uuid_[MAX_UUID_LEN - 1] = '\0';
+    motion_controller_->reset_progress_counters();
+    pattern_position_ = PatternPosition();
+
+    play_mode_ = loop ? PlayMode::RANDOM_LOOP : PlayMode::SINGLE_PATTERN;
+    playback_state_ = PlaybackState::PLAYING;
+    motion_controller_->resume();
+
+    ESP_LOGI(TAG, "Started random pattern: %s (%s)%s",
+        current_pattern_->name.c_str(), uuid.c_str(), loop ? " [loop]" : "");
+    return ESP_OK;
+}
+
+esp_err_t SandTablePlayer::setRandomLoop(bool enabled) {
+    if (!initialized_) return ESP_ERR_INVALID_STATE;
+
+    {
+        raii::MutexGuard guard(state_mutex_, pdMS_TO_TICKS(1000));
+        if (!guard) {
+            return ESP_ERR_TIMEOUT;
+        }
+        if (!enabled) {
+            if (play_mode_ == PlayMode::RANDOM_LOOP) {
+                play_mode_ = PlayMode::SINGLE_PATTERN;
+                ESP_LOGI(TAG, "Random loop off: finishing current pattern");
+            }
+            return ESP_OK;
+        }
+        if (playback_state_ != PlaybackState::STOPPED) {
+            // Keep the current pattern; only what happens next changes.
+            clearPlaylistState();
+            play_mode_ = PlayMode::RANDOM_LOOP;
+            ESP_LOGI(TAG, "Random loop on: chaining after current pattern");
+            return ESP_OK;
+        }
+    }
+    return playRandom(true);
+}
+
+bool SandTablePlayer::isRandomLoop() {
+    return play_mode_ == PlayMode::RANDOM_LOOP;
+}
+
+// =============================================================================
 // Playlist Playback
 // =============================================================================
 
@@ -505,6 +637,14 @@ esp_err_t SandTablePlayer::skip() {
         return ESP_ERR_TIMEOUT;
     }
 
+    if (play_mode_ == PlayMode::RANDOM_LOOP) {
+        unloadPatternFile();
+        motion_controller_->halt_and_drain();
+        startRandomPattern();
+        ESP_LOGI(TAG, "Skipped to another random pattern");
+        return ESP_OK;
+    }
+
     // Only works in playlist mode
     if (play_mode_ == PlayMode::SINGLE_PATTERN || playlist_patterns_.empty()) {
         return ESP_ERR_INVALID_STATE;
@@ -585,7 +725,7 @@ esp_err_t SandTablePlayer::setShuffle(bool shuffle) {
     }
 
     is_shuffle_ = shuffle;
-    if (play_mode_ != PlayMode::SINGLE_PATTERN) {
+    if (play_mode_ != PlayMode::SINGLE_PATTERN && play_mode_ != PlayMode::RANDOM_LOOP) {
         play_mode_ = is_loop_ ? PlayMode::PLAYLIST_LOOP :
             (is_shuffle_ ? PlayMode::PLAYLIST_SHUFFLE : PlayMode::PLAYLIST);
     }
@@ -608,7 +748,7 @@ esp_err_t SandTablePlayer::setLoop(bool loop) {
     }
 
     is_loop_ = loop;
-    if (play_mode_ != PlayMode::SINGLE_PATTERN) {
+    if (play_mode_ != PlayMode::SINGLE_PATTERN && play_mode_ != PlayMode::RANDOM_LOOP) {
         play_mode_ = is_loop_ ? PlayMode::PLAYLIST_LOOP :
             (is_shuffle_ ? PlayMode::PLAYLIST_SHUFFLE : PlayMode::PLAYLIST);
     }
@@ -695,6 +835,7 @@ cJSON* SandTablePlayer::getStateJSON() {
     case PlayMode::PLAYLIST: mode_str = "PLAYLIST"; break;
     case PlayMode::PLAYLIST_LOOP: mode_str = "PLAYLIST_LOOP"; break;
     case PlayMode::PLAYLIST_SHUFFLE: mode_str = "PLAYLIST_SHUFFLE"; break;
+    case PlayMode::RANDOM_LOOP: mode_str = "RANDOM_LOOP"; break;
     default: break;
     }
     cJSON_AddStringToObject(root, "mode", mode_str);
@@ -824,8 +965,10 @@ void SandTablePlayer::serviceTask() {
                         file_loaded_ && !hasMoreLines()) {
                         ESP_LOGI(TAG, "Pattern finished");
 
-                        // Handle playlist mode
-                        if (play_mode_ != PlayMode::SINGLE_PATTERN && !playlist_patterns_.empty()) {
+                        if (play_mode_ == PlayMode::RANDOM_LOOP) {
+                            startRandomPattern();
+                        }
+                        else if (play_mode_ != PlayMode::SINGLE_PATTERN && !playlist_patterns_.empty()) {
                             advanceToNextPattern();
                         }
                         else {

@@ -4,7 +4,6 @@
 #include "library_notifier.h"
 #include <freertos/task.h>
 #include "SandTablePlayer.h"
-#include "ManifestDatabase.h"
 
 #include <esp_log.h>
 #include <esp_timer.h>
@@ -686,11 +685,9 @@ ScheduleManager::RunResult ScheduleManager::runAction(const ScheduleAction& acti
         }
 
         case kTypeRandom: {
-            auto patterns = ManifestDatabase::instance().getAllPatterns();
-            if (patterns.empty()) return {false, "No patterns"};
-            size_t idx = esp_random() % patterns.size();
-            esp_err_t err = SandTablePlayer::playPattern(patterns[idx].external_uuid.c_str());
-            ESP_LOGI(TAG, "Random pattern %s: %s", patterns[idx].external_uuid.c_str(), esp_err_to_name(err));
+            // loop = keep chaining random patterns (PlayMode::RANDOM_LOOP)
+            esp_err_t err = SandTablePlayer::playRandom(action.loop);
+            if (err == ESP_ERR_NOT_FOUND) return {false, "No playable patterns"};
             return {err == ESP_OK, err == ESP_OK ? nullptr : "Failed to start pattern"};
         }
 
