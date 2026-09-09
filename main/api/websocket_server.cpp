@@ -5,6 +5,7 @@
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include <lwip/sockets.h>
 #include <cstring>
 #include <algorithm>
 
@@ -51,9 +52,11 @@ static bool add_client(int fd) {
 
 // Remove client from tracking list
 static void remove_client(int fd) {
-    // Long timeout: this also runs from httpd's session-close path (free_ctx),
-    // and failing to take the mutex there would permanently leak the slot.
-    raii::MutexGuard guard(clients_mutex, pdMS_TO_TICKS(1000));
+    // Block: this runs on the httpd task (session close / free_ctx) which
+    // never holds clients_mutex itself, and every other holder is short.
+    // A timeout here permanently leaked the slot; four leaks and no client
+    // could connect until the next server restart.
+    raii::MutexGuard guard(clients_mutex, portMAX_DELAY);
     if (!guard) {
         return;
     }
@@ -83,10 +86,24 @@ static esp_err_t ws_handler(httpd_req_t* req) {
         ESP_LOGI(TAG, "WebSocket handshake request from fd=%d", fd);
 
         if (!add_client(fd)) {
-            // Reject connection - too many clients
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Too many connections");
+            // Reject: httpd already sent the 101 upgrade before calling us,
+            // so writing an HTTP error here would land inside the WS stream.
+            // Failing the handler closes the socket cleanly instead.
             return ESP_FAIL;
         }
+
+        // Per-socket send behaviour. httpd's default send timeout is 5 s and
+        // every WS write runs synchronously on the httpd task, so one phone
+        // that went to sleep with a full TCP window stalled every other
+        // client for 5 s per frame. Fail fast instead, and let TCP keepalive
+        // reap half-open sockets iOS leaves behind.
+        struct timeval snd_to = { .tv_sec = 1, .tv_usec = 500000 };
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &snd_to, sizeof(snd_to));
+        int ka = 1, ka_idle = 20, ka_intvl = 5, ka_cnt = 3;
+        setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &ka, sizeof(ka));
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &ka_idle, sizeof(ka_idle));
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &ka_intvl, sizeof(ka_intvl));
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &ka_cnt, sizeof(ka_cnt));
 
         // Reclaim the slot on any session close (abrupt disconnect, LRU
         // purge, server stop) — a close frame is not guaranteed.
@@ -111,7 +128,29 @@ static esp_err_t ws_handler(httpd_req_t* req) {
     // Handle control frames
     if (ws_pkt.type == HTTPD_WS_TYPE_CLOSE) {
         ESP_LOGI(TAG, "Client sent close frame");
-        remove_client(httpd_req_to_sockfd(req));
+        int fd = httpd_req_to_sockfd(req);
+        remove_client(fd);
+        // Complete the closing handshake: echo a close frame and tear the
+        // session down. Browsers wait for the server's close before dropping
+        // TCP; without it the socket lingered in one of the few slots.
+        httpd_ws_frame_t close_frame = {
+            .final = true, .fragmented = false, .type = HTTPD_WS_TYPE_CLOSE,
+            .payload = nullptr, .len = 0
+        };
+        httpd_ws_send_frame(req, &close_frame);
+        httpd_sess_trigger_close(req->handle, fd);
+        return ESP_OK;
+    }
+
+    if (ws_pkt.type == HTTPD_WS_TYPE_PONG) {
+        // Unsolicited pongs (some clients use them as keepalive) carry no
+        // protobuf; drain the payload and ignore.
+        if (ws_pkt.len > 0) {
+            uint8_t pong_body[126];
+            if (ws_pkt.len > sizeof(pong_body)) return ESP_FAIL;
+            ws_pkt.payload = pong_body;
+            httpd_ws_recv_frame(req, &ws_pkt, ws_pkt.len);
+        }
         return ESP_OK;
     }
 
@@ -249,7 +288,17 @@ static void async_send_worker(void* arg) {
 
     esp_err_t ret = httpd_ws_send_frame_async(a->hd, a->fd, &pkt);
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Async send failed to fd=%d: %s", a->fd, esp_err_to_name(ret));
+        // A failed write means the peer is gone or wedged (send timeout).
+        // Close the session now rather than paying the timeout again on
+        // every subsequent broadcast; free_ctx reclaims the slot.
+        ESP_LOGW(TAG, "Async send failed to fd=%d: %s - closing", a->fd, esp_err_to_name(ret));
+        httpd_sess_trigger_close(a->hd, a->fd);
+    }
+    else {
+        // httpd only credits LRU activity on RECEIVE, so a client that just
+        // listens to broadcasts looks idle and is the first purged when HTTP
+        // traffic (thumbnail grids) saturates the socket budget. Mark it live.
+        httpd_sess_update_lru_counter(a->hd, a->fd);
     }
 
     free(a->data);

@@ -1,6 +1,7 @@
 // Unified playlist handler implementation
 #include "playlist_handler.h"
 #include "ManifestDatabase.h"
+#include "library_notifier.h"
 
 #include <esp_log.h>
 #include <cstring>
@@ -59,9 +60,14 @@ std::vector<Kd__V1__TranquilMessage__MessageCase> PlaylistHandler::supportedMess
 }
 
 HandleResult PlaylistHandler::handlePlaylistsRequest(ResponseMessage& response) {
+    response = buildPlaylistListMessage();
+    return HandleResult::ok();
+}
+
+ResponseMessage PlaylistHandler::buildPlaylistListMessage() {
     auto playlists = ManifestDatabase::instance().getAllPlaylists();
 
-    ESP_LOGI(TAG, "PlaylistsRequest: returning %zu playlists", playlists.size());
+    ESP_LOGD(TAG, "Playlists: %zu playlists", playlists.size());
 
     // Build response. Locals, not statics: httpd and the cloudlink task can
     // run this concurrently; two tasks resizing the same static vectors
@@ -121,8 +127,7 @@ HandleResult PlaylistHandler::handlePlaylistsRequest(ResponseMessage& response) 
     resp.message_case = KD__V1__TRANQUIL_MESSAGE__MESSAGE_PLAYLISTS;
     resp.playlists = &playlists_msg;
 
-    response = serialize(&resp);
-    return HandleResult::ok();
+    return serialize(&resp);
 }
 
 HandleResult PlaylistHandler::handleCreatePlaylist(
@@ -164,7 +169,8 @@ HandleResult PlaylistHandler::handleCreatePlaylist(
 
     ESP_LOGI(TAG, "Created playlist: %s (%s)", playlist.name.c_str(), playlist.external_uuid.c_str());
     response = makeCommandResult(true);
-    return HandleResult::ok(true);  // Broadcast to locals
+    library_notifier::playlists_changed();  // list push to LAN + cloud
+    return HandleResult::ok();
 }
 
 HandleResult PlaylistHandler::handleUpdatePlaylist(
@@ -225,7 +231,8 @@ HandleResult PlaylistHandler::handleUpdatePlaylist(
 
     ESP_LOGI(TAG, "Updated playlist: %s", msg->uuid);
     response = makeCommandResult(true);
-    return HandleResult::ok(true);  // Broadcast to locals
+    library_notifier::playlists_changed();
+    return HandleResult::ok();
 }
 
 HandleResult PlaylistHandler::handleDeletePlaylist(
@@ -255,5 +262,6 @@ HandleResult PlaylistHandler::handleDeletePlaylist(
 
     ESP_LOGI(TAG, "Deleted playlist: %s", msg->uuid);
     response = makeCommandResult(true);
-    return HandleResult::ok(true);  // Broadcast to locals
+    library_notifier::playlists_changed();
+    return HandleResult::ok();
 }

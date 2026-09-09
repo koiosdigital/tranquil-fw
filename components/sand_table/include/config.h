@@ -2,6 +2,7 @@
 
 #include "sdkconfig.h"
 #include "driver/gpio.h"
+#include <cstddef>
 #include <cstdint>
 #include <cmath>
 
@@ -119,12 +120,27 @@ namespace sand_table {
         static uint16_t rho_irun_ma();
         static uint8_t stallguard_threshold();
 
+        // Runtime-tunable motion shaping (NVS-backed via ConfigManager; the
+        // kDefault* values are the factory settings). All are read live by
+        // the planner / executor, so a settings save applies to the next
+        // segment without a reboot or re-home.
+        static uint32_t accel_steps_s2();          // per-motor step accel
+        static uint32_t junction_dv_steps_s();     // max per-axis rate jump at a junction
+        static float theta_max_rot_per_min();      // theta spin-rate cap
+        static uint32_t motor_idle_timeout_s();    // 0 = never de-energize
+
+        static constexpr uint32_t kDefaultAccelStepsS2 = 10000;
+        static constexpr uint32_t kDefaultJunctionDvStepsS = 250;
+        static constexpr float kDefaultThetaMaxRotPerMin = 12.0f;
+        static constexpr uint32_t kDefaultMotorIdleTimeoutS = 30;
+
         // Constants that don't change at runtime
         static constexpr uint32_t LOOKAHEAD_DEPTH = 32;
         // De-energize the motors after this long with no motion (holding
         // current just heats the drivers; the arm can't backdrive). The next
-        // move re-enables them (with the TMC warmup delay).
-        static constexpr uint32_t MOTOR_INACTIVITY_TIMEOUT_MS = 30000;
+        // move re-enables them (with the TMC warmup delay). Default only; the
+        // live value is motor_idle_timeout_s().
+        static constexpr uint32_t MOTOR_INACTIVITY_TIMEOUT_MS = kDefaultMotorIdleTimeoutS * 1000;
 
         // Hard cap on major-axis steps per motion segment. Sized so the
         // interval table (MAX_SEGMENT_STEPS * sizeof(uint16_t)) fits in
@@ -136,7 +152,29 @@ namespace sand_table {
 
         // Per-motor step acceleration used for the per-segment trapezoid
         // profile (steps/s^2). This is the knob that actually shapes ramps.
-        static constexpr float STEP_ACCEL_STEPS_S2 = 10000.0f;
+        // Default only; the live value is accel_steps_s2().
+        static constexpr float STEP_ACCEL_STEPS_S2 = static_cast<float>(kDefaultAccelStepsS2);
+
+        // Max instantaneous per-motor step-rate change allowed across a
+        // segment junction (steps/s). Both motors run off one shared time
+        // base, so a junction executes as a small step change in each
+        // axis's rate; the planner clamps the junction path speed so no
+        // axis jumps by more than this. Small jumps are absorbed by the
+        // magnet/ball compliance; sharp corners, at-speed reversals and
+        // the theta whip near center produce large per-axis deltas and
+        // get slowed proportionally. Raising this corners faster but
+        // marks the sand; lowering it approaches a stop at every
+        // junction. Default only; the live value is junction_dv_steps_s().
+        static constexpr float JUNCTION_MAX_AXIS_DV_STEPS_S = static_cast<float>(kDefaultJunctionDvStepsS);
+
+        // Segments are handed to the executor only while the velocity
+        // planner holds MORE than this many (except when flushing a
+        // stalled or ending stream). A popped segment's exit speed is
+        // frozen, and it is only trustworthy once enough successors
+        // arrived for the backward pass to re-raise the plan-to-zero
+        // tail; committing from a starved buffer re-creates the very
+        // stop/start jitter the lookahead exists to remove.
+        static constexpr size_t PLANNER_COMMIT_LOOKAHEAD = 8;
 
         // Hard ceiling on the theta axis rotation rate (rotations/min),
         // applied AFTER feedrate (including transit boosts) as a safety
@@ -144,8 +182,9 @@ namespace sand_table {
         // distance maps to a large theta swing (direction changes pass
         // through the middle), so path-speed planning alone can whip the
         // arm around. Enforced in calculate_velocity_profile and, for live
-        // feedrate boosts, via the sequencer's speed-scale ceiling.
-        static constexpr float THETA_MAX_ROT_PER_MIN = 12.0f;
+        // feedrate boosts, via the sequencer's speed-scale ceiling. Default
+        // only; the live value is theta_max_rot_per_min().
+        static constexpr float THETA_MAX_ROT_PER_MIN = kDefaultThetaMaxRotPerMin;
     };
 
     // =============================================================================

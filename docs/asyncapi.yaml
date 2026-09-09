@@ -16,8 +16,22 @@ info:
 
     ## Protocol
     - Binary WebSocket frames containing serialized protobuf messages
-    - Max frame size: 8KB
+    - Max inbound frame size: 8KB (client -> device); device -> client frames up to 32KB
     - Max concurrent clients: 4
+    - Send a `Ping` every few seconds: the device only credits socket activity on
+      inbound frames, and the `Pong` doubles as the client's liveness check.
+
+    ## Reply and broadcast semantics
+    - Commands (play/pause/LED/playlist/...) answer the REQUESTER with a
+      `CommandResult`. Results are never broadcast to other clients.
+    - The state that changed is pushed to EVERY client (and the cloud) as its
+      own snapshot: `PlayerState` on playback change, `LEDConfig` (with per-channel
+      state) on any LED change, `DownloadedPatterns` / `Playlists` on any library
+      change (including changes made over REST or by another client), `Schedule`
+      on schedule change, `SystemInfo` when homing starts/ends.
+    - Progress-only `PlayerState` updates are throttled to 1 s locally.
+    - Unknown / retired message types get `CommandResult{success:false}` so a
+      client never waits forever.
 
     ## Protobuf Definitions
     See `components/protobufs/proto/kd/v1/tranquil.proto` for full message definitions.
@@ -74,6 +88,7 @@ channels:
           - $ref: '#/components/messages/Ping'
           - $ref: '#/components/messages/GetSystemInfo'
           - $ref: '#/components/messages/HomeRequest'
+          - $ref: '#/components/messages/RebootRequest'
           - $ref: '#/components/messages/FactoryResetRequest'
 
     subscribe:
@@ -398,10 +413,17 @@ components:
       payload:
         $ref: '#/components/schemas/HomeResponse'
 
+    RebootRequest:
+      name: RebootRequest
+      title: Reboot Request
+      summary: Restart the device (settings and library kept). Responds with CommandResult.
+      payload:
+        $ref: '#/components/schemas/TranquilRebootRequest'
+
     FactoryResetRequest:
       name: FactoryResetRequest
       title: Factory Reset
-      summary: Trigger factory reset (device will restart)
+      summary: Trigger factory reset (device will restart). Local clients only.
       payload:
         $ref: '#/components/schemas/FactoryResetRequest'
 
@@ -490,7 +512,13 @@ components:
     GetPlayerState:
       type: object
       description: "Protobuf: kd.v1.GetPlayerState"
-      properties: {}
+      properties:
+        watch_seconds:
+          type: integer
+          description: >-
+            Cloud only. When non-zero the device keeps progress-only PlayerState
+            updates flowing to the cloud at the fast (~2 s) cadence for this many
+            seconds (idle cadence is 15 s). Ignored on the local socket.
 
     PlayerState:
       type: object
@@ -757,10 +785,18 @@ components:
             Protobuf enum kd.v1.LEDFormat: 0=UNSPECIFIED, 1=RGB, 2=RGBW,
             3=RGBCCT (RGB + warm/cool white, e.g. FW1906)
           enum: [0, 1, 2, 3]
+        channels:
+          type: array
+          description: >-
+            Live per-channel effect state. Sent with every LEDConfig: in reply to
+            LEDConfigRequest and, debounced (~400 ms), whenever any channel changes
+            (REST, WebSocket, cloud, schedule).
+          items:
+            $ref: '#/components/schemas/LEDChannelState'
 
-    SetLEDChannel:
+    LEDChannelState:
       type: object
-      description: "Protobuf: kd.v1.SetLEDChannel"
+      description: "Protobuf: kd.v1.LEDChannelState"
       properties:
         channel:
           type: integer
@@ -768,10 +804,50 @@ components:
           type: string
         brightness:
           type: integer
+          description: "0-255"
         speed:
           type: integer
+          description: "1-10"
         enabled:
           type: boolean
+        color:
+          type: object
+          description: "Protobuf: kd.v1.LEDColor"
+          properties:
+            r:
+              type: integer
+            g:
+              type: integer
+            b:
+              type: integer
+            w:
+              type: integer
+              description: "Single white (RGBW) / warm white (RGBCCT)"
+            cw:
+              type: integer
+              description: "Cool white (RGBCCT only)"
+
+    SetLEDChannel:
+      type: object
+      description: >-
+        Protobuf: kd.v1.SetLEDChannel. PARTIAL update: brightness/speed/enabled
+        are proto3 `optional` and only applied when present; an empty effect_id
+        and an absent color mean "unchanged". Responds with CommandResult; the
+        resulting state is broadcast as LEDConfig.
+      properties:
+        channel:
+          type: integer
+        effect_id:
+          type: string
+        brightness:
+          type: integer
+          description: "0-255 (optional)"
+        speed:
+          type: integer
+          description: "1-10, clamped (optional)"
+        enabled:
+          type: boolean
+          description: "(optional)"
         color:
           type: object
           description: "Protobuf: kd.v1.LEDColor"
@@ -877,6 +953,26 @@ components:
           type: integer
         hostname:
           type: string
+        is_homing:
+          type: boolean
+          description: "A homing/calibration run is in progress"
+        uptime_s:
+          type: integer
+        wifi_rssi:
+          type: integer
+          description: "dBm, 0 if unknown"
+        free_psram:
+          type: integer
+        ip_address:
+          type: string
+
+    TranquilRebootRequest:
+      type: object
+      description: "Protobuf: kd.v1.TranquilRebootRequest"
+      properties:
+        reason:
+          type: string
+          description: "Optional reason for logging"
 
     HomeRequest:
       type: object
@@ -888,7 +984,11 @@ components:
 
     HomeResponse:
       type: object
-      description: "Protobuf: kd.v1.HomeResponse"
+      description: >-
+        Protobuf: kd.v1.HomeResponse. Homing runs asynchronously: success=true
+        means the run STARTED (error is set when a run is already in progress).
+        Completion is visible in SystemInfo (is_homing / is_homed), which is
+        pushed to all clients when the run ends.
       properties:
         success:
           type: boolean
@@ -901,7 +1001,7 @@ components:
 
     FactoryResetRequest:
       type: object
-      description: "Protobuf: kd.v1.FactoryResetRequest"
+      description: "Protobuf: kd.v1.FactoryResetRequest. Local clients only (refused from the cloud)."
       properties:
         reason:
           type: string

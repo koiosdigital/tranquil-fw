@@ -7,6 +7,10 @@
 #include <vector>
 #include <string>
 #include <cstdint>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+
+#include "handler_base.h"
 
 // Day of week bitmask (bit 0 = Sunday, bit 6 = Saturday)
 namespace DayOfWeek {
@@ -41,8 +45,12 @@ public:
     // Shutdown - stops the scheduler task
     void shutdown();
 
-    // Get current schedule
-    const std::vector<ScheduleItem>& getSchedule() const { return schedule_; }
+    // Get a copy of the current schedule (the live vector is replaced from
+    // httpd / cloudlink tasks while the timer task iterates it).
+    std::vector<ScheduleItem> getSchedule() const;
+
+    // Packed TranquilMessage{schedule} with the current items.
+    ResponseMessage buildScheduleMessage() const;
 
     // Set entire schedule (replaces existing)
     esp_err_t setSchedule(const std::vector<ScheduleItem>& items);
@@ -77,13 +85,16 @@ private:
     // Check current time against schedule and execute if needed
     void checkAndExecute();
 
-    // Execute a schedule action
+    // Execute a schedule action (runs on a short-lived task, never on the
+    // esp_timer task: play() loads a file from SD and drains motion).
     void executeAction(const ScheduleItem& item);
+    static void actionTask(void* arg);
 
     // Get current local time components
     bool getCurrentTime(int& day_of_week, uint32_t& seconds_since_midnight);
 
     std::vector<ScheduleItem> schedule_;
+    mutable SemaphoreHandle_t mutex_ = nullptr;
     esp_timer_handle_t timer_ = nullptr;
     bool initialized_ = false;
 

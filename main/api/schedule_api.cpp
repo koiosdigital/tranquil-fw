@@ -14,7 +14,7 @@ static const char* TAG = "schedule_api";
 using namespace api_common;
 
 static void write_schedule_json(ChunkBuf* cb) {
-    const auto& items = ScheduleManager::instance().getSchedule();
+    const auto items = ScheduleManager::instance().getSchedule();
     chunk_buf_write_str(cb, "{\"items\":[");
     bool first = true;
     for (const auto& item : items) {
@@ -48,23 +48,8 @@ static esp_err_t schedule_get_handler(httpd_req_t* req) {
 // Schedule to local WS clients and push it to the cloud (mirrors what the
 // WS handler did for a local SetSchedule).
 static void notify_schedule_changed() {
-    Kd__V1__TranquilSchedule schedule_proto;
-    std::vector<Kd__V1__TranquilScheduleItem> items_storage;
-    std::vector<Kd__V1__TranquilScheduleItem*> item_ptrs;
-    std::vector<Kd__V1__ScheduleAction> actions_storage;
-
-    ScheduleManager::instance().toProto(&schedule_proto, items_storage, item_ptrs, actions_storage);
-
-    Kd__V1__TranquilMessage msg = KD__V1__TRANQUIL_MESSAGE__INIT;
-    msg.message_case = KD__V1__TRANQUIL_MESSAGE__MESSAGE_SCHEDULE;
-    msg.schedule = &schedule_proto;
-
-    size_t len = kd__v1__tranquil_message__get_packed_size(&msg);
-    uint8_t* buf = static_cast<uint8_t*>(malloc(len));
-    if (!buf) return;
-    kd__v1__tranquil_message__pack(&msg, buf);
-
-    ResponseMessage packed(buf, len);
+    ResponseMessage packed = ScheduleManager::instance().buildScheduleMessage();
+    if (!packed.valid()) return;
     ResponseRouter::instance().broadcastToLocal(packed);
     ResponseRouter::instance().sendToCloud(packed);
 }

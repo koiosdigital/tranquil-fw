@@ -115,6 +115,19 @@ esp_err_t MessageDispatcher::dispatch(
     HandlerBase* handler = findHandler(msg->message_case);
     if (!handler) {
         ESP_LOGW(TAG, "No handler for message type %d", msg->message_case);
+        // A local client that sent a retired / unknown request must not hang
+        // waiting: answer with an explicit failure. Cloud-only replies
+        // (license, purchases, ...) are handled before dispatch and never
+        // reach here; anything else from the cloud is simply ignored.
+        if (ctx.source == MessageSource::LOCAL_WEBSOCKET) {
+            if (response_out) {
+                *response_out = HandlerBase::makeCommandResult(false, "Unsupported message");
+            }
+            if (result_out) {
+                *result_out = HandleResult::error();
+            }
+            return ESP_ERR_NOT_FOUND;
+        }
         if (result_out) {
             *result_out = HandleResult::notHandled();
         }

@@ -36,19 +36,10 @@ static esp_err_t handle_get_state(httpd_req_t* req) {
 //   { "playlist_uuid": "...", "shuffle": bool, "loop": bool } - play playlist from start
 //   { "playlist_uuid": "...", "pattern_uuid": "...", "shuffle": bool, "loop": bool } - play playlist from pattern
 static esp_err_t handle_play(httpd_req_t* req) {
-    char buf[512];
-    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
-    if (len <= 0) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty body");
-        return ESP_FAIL;
-    }
-    buf[len] = '\0';
-
-    cJSON* root = cJSON_Parse(buf);
-    if (!root) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
-        return ESP_FAIL;
-    }
+    // Full body read (a truncated single recv left the remainder to be
+    // parsed as the NEXT request on the keep-alive connection).
+    cJSON* root = api_common::parse_json_body(req, 2048);
+    if (!root) return ESP_FAIL;
 
     cJSON* pattern_uuid = cJSON_GetObjectItem(root, "pattern_uuid");
     cJSON* playlist_uuid = cJSON_GetObjectItem(root, "playlist_uuid");
@@ -114,19 +105,8 @@ static esp_err_t handle_play(httpd_req_t* req) {
 //   playlist_uuid: string - set playing playlist (stops current, plays new)
 // If both pattern_uuid and playlist_uuid provided, starts playlist from pattern
 static esp_err_t handle_patch(httpd_req_t* req) {
-    char buf[512];
-    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
-    if (len <= 0) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty body");
-        return ESP_FAIL;
-    }
-    buf[len] = '\0';
-
-    cJSON* root = cJSON_Parse(buf);
-    if (!root) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
-        return ESP_FAIL;
-    }
+    cJSON* root = api_common::parse_json_body(req, 2048);
+    if (!root) return ESP_FAIL;
 
     esp_err_t ret = ESP_OK;
 
@@ -219,21 +199,14 @@ static esp_err_t handle_stop(httpd_req_t* req) {
     bool emergency = false;
 
     // Check if there's a body with emergency_stop
-    int content_len = req->content_len;
-    if (content_len > 0) {
-        char buf[64];
-        int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
-        if (len > 0) {
-            buf[len] = '\0';
-            cJSON* root = cJSON_Parse(buf);
-            if (root) {
-                cJSON* emergency_item = cJSON_GetObjectItem(root, "emergency_stop");
-                if (emergency_item && cJSON_IsBool(emergency_item)) {
-                    emergency = cJSON_IsTrue(emergency_item);
-                }
-                cJSON_Delete(root);
-            }
+    if (req->content_len > 0) {
+        cJSON* root = api_common::parse_json_body(req, 512);
+        if (!root) return ESP_FAIL;
+        cJSON* emergency_item = cJSON_GetObjectItem(root, "emergency_stop");
+        if (emergency_item && cJSON_IsBool(emergency_item)) {
+            emergency = cJSON_IsTrue(emergency_item);
         }
+        cJSON_Delete(root);
     }
 
     esp_err_t ret;

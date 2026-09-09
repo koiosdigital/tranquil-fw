@@ -45,8 +45,9 @@ void PlayerStateBroadcaster::init() {
     }
 
     initialized_ = true;
-    ESP_LOGI(TAG, "Player state broadcaster initialized (poll=%lldms, local=%llds, cloud=%llds)",
-        CHECK_INTERVAL_US / 1000, LOCAL_COOLDOWN_US / 1000000, CLOUD_COOLDOWN_US / 1000000);
+    ESP_LOGI(TAG, "Player state broadcaster initialized (poll=%lldms, local=%llds, cloud=%llds idle / %llds watched)",
+        CHECK_INTERVAL_US / 1000, LOCAL_COOLDOWN_US / 1000000,
+        CLOUD_COOLDOWN_IDLE_US / 1000000, CLOUD_COOLDOWN_WATCHED_US / 1000000);
 }
 
 void PlayerStateBroadcaster::shutdown() {
@@ -68,6 +69,28 @@ void PlayerStateBroadcaster::forceImmediateBroadcast() {
     last_cloud_send_us_ = 0;
 }
 
+void PlayerStateBroadcaster::pushToCloudNow() {
+    sendToCloud();
+    last_cloud_send_us_ = esp_timer_get_time();
+}
+
+void PlayerStateBroadcaster::noteCloudAttention(uint32_t seconds) {
+    if (seconds == 0) return;
+    if (seconds > MAX_ATTENTION_S) seconds = MAX_ATTENTION_S;
+    const int64_t until = esp_timer_get_time() + static_cast<int64_t>(seconds) * 1000000LL;
+    // Only ever extend; a shorter request must not cut an active window.
+    int64_t cur = cloud_attention_until_us_.load(std::memory_order_relaxed);
+    while (until > cur &&
+           !cloud_attention_until_us_.compare_exchange_weak(cur, until, std::memory_order_relaxed)) {
+    }
+    ESP_LOGD(TAG, "Cloud attention for %lus", static_cast<unsigned long>(seconds));
+}
+
+int64_t PlayerStateBroadcaster::cloudCooldownUs(int64_t now_us) const {
+    return (now_us < cloud_attention_until_us_.load(std::memory_order_relaxed))
+        ? CLOUD_COOLDOWN_WATCHED_US : CLOUD_COOLDOWN_IDLE_US;
+}
+
 void PlayerStateBroadcaster::timerCallback(void* arg) {
     auto* self = static_cast<PlayerStateBroadcaster*>(arg);
     self->checkAndBroadcast();
@@ -76,6 +99,12 @@ void PlayerStateBroadcaster::timerCallback(void* arg) {
 void PlayerStateBroadcaster::checkAndBroadcast() {
     // Get current player state
     PlaybackStatus status = SandTablePlayer::getStatus();
+    if (!status.valid) {
+        // The player's state lock was busy (a play() is loading a file).
+        // A partial snapshot would look like "nothing playing" for one tick
+        // and be broadcast as a real change - skip until it is consistent.
+        return;
+    }
 
     CachedState current = {};
     current.state = static_cast<int>(status.state);
@@ -119,7 +148,7 @@ void PlayerStateBroadcaster::checkAndBroadcast() {
         last_cloud_send_us_ = now_us;
     } else if (progress_only) {
         // Throttled send for progress-only changes
-        if (now_us - last_cloud_send_us_ >= CLOUD_COOLDOWN_US) {
+        if (now_us - last_cloud_send_us_ >= cloudCooldownUs(now_us)) {
             sendToCloud();
             last_cloud_send_us_ = now_us;
         }
@@ -140,6 +169,9 @@ void PlayerStateBroadcaster::broadcastToLocal() {
 void PlayerStateBroadcaster::sendToCloud() {
     ResponseMessage response = PlayerHandler::instance().buildPlayerStateResponse();
     if (response.valid()) {
+        // forwardToCloud is a no-op while the cloud session is down; the
+        // reconnect handshake pushes a fresh snapshot instead of replaying
+        // stale ones.
         ResponseRouter::instance().forwardToCloud(response.data(), response.len());
         ESP_LOGD(TAG, "Sent PlayerState to cloud");
     }

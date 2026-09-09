@@ -33,6 +33,13 @@ struct RuntimeMotionConfig {
     // StallGuard
     uint8_t stallguard_threshold = 30;
 
+    // Advanced motion shaping (applied live). See MotionConfig in config.h
+    // for what each one does; 0 motor_idle_timeout_s = never de-energize.
+    uint32_t accel_steps_s2 = 10000;
+    uint32_t junction_dv_steps_s = 250;
+    float theta_max_rot_per_min = 12.0f;
+    uint32_t motor_idle_timeout_s = 30;
+
     // Derived calculations
     uint32_t effective_steps_per_rev() const {
         return steps_per_rev * microsteps;
@@ -136,6 +143,10 @@ private:
     static constexpr const char* kKeyThetaCurrMa = "theta_curr";
     static constexpr const char* kKeyRhoCurrMa = "rho_curr";
     static constexpr const char* kKeySgThreshold = "sg_thresh";
+    static constexpr const char* kKeyAccel = "accel_sps2";
+    static constexpr const char* kKeyJunctionDv = "junc_dv";
+    static constexpr const char* kKeyThetaRot = "theta_rot";   // x100, u32
+    static constexpr const char* kKeyIdleTimeout = "idle_s";
 
     // NVS keys - LED
     static constexpr const char* kKeyHasLeds = "has_leds";

@@ -33,5 +33,5 @@ private:
     HandleResult handleSetLoop(const Kd__V1__SetLoop* msg, ResponseMessage& response);
     HandleResult handleSetFeedRate(const Kd__V1__SetFeedRate* msg, ResponseMessage& response);
     HandleResult handlePlaylistNavigate(const Kd__V1__PlaylistNavigateCommand* msg, ResponseMessage& response);
-    HandleResult handleGetPlayerState(ResponseMessage& response);
+    HandleResult handleGetPlayerState(const Kd__V1__GetPlayerState* msg, const MessageContext& ctx, ResponseMessage& response);
 };

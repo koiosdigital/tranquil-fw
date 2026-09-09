@@ -804,7 +804,7 @@
           "LED"
         ],
         "summary": "List LED effects",
-        "description": "Returns the list of available LED effects.",
+        "description": "Static list of effect slugs for this firmware (cacheable; Cache-Control: max-age=3600).",
         "operationId": "getLEDEffects",
         "responses": {
           "200": {
@@ -954,7 +954,7 @@
           "System"
         ],
         "summary": "Run homing sequence",
-        "description": "Blocks until homing completes. Player state broadcasts on the WebSocket reflect progress.",
+        "description": "Starts the homing sequence on its own task and returns immediately (202). Poll GET /api/system/info (is_homing / is_homed) or watch the SystemInfo WebSocket push for completion. 409 when a run is already in progress.",
         "operationId": "homeDevice",
         "requestBody": {
           "required": false,
@@ -967,8 +967,18 @@
           }
         },
         "responses": {
-          "200": {
-            "description": "Homing result",
+          "202": {
+            "description": "Homing started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HomeResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A homing run is already in progress",
             "content": {
               "application/json": {
                 "schema": {
@@ -978,7 +988,7 @@
             }
           },
           "500": {
-            "description": "Motion controller unavailable or homing failed"
+            "description": "Motion controller unavailable or the run could not be started"
           }
         }
       }
@@ -1058,7 +1068,8 @@
           "400": {
             "description": "No valid config in body"
           }
-        }
+        },
+        "description": "Partial update. Absent fields are unchanged; presence (not a non-zero value) decides what is applied, so 0 is valid where it means something (motor_idle_timeout_s = 0 keeps the motors powered). Out-of-range values are rejected with 400. Motion values apply to the drivers/planner immediately; LED hardware changes rebuild the strip live (`led_applied`); steps_per_rev / microsteps set `reboot_required`."
       }
     },
     "/api/config/calibration": {
@@ -1193,6 +1204,28 @@
           },
           "400": {
             "description": "Malformed items"
+          }
+        }
+      }
+    },
+    "/api/system/reboot": {
+      "post": {
+        "tags": [
+          "System"
+        ],
+        "summary": "Restart the table",
+        "description": "Stops playback and restarts the device after ~500 ms. Settings and the pattern library are kept.",
+        "operationId": "rebootDevice",
+        "responses": {
+          "200": {
+            "description": "Restart scheduled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
+                }
+              }
+            }
           }
         }
       }
@@ -1693,8 +1726,16 @@
           },
           "type": {
             "type": "string",
-            "enum": ["RGB", "RGBW", "RGBCCT"],
+            "enum": [
+              "RGB",
+              "RGBW",
+              "RGBCCT"
+            ],
             "description": "LED strip pixel format. RGBCCT = RGB + warm/cool white (e.g. FW1906)."
+          },
+          "state": {
+            "$ref": "#/components/schemas/LEDChannelState",
+            "description": "Live effect state of the channel"
           }
         }
       },
@@ -1709,6 +1750,37 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/LEDChannelInfo"
+            }
+          },
+          "has_leds": {
+            "type": "boolean",
+            "description": "A strip channel is currently active"
+          },
+          "hardware": {
+            "type": "object",
+            "description": "Configured (NVS) strip hardware, present even when the strip is disabled",
+            "properties": {
+              "has_leds": {
+                "type": "boolean"
+              },
+              "led_count": {
+                "type": "integer"
+              },
+              "ic_type": {
+                "type": "integer",
+                "description": "0=ws2812, 1=sk6812, 2=fw1906"
+              },
+              "format": {
+                "type": "integer",
+                "description": "3=rgb, 4=rgbw, 5=rgbcct"
+              },
+              "color_order": {
+                "type": "integer",
+                "description": "0=rgb..5=bgr"
+              },
+              "white_swap": {
+                "type": "boolean"
+              }
             }
           }
         }
@@ -1728,7 +1800,9 @@
           },
           "speed": {
             "type": "integer",
-            "description": "Effect animation speed"
+            "minimum": 1,
+            "maximum": 10,
+            "description": "Effect animation speed (1-10)"
           },
           "on": {
             "type": "boolean",
@@ -1767,7 +1841,9 @@
           },
           "speed": {
             "type": "integer",
-            "description": "Effect animation speed"
+            "minimum": 1,
+            "maximum": 10,
+            "description": "Effect animation speed (1-10; clamped)"
           },
           "on": {
             "type": "boolean",
@@ -1789,7 +1865,8 @@
             "maximum": 255,
             "description": "Cool white level (RGBCCT channels only)"
           }
-        }
+        },
+        "description": "Partial update: only the fields present are applied. Every change is pushed to all WebSocket clients (and the cloud) as an LEDConfig snapshot."
       },
       "SystemInfo": {
         "type": "object",
@@ -1812,6 +1889,26 @@
           },
           "free_heap": {
             "type": "integer"
+          },
+          "is_homing": {
+            "type": "boolean",
+            "description": "A homing/calibration run is in progress"
+          },
+          "free_psram": {
+            "type": "integer",
+            "description": "Free PSRAM (bytes)"
+          },
+          "uptime_s": {
+            "type": "integer",
+            "description": "Seconds since boot"
+          },
+          "wifi_rssi": {
+            "type": "integer",
+            "description": "Wi-Fi RSSI in dBm (0 when not associated)"
+          },
+          "ip_address": {
+            "type": "string",
+            "description": "Current IPv4 address (empty when none)"
           }
         }
       },
@@ -1832,6 +1929,10 @@
           },
           "error": {
             "type": "string"
+          },
+          "started": {
+            "type": "boolean",
+            "description": "True when the homing run was started (it completes asynchronously)"
           }
         }
       },
@@ -1853,7 +1954,8 @@
             "type": "integer"
           },
           "rho_max_rpm": {
-            "type": "integer"
+            "type": "integer",
+            "description": "Default path speed (units/min) new patterns start at"
           },
           "theta_current_ma": {
             "type": "integer"
@@ -1862,13 +1964,41 @@
             "type": "integer"
           },
           "stallguard_threshold": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 255,
+            "description": "Sensorless-homing StallGuard threshold; applied to the driver immediately"
+          },
+          "accel_steps_s2": {
+            "type": "integer",
+            "minimum": 500,
+            "maximum": 100000,
+            "description": "Per-motor step acceleration (steps/s^2). Applied live to the next segment."
+          },
+          "junction_dv_steps_s": {
+            "type": "integer",
+            "minimum": 10,
+            "maximum": 5000,
+            "description": "Max per-axis step-rate jump at a segment junction (steps/s). Applied live."
+          },
+          "theta_max_rot_per_min": {
+            "type": "number",
+            "minimum": 0.5,
+            "maximum": 60,
+            "description": "Theta spin-rate safety cap (rotations/min). Applied live."
+          },
+          "motor_idle_timeout_s": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 86400,
+            "description": "De-energize the motors after this many idle seconds; 0 = never. Applied live."
           }
-        }
+        },
+        "description": "Runtime motion config (NVS-backed). Currents, StallGuard and the shaping knobs apply live; steps_per_rev / microsteps take effect after a reboot + re-home (the calibration is expressed in those steps)."
       },
       "LEDHardwareConfig": {
         "type": "object",
-        "description": "Runtime LED strip config (NVS-backed). Strip type/layout changes take effect on reboot. Also settable over the device console via `led_config`.",
+        "description": "Runtime LED strip config (NVS-backed). Changes apply immediately: the strip is torn down and rebuilt with the new count/IC/format/order (no reboot). Prefer the string names for ic_type/format/color_order; the numeric `format` codes are the firmware's own (3=rgb, 4=rgbw, 5=rgbcct), NOT the protobuf LEDFormat enum. Also settable over the device console via `led_config`.",
         "properties": {
           "has_leds": {
             "type": "boolean"
@@ -1883,17 +2013,32 @@
           },
           "ic_type": {
             "type": "string",
-            "enum": ["ws2812", "sk6812", "fw1906"],
+            "enum": [
+              "ws2812",
+              "sk6812",
+              "fw1906"
+            ],
             "description": "LED controller IC family. FW1906 is a 5-channel (RGB + dual white) IC. Accepts the raw int code (0/1/2) on PATCH."
           },
           "format": {
             "type": "string",
-            "enum": ["rgb", "rgbw", "rgbcct"],
+            "enum": [
+              "rgb",
+              "rgbw",
+              "rgbcct"
+            ],
             "description": "Color channels per pixel: rgb=3, rgbw=4 (single white), rgbcct=5 (warm+cool white). Accepts the raw int code (3/4/5) on PATCH."
           },
           "color_order": {
             "type": "string",
-            "enum": ["rgb", "rbg", "grb", "gbr", "brg", "bgr"],
+            "enum": [
+              "rgb",
+              "rbg",
+              "grb",
+              "gbr",
+              "brg",
+              "bgr"
+            ],
             "description": "Wire order of the R/G/B bytes. Accepts the raw int code (0-5) on PATCH."
           },
           "white_swap": {
@@ -1934,6 +2079,17 @@
           },
           "active_preset_id": {
             "type": "string"
+          },
+          "is_homed": {
+            "type": "boolean"
+          },
+          "led_applied": {
+            "type": "boolean",
+            "description": "PATCH / preset responses: the LED strip was rebuilt live"
+          },
+          "reboot_required": {
+            "type": "boolean",
+            "description": "PATCH / preset responses: steps_per_rev or microsteps changed; reboot + re-home to take effect"
           }
         }
       },

@@ -857,31 +857,14 @@ namespace sand_table {
         const float max_step_rate = static_cast<float>(HardwareConfig::MAX_STEP_RATE_HZ);
         const float min_step_rate = 31.0f;  // Limited by RMT symbol duration at 1 MHz
 
-        // For coordinated motion, use velocity from motors that are actually moving
-        // If both move, use minimum (so deceleration happens if either needs to slow)
-        // If only one moves, use that motor's velocity
+        // One entry/exit pair in path units: both motors share this one
+        // time base (the interval table drives the major axis, Bresenham
+        // interleaves the minor), so the planner emits a single scalar
+        // junction speed — per-axis continuity was already enforced there
+        // (VelocityPlanner's junction jump limit).
         const bool theta_moves = segment.delta_theta_steps != 0;
-        const bool rho_moves = segment.delta_rho_steps != 0;
-
-        float entry_rpm, exit_rpm;
-        if (theta_moves && rho_moves) {
-            // Both moving: use minimum so either motor can request deceleration
-            entry_rpm = std::min(segment.theta_entry_velocity, segment.rho_entry_velocity);
-            exit_rpm = std::min(segment.theta_exit_velocity, segment.rho_exit_velocity);
-        }
-        else if (theta_moves) {
-            entry_rpm = segment.theta_entry_velocity;
-            exit_rpm = segment.theta_exit_velocity;
-        }
-        else if (rho_moves) {
-            entry_rpm = segment.rho_entry_velocity;
-            exit_rpm = segment.rho_exit_velocity;
-        }
-        else {
-            // Neither moves - shouldn't happen, but handle gracefully
-            entry_rpm = 0.0f;
-            exit_rpm = 0.0f;
-        }
+        float entry_rpm = segment.entry_velocity;
+        float exit_rpm = segment.exit_velocity;
 
         // Safety cap applied AFTER feedrate: bound the physical theta spin
         // rate regardless of what path speed was requested. Path speed v
@@ -894,7 +877,7 @@ namespace sand_table {
             const float rotations = std::fabs(static_cast<float>(segment.delta_theta_rad)) /
                 (2.0f * static_cast<float>(M_PI));
             if (rotations > 1e-6f) {
-                const float v_cap = MotionConfig::THETA_MAX_ROT_PER_MIN *
+                const float v_cap = MotionConfig::theta_max_rot_per_min() *
                     segment.distance / rotations;
                 entry_rpm = std::min(entry_rpm, v_cap);
                 exit_rpm = std::min(exit_rpm, v_cap);
@@ -926,8 +909,8 @@ namespace sand_table {
             nominal_steps_s = max_step_rate;
         }
 
-        // Acceleration in steps/s^2 (single tunable, see config.h)
-        const float accel_steps_s2 = MotionConfig::STEP_ACCEL_STEPS_S2;
+        // Acceleration in steps/s^2 (runtime tunable, see config.h)
+        const float accel_steps_s2 = static_cast<float>(MotionConfig::accel_steps_s2());
 
         // Calculate distances (in steps) for acceleration and deceleration
         // Using kinematic equation: v^2 = v0^2 + 2*a*d  =>  d = (v^2 - v0^2) / (2*a)
@@ -1067,7 +1050,7 @@ namespace sand_table {
             const float rotations = std::fabs(static_cast<float>(segment.delta_theta_rad)) /
                 (2.0f * static_cast<float>(M_PI));
             if (rotations > 1e-6f) {
-                const float v_cap = MotionConfig::THETA_MAX_ROT_PER_MIN *
+                const float v_cap = MotionConfig::theta_max_rot_per_min() *
                     segment.distance / rotations;
                 scale_ceiling = std::max(1.0f,
                     v_cap / std::min(segment.nominal_velocity, v_cap));

@@ -1,5 +1,6 @@
 // Unified LED control handler implementation
 #include "led_handler.h"
+#include "led_state.h"
 #include "kd_pixdriver.h"
 #include "pixel_effects.h"
 
@@ -55,55 +56,7 @@ std::vector<Kd__V1__TranquilMessage__MessageCase> LEDHandler::supportedMessages(
 }
 
 HandleResult LEDHandler::handleLEDConfigRequest(ResponseMessage& response) {
-    // Locals, not statics: httpd and the cloudlink task can run handlers
-    // concurrently; shared static protobuf state races during serialize.
-    Kd__V1__LEDConfig config = KD__V1__LEDCONFIG__INIT;
-    char version[32] = "1.0";
-
-    std::vector<int32_t> channel_ids = PixelDriver::getChannelIds();
-    bool has_leds = !channel_ids.empty();
-    uint32_t total_leds = 0;
-    Kd__V1__LEDFormat format = KD__V1__LEDFORMAT__LED_FORMAT_UNSPECIFIED;
-
-    for (int32_t id : channel_ids) {
-        const PixelChannel* ch = PixelDriver::getChannel(id);
-        if (ch) {
-            ChannelConfig cfg = ch->getConfig();
-            total_leds += cfg.pixel_count;
-            switch (cfg.format) {
-                case PixelFormat::RGB:
-                    format = KD__V1__LEDFORMAT__LED_FORMAT_RGB;
-                    break;
-                case PixelFormat::RGBW:
-                    format = KD__V1__LEDFORMAT__LED_FORMAT_RGBW;
-                    break;
-                case PixelFormat::RGBCCT:
-                    format = KD__V1__LEDFORMAT__LED_FORMAT_RGBCCT;
-                    break;
-            }
-        }
-    }
-
-    config.has_leds = has_leds;
-    config.led_count = total_leds;
-    // Legacy flag for old clients; format is the authoritative field. The
-    // field is marked deprecated in the proto - we still populate it on
-    // purpose, so silence the self-inflicted warning.
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-    config.is_rgbw = (format == KD__V1__LEDFORMAT__LED_FORMAT_RGBW);
-#pragma GCC diagnostic pop
-    config.format = format;
-    config.pixdriver_version = version;
-
-    ESP_LOGI(TAG, "LEDConfigRequest: has_leds=%d, count=%u, format=%d",
-        has_leds, total_leds, static_cast<int>(format));
-
-    Kd__V1__TranquilMessage resp = KD__V1__TRANQUIL_MESSAGE__INIT;
-    resp.message_case = KD__V1__TRANQUIL_MESSAGE__MESSAGE_LED_CONFIG;
-    resp.led_config = &config;
-
-    response = serialize(&resp);
+    response = led_state::build_config_message();
     return HandleResult::ok();
 }
 
@@ -116,45 +69,47 @@ HandleResult LEDHandler::handleSetLEDChannel(
         return HandleResult::ok();
     }
 
-    PixelChannel* ch = PixelDriver::getChannel(msg->channel);
-    if (!ch) {
+    // Partial update: proto3 `optional` fields carry presence (protobuf-c
+    // exposes it as the synthetic *_case), effect_id "" = unchanged, absent
+    // color = unchanged. So a cloud "power on" no longer zeroes brightness.
+    led_state::ChannelPatch patch;
+    if (msg->effect_id && msg->effect_id[0]) patch.effect_id = std::string(msg->effect_id);
+    if (msg->_brightness_case == KD__V1__SET_LEDCHANNEL___BRIGHTNESS_BRIGHTNESS) {
+        patch.brightness = static_cast<uint8_t>(msg->brightness > 255 ? 255 : msg->brightness);
+    }
+    if (msg->_speed_case == KD__V1__SET_LEDCHANNEL___SPEED_SPEED) {
+        patch.speed = static_cast<uint8_t>(msg->speed > 10 ? 10 : (msg->speed < 1 ? 1 : msg->speed));
+    }
+    if (msg->_enabled_case == KD__V1__SET_LEDCHANNEL___ENABLED_ENABLED) {
+        patch.enabled = msg->enabled;
+    }
+    if (msg->color) {
+        patch.color = PixelColor(
+            static_cast<uint8_t>(msg->color->r), static_cast<uint8_t>(msg->color->g),
+            static_cast<uint8_t>(msg->color->b), static_cast<uint8_t>(msg->color->w),
+            static_cast<uint8_t>(msg->color->cw));
+    }
+
+    if (!led_state::apply_channel_patch(msg->channel, patch)) {
         ESP_LOGW(TAG, "SetLEDChannel: channel %u not found", msg->channel);
         response = makeCommandResult(false, "Channel not found");
         return HandleResult::ok();
     }
 
-    EffectConfig eff_cfg = ch->getEffectConfig();
+    ESP_LOGI(TAG, "SetLEDChannel: ch=%u", msg->channel);
 
-    // Update effect config from message
-    if (msg->effect_id && strlen(msg->effect_id) > 0) {
-        eff_cfg.effect = msg->effect_id;
-    }
-    eff_cfg.brightness = msg->brightness;
-    eff_cfg.speed = msg->speed;
-    eff_cfg.enabled = msg->enabled;
-
-    if (msg->color) {
-        eff_cfg.color.r = msg->color->r;
-        eff_cfg.color.g = msg->color->g;
-        eff_cfg.color.b = msg->color->b;
-        eff_cfg.color.w = msg->color->w;    // single white (RGBW) / warm (RGBCCT)
-        eff_cfg.color.cw = msg->color->cw;  // cool white (RGBCCT)
-    }
-
-    ch->setEffect(eff_cfg);
-
-    ESP_LOGI(TAG, "SetLEDChannel: ch=%u effect=%s bright=%u enabled=%d",
-        msg->channel, eff_cfg.effect.c_str(), eff_cfg.brightness, eff_cfg.enabled);
-
+    // Requester gets the CommandResult; the resulting LEDConfig snapshot
+    // reaches LAN clients and the cloud through led_state::notify_changed().
     response = makeCommandResult(true);
-    return HandleResult::ok(true);  // Broadcast to locals
+    return HandleResult::ok();
 }
 
 HandleResult LEDHandler::handleGetLEDEffects(ResponseMessage& response) {
     PixelEffectEngine* effect_engine = PixelDriver::getEffectEngine();
-    std::vector<PixelEffectEngine::EffectInfo> effects = effect_engine->getAllEffects();
+    std::vector<PixelEffectEngine::EffectInfo> effects =
+        effect_engine ? effect_engine->getAllEffects() : std::vector<PixelEffectEngine::EffectInfo>{};
 
-    ESP_LOGI(TAG, "GetLEDEffects: returning %zu effects", effects.size());
+    ESP_LOGD(TAG, "GetLEDEffects: returning %zu effects", effects.size());
 
     // Locals, not statics: concurrent handler tasks resizing shared static
     // vectors double-free their backing stores.

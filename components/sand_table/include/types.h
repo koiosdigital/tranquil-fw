@@ -127,13 +127,14 @@ namespace sand_table {
         // Normalized distance (for velocity planning)
         float distance = 0.0f;
 
-        // Velocity profile - set by lookahead (per-motor, independent)
-        // Each motor has its own entry/exit velocities - only slows when that motor reverses
-        float theta_entry_velocity = 0.0f;   // RPM
-        float theta_exit_velocity = 0.0f;    // RPM
-        float rho_entry_velocity = 0.0f;     // RPM
-        float rho_exit_velocity = 0.0f;      // RPM
-        float nominal_velocity = 0.0f;       // RPM (shared nominal/cruise target)
+        // Velocity profile - set by lookahead planning. One scalar speed per
+        // boundary: the executor drives both motors off a single time base
+        // (major-axis interval table, Bresenham interleaves the minor axis),
+        // so per-axis continuity is enforced by the PLANNER when it picks
+        // these junction speeds (see VelocityPlanner's junction model).
+        float entry_velocity = 0.0f;         // path units/min at segment start
+        float exit_velocity = 0.0f;          // path units/min at segment end
+        float nominal_velocity = 0.0f;       // path units/min cruise target
 
         // The user feedrate this segment was planned at, WITHOUT transient
         // boosts (transit multipliers). The executor scales step intervals

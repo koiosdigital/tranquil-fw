@@ -635,26 +635,38 @@ PlayMode SandTablePlayer::getPlayMode() {
 }
 
 PlaybackStatus SandTablePlayer::getStatus() {
+    // Last consistent snapshot, returned when the lock is busy so callers
+    // (the 100 ms state broadcaster in particular) never see a half-filled
+    // status and broadcast a bogus "nothing playing".
+    static PlaybackStatus last_good;
+    static portMUX_TYPE last_good_lock = portMUX_INITIALIZER_UNLOCKED;
+
     PlaybackStatus status;
     // Reading the uuid buffers / playlist vector while another task mutates
     // them under state_mutex_ is a data race — snapshot under the mutex.
     raii::MutexGuard guard(state_mutex_, pdMS_TO_TICKS(100));
+    if (!guard) {
+        portENTER_CRITICAL(&last_good_lock);
+        status = last_good;
+        portEXIT_CRITICAL(&last_good_lock);
+        status.valid = false;
+        return status;
+    }
     status.state = playback_state_;
     status.mode = play_mode_;
-    if (guard) {
-        status.current_pattern_uuid = current_pattern_uuid_;
-        status.current_playlist_uuid = current_playlist_uuid_;
-        status.pattern_index = playlist_index_;
-        status.playlist_size = playlist_patterns_.size();
-    }
-    else {
-        status.pattern_index = 0;
-        status.playlist_size = 0;
-    }
+    status.current_pattern_uuid = current_pattern_uuid_;
+    status.current_playlist_uuid = current_playlist_uuid_;
+    status.pattern_index = playlist_index_;
+    status.playlist_size = playlist_patterns_.size();
     status.progress_percent = getTotalProgress();
     status.feed_rate = feed_rate_;
     status.is_shuffle = is_shuffle_;
     status.is_loop = is_loop_;
+    status.valid = true;
+
+    portENTER_CRITICAL(&last_good_lock);
+    last_good = status;
+    portEXIT_CRITICAL(&last_good_lock);
     return status;
 }
 

@@ -1,5 +1,7 @@
 // Schedule manager implementation
 #include "schedule_manager.h"
+#include "led_state.h"
+#include <freertos/task.h>
 #include "SandTablePlayer.h"
 #include "ManifestDatabase.h"
 #include "kd_pixdriver.h"
@@ -23,6 +25,8 @@ ScheduleManager& ScheduleManager::instance() {
 
 esp_err_t ScheduleManager::init() {
     if (initialized_) return ESP_OK;
+
+    if (!mutex_) mutex_ = xSemaphoreCreateMutex();
 
     // Load saved schedule
     esp_err_t ret = loadSchedule();
@@ -71,33 +75,78 @@ void ScheduleManager::shutdown() {
     ESP_LOGI(TAG, "Schedule manager shutdown");
 }
 
+namespace {
+struct Lock {
+    SemaphoreHandle_t m;
+    explicit Lock(SemaphoreHandle_t mutex) : m(mutex) { if (m) xSemaphoreTake(m, portMAX_DELAY); }
+    ~Lock() { if (m) xSemaphoreGive(m); }
+};
+
+// Reaches HandlerBase::serialize() (protected) for the packed Schedule push.
+struct Packer : HandlerBase {
+    HandleResult handle(const Kd__V1__TranquilMessage*, const MessageContext&, ResponseMessage&) override {
+        return HandleResult::notHandled();
+    }
+    bool canHandle(Kd__V1__TranquilMessage__MessageCase) const override { return false; }
+    std::vector<Kd__V1__TranquilMessage__MessageCase> supportedMessages() const override { return {}; }
+    static ResponseMessage pack(const Kd__V1__TranquilMessage* msg) { return serialize(msg); }
+};
+}  // namespace
+
+std::vector<ScheduleItem> ScheduleManager::getSchedule() const {
+    Lock lock(mutex_);
+    return schedule_;
+}
+
+ResponseMessage ScheduleManager::buildScheduleMessage() const {
+    Kd__V1__TranquilSchedule schedule_proto;
+    std::vector<Kd__V1__TranquilScheduleItem> items_storage;
+    std::vector<Kd__V1__TranquilScheduleItem*> item_ptrs;
+    std::vector<Kd__V1__ScheduleAction> actions_storage;
+    toProto(&schedule_proto, items_storage, item_ptrs, actions_storage);
+
+    Kd__V1__TranquilMessage msg = KD__V1__TRANQUIL_MESSAGE__INIT;
+    msg.message_case = KD__V1__TRANQUIL_MESSAGE__MESSAGE_SCHEDULE;
+    msg.schedule = &schedule_proto;
+    return Packer::pack(&msg);
+}
+
 esp_err_t ScheduleManager::setSchedule(const std::vector<ScheduleItem>& items) {
-    schedule_ = items;
+    {
+        Lock lock(mutex_);
+        schedule_ = items;
 
-    // Sort by time for efficient checking
-    std::sort(schedule_.begin(), schedule_.end(),
-        [](const ScheduleItem& a, const ScheduleItem& b) {
-            return a.time_of_day < b.time_of_day;
-        });
+        // Sort by time for efficient checking
+        std::sort(schedule_.begin(), schedule_.end(),
+            [](const ScheduleItem& a, const ScheduleItem& b) {
+                return a.time_of_day < b.time_of_day;
+            });
+    }
 
-    ESP_LOGI(TAG, "Schedule set with %zu items", schedule_.size());
+    ESP_LOGI(TAG, "Schedule set with %zu items", items.size());
     return saveSchedule();
 }
 
 esp_err_t ScheduleManager::addItem(const ScheduleItem& item) {
-    schedule_.push_back(item);
+    {
+        Lock lock(mutex_);
+        schedule_.push_back(item);
 
-    // Re-sort
-    std::sort(schedule_.begin(), schedule_.end(),
-        [](const ScheduleItem& a, const ScheduleItem& b) {
-            return a.time_of_day < b.time_of_day;
-        });
+        // Re-sort
+        std::sort(schedule_.begin(), schedule_.end(),
+            [](const ScheduleItem& a, const ScheduleItem& b) {
+                return a.time_of_day < b.time_of_day;
+            });
+    }
 
     return saveSchedule();
 }
 
 esp_err_t ScheduleManager::clearSchedule() {
-    schedule_.clear();
+    {
+        Lock lock(mutex_);
+        schedule_.clear();
+    }
     return saveSchedule();
 }
 
@@ -226,8 +275,17 @@ bool ScheduleManager::getCurrentTime(int& day_of_week, uint32_t& seconds_since_m
     return true;
 }
 
+void ScheduleManager::actionTask(void* arg) {
+    auto* item = static_cast<ScheduleItem*>(arg);
+    ScheduleManager::instance().executeAction(*item);
+    delete item;
+    vTaskDelete(nullptr);
+}
+
 void ScheduleManager::checkAndExecute() {
-    if (schedule_.empty()) return;
+    // Snapshot: the live vector is replaced from httpd / cloudlink tasks.
+    std::vector<ScheduleItem> schedule = getSchedule();
+    if (schedule.empty()) return;
 
     int day_of_week;
     uint32_t current_time;
@@ -238,7 +296,7 @@ void ScheduleManager::checkAndExecute() {
     }
 
     // Find matching schedule items
-    for (const auto& item : schedule_) {
+    for (const auto& item : schedule) {
         // Check if this item matches today
         if (!item.matches_day(day_of_week)) continue;
 
@@ -257,7 +315,13 @@ void ScheduleManager::checkAndExecute() {
             (item.time_of_day % 3600) / 60,
             item.time_of_day % 60);
 
-        executeAction(item);
+        // Off the esp_timer task: play() loads a file from SD and drains
+        // motion (seconds), and the timer task has a 4 KB stack.
+        auto* copy = new ScheduleItem(item);
+        if (xTaskCreate(actionTask, "sched_act", 6144, copy, 4, nullptr) != pdPASS) {
+            ESP_LOGE(TAG, "Failed to spawn schedule action task");
+            delete copy;
+        }
 
         last_executed_day_ = day_of_week;
         last_executed_time_ = item.time_of_day;
@@ -267,28 +331,20 @@ void ScheduleManager::checkAndExecute() {
 void ScheduleManager::executeAction(const ScheduleItem& item) {
     switch (item.action_type) {
         case KD__V1__SCHEDULE_ACTION__SCHEDULE_ACTION_TYPE__SCHEDULE_ACTION_TYPE_LED_OFF: {
-            auto channel_ids = PixelDriver::getChannelIds();
-            for (int32_t id : channel_ids) {
-                PixelChannel* ch = PixelDriver::getChannel(id);
-                if (ch) {
-                    EffectConfig cfg = ch->getEffectConfig();
-                    cfg.enabled = false;
-                    ch->setEffect(cfg);
-                }
+            for (size_t i = 0; i < led_state::channel_count(); i++) {
+                led_state::ChannelPatch patch;
+                patch.enabled = false;
+                led_state::apply_channel_patch(i, patch);
             }
             ESP_LOGI(TAG, "Scheduled: LED off");
             break;
         }
 
         case KD__V1__SCHEDULE_ACTION__SCHEDULE_ACTION_TYPE__SCHEDULE_ACTION_TYPE_LED_ON: {
-            auto channel_ids = PixelDriver::getChannelIds();
-            for (int32_t id : channel_ids) {
-                PixelChannel* ch = PixelDriver::getChannel(id);
-                if (ch) {
-                    EffectConfig cfg = ch->getEffectConfig();
-                    cfg.enabled = true;
-                    ch->setEffect(cfg);
-                }
+            for (size_t i = 0; i < led_state::channel_count(); i++) {
+                led_state::ChannelPatch patch;
+                patch.enabled = true;
+                led_state::apply_channel_patch(i, patch);
             }
             ESP_LOGI(TAG, "Scheduled: LED on");
             break;
@@ -367,6 +423,7 @@ void ScheduleManager::toProto(
     item_ptrs.clear();
     actions_storage.clear();
 
+    Lock lock(mutex_);
     items_storage.resize(schedule_.size());
     actions_storage.resize(schedule_.size());
     item_ptrs.reserve(schedule_.size());

@@ -132,6 +132,10 @@ bool cloud_sockets_is_connected() {
     return koios_cloudlink_is_connected();
 }
 
+bool cloud_sockets_is_ready() {
+    return koios_cloudlink_is_ready();
+}
+
 size_t cloud_sockets_max_msg_size() {
     return MAX_MSG_SIZE;
 }

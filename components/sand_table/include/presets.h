@@ -33,6 +33,10 @@ inline constexpr Preset kPresetTranquil4Tabletop = {
         .theta_current_ma = 400,
         .rho_current_ma = 400,
         .stallguard_threshold = 30,
+        .accel_steps_s2 = 10000,
+        .junction_dv_steps_s = 250,
+        .theta_max_rot_per_min = 12.0f,
+        .motor_idle_timeout_s = 30,
     },
     .led = {
         .has_leds = true,
@@ -57,6 +61,10 @@ inline constexpr Preset kPresetTranquil4Coffee = {
         .theta_current_ma = 500,
         .rho_current_ma = 500,
         .stallguard_threshold = 25,
+        .accel_steps_s2 = 8000,
+        .junction_dv_steps_s = 200,
+        .theta_max_rot_per_min = 8.0f,
+        .motor_idle_timeout_s = 30,
     },
     .led = {
         .has_leds = true,

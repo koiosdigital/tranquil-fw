@@ -16,7 +16,6 @@
 #include "kd_common.h"
 #include "kd_api.h"
 #include "kdc_heap_tracing.h"
-#include "kd_pixdriver.h"
 #include "cJSON.h"
 
 #include "sand_table.h"
@@ -37,8 +36,11 @@
 #include "storage/jobs/download_executor.h"
 #include "PatternDownloader.h"
 #include "pattern_handler.h"
+#include "homing_service.h"
 #include "download_progress.h"
 #include "pipeline_progress.h"
+#include "library_notifier.h"
+#include "led/led_runtime.h"
 
 #include <koios/ota.h>
 
@@ -100,6 +102,11 @@ extern "C" void app_main(void)
             PatternHandler::instance().notifyPatternDownloadComplete(
                 job.pattern_external_uuid, result.success);
         }
+        // A finished conversion means an uploaded pattern just became
+        // playable: push the list so clients (and the cloud cache) see it.
+        if (job.type == jobs::JobType::Conversion && result.success) {
+            library_notifier::patterns_changed();
+        }
         // A final failure anywhere in the download→conversion→thumbnail chain
         // ends the pipeline. Emit a terminal signal so clients clear their UI
         // instead of leaving a spinner stuck at the last percent.
@@ -157,42 +164,17 @@ extern "C" void app_main(void)
 
     SandTablePlayer::initialize(g_motion_controller);
 
-    // Initialize LED driver using runtime config from NVS
-    const auto& led_config = sand_table::ConfigManager::instance().led_config();
-
-    if (led_config.has_leds && led_config.led_count > 0) {
-        PixelDriver::initialize(60);
-
-        // Map the NVS-persisted strip config (small int codes) to the driver
-        // enums. Values are validated on entry, but clamp defensively.
-        const uint8_t fmt_code = (led_config.format >= 3 && led_config.format <= 5)
-            ? led_config.format : 3;
-        const PixelFormat format = static_cast<PixelFormat>(fmt_code);
-        const LedICType ic_type = (led_config.ic_type <= 2)
-            ? static_cast<LedICType>(led_config.ic_type) : LedICType::WS2812;
-        const ColorOrder color_order = (led_config.color_order <= 5)
-            ? static_cast<ColorOrder>(led_config.color_order) : ColorOrder::GRB;
-
-        // LED pin stays in sdkconfig (hardware config); strip type/layout is
-        // runtime config from NVS (console: `led_config`, REST: /api/config).
-        PixelDriver::addChannel(ChannelConfig(
-            (gpio_num_t)CONFIG_LED_PIN, led_config.led_count, format, "",
-            ic_type, color_order, led_config.white_swap));
-        PixelDriver::setCurrentLimit(1750);
-        PixelDriver::start();
-
-        // Route registration through the kd_common wrapper so the CORS
-        // pre-handler applies to the LED routes too.
-        kd_common_api_register_handlers([](httpd_handle_t server) {
-            PixelDriver::attach_api(server, kd_common_api_register_uri_handler);
-            });
-    }
+    // LED strip from the NVS config. The driver + REST API are always up so
+    // the strip can be (re)configured live from the settings page; the
+    // channel is only created when LEDs are enabled.
+    led_runtime::init();
 
     tranquil_api_init();
     cloud_sockets_init();
 
-    auto ret = g_motion_controller->home();
-    if (ret.is_err()) {
-        ESP_LOGE(TAG, "Failed to home motion controller");
+    // Boot homing runs on the homing task, not app_main: the LAN/cloud
+    // surfaces come up immediately instead of after the seek completes.
+    if (homing_service::start(false) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start boot homing");
     }
 }

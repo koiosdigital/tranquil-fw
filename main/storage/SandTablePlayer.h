@@ -66,6 +66,10 @@ struct PlaybackStatus {
     double feed_rate;
     bool is_shuffle;
     bool is_loop;
+    // False when the snapshot could not be taken under the state lock (a
+    // play() is loading a file). Fields are then the LAST consistent
+    // snapshot, never a half-filled one.
+    bool valid = true;
 };
 
 class SandTablePlayer {

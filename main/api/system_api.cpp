@@ -1,14 +1,14 @@
-// System REST API: device info, homing, factory reset.
+// System REST API: device info, homing, reboot, factory reset.
 #include "system_api.h"
 #include "api_common.h"
+#include "system_info.h"
+#include "homing_service.h"
 #include "SandTablePlayer.h"
 #include "factory_reset.h"
 
 #include <esp_log.h>
-#include <esp_app_desc.h>
 #include <esp_system.h>
 #include <esp_timer.h>
-#include <kd_common.h>
 
 static const char* TAG = "system_api";
 
@@ -16,46 +16,34 @@ using namespace api_common;
 
 // GET /api/system/info
 static esp_err_t system_info_handler(httpd_req_t* req) {
-    const esp_app_desc_t* app_desc = esp_app_get_description();
-    const char* device_id = kd_common_get_device_name();
-    const char* hostname = kd_common_get_wifi_hostname();
+    system_info::Snapshot s;
+    system_info::snapshot(s);
 
     httpd_resp_set_type(req, "application/json");
     ChunkBuf cb;
     chunk_buf_init(&cb, req);
     chunk_buf_write_str(&cb, "{\"firmware_version\":");
-    chunk_buf_write_json_string(&cb, app_desc->version);
-    chunk_buf_write_str(&cb, ",\"hardware_model\":\"tranquil\",\"device_id\":");
-    chunk_buf_write_json_string(&cb, device_id ? device_id : "");
+    chunk_buf_write_json_string(&cb, s.firmware_version);
+    chunk_buf_write_str(&cb, ",\"hardware_model\":");
+    chunk_buf_write_json_string(&cb, s.hardware_model);
+    chunk_buf_write_str(&cb, ",\"device_id\":");
+    chunk_buf_write_json_string(&cb, s.device_id);
     chunk_buf_write_str(&cb, ",\"hostname\":");
-    chunk_buf_write_json_string(&cb, hostname ? hostname : "");
-    chunk_buf_printf(&cb, ",\"is_homed\":%s,\"free_heap\":%lu}",
-        SandTablePlayer::isHomed() ? "true" : "false",
-        (unsigned long)esp_get_free_heap_size());
+    chunk_buf_write_json_string(&cb, s.hostname);
+    chunk_buf_write_str(&cb, ",\"ip_address\":");
+    chunk_buf_write_json_string(&cb, s.ip_address);
+    chunk_buf_printf(&cb, ",\"is_homed\":%s,\"is_homing\":%s,\"free_heap\":%lu,\"free_psram\":%lu,",
+        s.is_homed ? "true" : "false", s.is_homing ? "true" : "false",
+        (unsigned long)s.free_heap, (unsigned long)s.free_psram);
+    chunk_buf_printf(&cb, "\"uptime_s\":%lu,\"wifi_rssi\":%ld}",
+        (unsigned long)s.uptime_s, (long)s.wifi_rssi);
     chunk_buf_finish(&cb);
     return ESP_OK;
 }
 
-static const char* motion_error_to_string(sand_table::MotionError err) {
-    switch (err) {
-        case sand_table::MotionError::None: return "None";
-        case sand_table::MotionError::NotHomed: return "Not homed";
-        case sand_table::MotionError::OutOfBounds: return "Out of bounds";
-        case sand_table::MotionError::QueueFull: return "Queue full";
-        case sand_table::MotionError::QueueEmpty: return "Queue empty";
-        case sand_table::MotionError::InvalidState: return "Invalid state";
-        case sand_table::MotionError::HardwareFault: return "Hardware fault";
-        case sand_table::MotionError::StallDetected: return "Stall detected";
-        case sand_table::MotionError::Timeout: return "Timeout";
-        case sand_table::MotionError::HomingFailed: return "Homing failed";
-        case sand_table::MotionError::EmergencyStop: return "Emergency stop";
-        default: return "Unknown error";
-    }
-}
-
 // POST /api/system/home - body optional: {"force_full_calibration": bool}
-// Runs the homing sequence synchronously (same semantics as the WS handler);
-// progress/state updates reach clients via the player state broadcast.
+// Starts the homing run on its own task and returns immediately; poll
+// GET /api/system/info (is_homing / is_homed) or watch the SystemInfo push.
 static esp_err_t system_home_handler(httpd_req_t* req) {
     bool force_full = false;
     if (req->content_len > 0) {
@@ -68,34 +56,55 @@ static esp_err_t system_home_handler(httpd_req_t* req) {
 
     ESP_LOGI(TAG, "Home request (force_full=%d)", force_full);
 
-    auto* motion_controller = SandTablePlayer::getMotionController();
-    if (!motion_controller) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Motion controller not initialized");
-        return ESP_FAIL;
+    esp_err_t err = homing_service::start(force_full);
+    httpd_resp_set_type(req, "application/json");
+    if (err == ESP_ERR_INVALID_STATE) {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_sendstr(req, "{\"success\":false,\"error\":\"Homing already in progress\"}");
+        return ESP_OK;
     }
-
-    auto result = motion_controller->home(force_full);
-    if (result.is_err()) {
-        httpd_resp_set_type(req, "application/json");
+    if (err != ESP_OK) {
         httpd_resp_set_status(req, "500 Internal Server Error");
-        ChunkBuf cb;
-        chunk_buf_init(&cb, req);
-        chunk_buf_write_str(&cb, "{\"success\":false,\"error\":");
-        chunk_buf_write_json_string(&cb, motion_error_to_string(result.error()));
-        chunk_buf_write_str(&cb, "}");
-        chunk_buf_finish(&cb);
+        httpd_resp_sendstr(req, "{\"success\":false,\"error\":\"Failed to start homing\"}");
         return ESP_OK;
     }
 
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, "{\"success\":true}");
+    httpd_resp_set_status(req, "202 Accepted");
+    httpd_resp_sendstr(req, "{\"success\":true,\"started\":true}");
     return ESP_OK;
 }
 
 static void restart_timer_callback(void* arg) {
     (void)arg;
-    ESP_LOGW(TAG, "Restarting device after factory reset...");
+    ESP_LOGW(TAG, "Restarting device...");
     esp_restart();
+}
+
+static void schedule_restart(uint32_t delay_ms) {
+    esp_timer_handle_t restart_timer;
+    esp_timer_create_args_t timer_args = {
+        .callback = restart_timer_callback,
+        .arg = nullptr,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "restart",
+    };
+    if (esp_timer_create(&timer_args, &restart_timer) == ESP_OK) {
+        esp_timer_start_once(restart_timer, static_cast<uint64_t>(delay_ms) * 1000);
+        ESP_LOGI(TAG, "Device will restart in %lums", static_cast<unsigned long>(delay_ms));
+    }
+    else {
+        ESP_LOGW(TAG, "Failed to create restart timer, restarting immediately");
+        esp_restart();
+    }
+}
+
+// POST /api/system/reboot - restart (settings and library are kept)
+static esp_err_t system_reboot_handler(httpd_req_t* req) {
+    ESP_LOGW(TAG, "Reboot requested via REST");
+    SandTablePlayer::stop();
+    esp_err_t send_err = send_ok(req);
+    schedule_restart(500);
+    return send_err;
 }
 
 // POST /api/system/factory-reset
@@ -110,23 +119,7 @@ static esp_err_t system_factory_reset_handler(httpd_req_t* req) {
     }
 
     esp_err_t send_err = send_ok(req);
-
-    // Schedule restart after a short delay so the response gets out first
-    esp_timer_handle_t restart_timer;
-    esp_timer_create_args_t timer_args = {
-        .callback = restart_timer_callback,
-        .arg = nullptr,
-        .dispatch_method = ESP_TIMER_TASK,
-        .name = "factory_reset_restart",
-    };
-    if (esp_timer_create(&timer_args, &restart_timer) == ESP_OK) {
-        esp_timer_start_once(restart_timer, 300 * 1000);  // 300ms
-        ESP_LOGI(TAG, "Device will restart in 300ms");
-    } else {
-        ESP_LOGW(TAG, "Failed to create restart timer, restarting immediately");
-        esp_restart();
-    }
-
+    schedule_restart(300);
     return send_err;
 }
 
@@ -146,6 +139,14 @@ void system_api_register_handlers(httpd_handle_t server) {
         .user_ctx = nullptr
     };
     kd_common_api_register_uri_handler(server, &home_uri);
+
+    static httpd_uri_t reboot_uri = {
+        .uri = "/api/system/reboot",
+        .method = HTTP_POST,
+        .handler = system_reboot_handler,
+        .user_ctx = nullptr
+    };
+    kd_common_api_register_uri_handler(server, &reboot_uri);
 
     static httpd_uri_t factory_reset_uri = {
         .uri = "/api/system/factory-reset",

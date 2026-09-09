@@ -1,13 +1,13 @@
 // Unified system handler implementation
 #include "system_handler.h"
+#include "system_info.h"
+#include "homing_service.h"
 #include "SandTablePlayer.h"
 #include "factory_reset.h"
 
 #include <esp_log.h>
-#include <esp_app_desc.h>
 #include <esp_system.h>
 #include <esp_timer.h>
-#include <kd_common.h>
 
 static const char* TAG = "system_handler";
 
@@ -33,6 +33,9 @@ HandleResult SystemHandler::handle(
         case KD__V1__TRANQUIL_MESSAGE__MESSAGE_FACTORY_RESET_REQUEST:
             return handleFactoryReset(msg->factory_reset_request, response);
 
+        case KD__V1__TRANQUIL_MESSAGE__MESSAGE_REBOOT_REQUEST:
+            return handleReboot(msg->reboot_request, response);
+
         case KD__V1__TRANQUIL_MESSAGE__MESSAGE_HOME_REQUEST:
             return handleHomeRequest(msg->home_request, response);
 
@@ -46,6 +49,7 @@ bool SystemHandler::canHandle(Kd__V1__TranquilMessage__MessageCase msg_case) con
         case KD__V1__TRANQUIL_MESSAGE__MESSAGE_PING:
         case KD__V1__TRANQUIL_MESSAGE__MESSAGE_GET_SYSTEM_INFO:
         case KD__V1__TRANQUIL_MESSAGE__MESSAGE_FACTORY_RESET_REQUEST:
+        case KD__V1__TRANQUIL_MESSAGE__MESSAGE_REBOOT_REQUEST:
         case KD__V1__TRANQUIL_MESSAGE__MESSAGE_HOME_REQUEST:
             return true;
         default:
@@ -58,8 +62,13 @@ std::vector<Kd__V1__TranquilMessage__MessageCase> SystemHandler::supportedMessag
         KD__V1__TRANQUIL_MESSAGE__MESSAGE_PING,
         KD__V1__TRANQUIL_MESSAGE__MESSAGE_GET_SYSTEM_INFO,
         KD__V1__TRANQUIL_MESSAGE__MESSAGE_FACTORY_RESET_REQUEST,
+        KD__V1__TRANQUIL_MESSAGE__MESSAGE_REBOOT_REQUEST,
         KD__V1__TRANQUIL_MESSAGE__MESSAGE_HOME_REQUEST
     };
+}
+
+bool SystemHandler::isLocalOnly(Kd__V1__TranquilMessage__MessageCase msg_case) const {
+    return msg_case == KD__V1__TRANQUIL_MESSAGE__MESSAGE_FACTORY_RESET_REQUEST;
 }
 
 HandleResult SystemHandler::handlePing(
@@ -78,52 +87,32 @@ HandleResult SystemHandler::handlePing(
 }
 
 HandleResult SystemHandler::handleGetSystemInfo(ResponseMessage& response) {
-    // Locals, not statics: httpd, the cloudlink task, and the state broadcaster
-    // can run this concurrently, and two callers racing between
-    // get_packed_size() and pack() inside serialize() corrupt the message.
-    // These are tiny and only need to outlive the serialize() call below.
-    Kd__V1__SystemInfo info = KD__V1__SYSTEM_INFO__INIT;
-    char model[] = "tranquil";
-
-    const esp_app_desc_t* app_desc = esp_app_get_description();
-
-    info.firmware_version = const_cast<char*>(app_desc->version);
-    info.hardware_model = model;
-    info.device_id = kd_common_get_device_name();
-    info.is_homed = SandTablePlayer::isHomed();
-    info.free_heap = esp_get_free_heap_size();
-    info.hostname = kd_common_get_wifi_hostname();
-
-    Kd__V1__TranquilMessage resp = KD__V1__TRANQUIL_MESSAGE__INIT;
-    resp.message_case = KD__V1__TRANQUIL_MESSAGE__MESSAGE_SYSTEM_INFO;
-    resp.system_info = &info;
-
-    response = serialize(&resp);
+    response = system_info::build_message();
     return HandleResult::ok(false, false);
 }
 
-// Timer callback to restart device after factory reset
+// Timer callback to restart the device once the response is on the wire
 static void restart_timer_callback(void* arg) {
     (void)arg;
-    ESP_LOGW(TAG, "Restarting device after factory reset...");
+    ESP_LOGW(TAG, "Restarting device...");
     esp_restart();
 }
 
-// Convert MotionError to string for error messages
-static const char* motion_error_to_string(sand_table::MotionError err) {
-    switch (err) {
-        case sand_table::MotionError::None: return "None";
-        case sand_table::MotionError::NotHomed: return "Not homed";
-        case sand_table::MotionError::OutOfBounds: return "Out of bounds";
-        case sand_table::MotionError::QueueFull: return "Queue full";
-        case sand_table::MotionError::QueueEmpty: return "Queue empty";
-        case sand_table::MotionError::InvalidState: return "Invalid state";
-        case sand_table::MotionError::HardwareFault: return "Hardware fault";
-        case sand_table::MotionError::StallDetected: return "Stall detected";
-        case sand_table::MotionError::Timeout: return "Timeout";
-        case sand_table::MotionError::HomingFailed: return "Homing failed";
-        case sand_table::MotionError::EmergencyStop: return "Emergency stop";
-        default: return "Unknown error";
+static void schedule_restart(uint32_t delay_ms) {
+    esp_timer_handle_t restart_timer;
+    esp_timer_create_args_t timer_args = {
+        .callback = restart_timer_callback,
+        .arg = nullptr,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "restart",
+    };
+    if (esp_timer_create(&timer_args, &restart_timer) == ESP_OK) {
+        esp_timer_start_once(restart_timer, static_cast<uint64_t>(delay_ms) * 1000);
+        ESP_LOGI(TAG, "Device will restart in %lums", static_cast<unsigned long>(delay_ms));
+    }
+    else {
+        ESP_LOGW(TAG, "Failed to create restart timer, restarting immediately");
+        esp_restart();
     }
 }
 
@@ -144,25 +133,22 @@ HandleResult SystemHandler::handleFactoryReset(
 
     // Send success response before scheduling restart
     response = makeCommandResult(true);
+    schedule_restart(300);
+    return HandleResult::ok(false, false);
+}
 
-    // Schedule restart after a short delay to allow response to be sent
-    esp_timer_handle_t restart_timer;
-    esp_timer_create_args_t timer_args = {
-        .callback = restart_timer_callback,
-        .arg = nullptr,
-        .dispatch_method = ESP_TIMER_TASK,
-        .name = "factory_reset_restart",
-    };
+HandleResult SystemHandler::handleReboot(
+    const Kd__V1__TranquilRebootRequest* msg,
+    ResponseMessage& response
+) {
+    const char* reason = (msg && msg->reason && msg->reason[0]) ? msg->reason : "requested";
+    ESP_LOGW(TAG, "Reboot requested: %s", reason);
 
-    err = esp_timer_create(&timer_args, &restart_timer);
-    if (err == ESP_OK) {
-        esp_timer_start_once(restart_timer, 300 * 1000);  // 300ms delay
-        ESP_LOGI(TAG, "Device will restart in 300ms");
-    } else {
-        ESP_LOGW(TAG, "Failed to create restart timer, restarting immediately");
-        esp_restart();
-    }
+    // Stop motion first so the arm is not mid-move when power drops.
+    SandTablePlayer::stop();
 
+    response = makeCommandResult(true);
+    schedule_restart(500);
     return HandleResult::ok(false, false);
 }
 
@@ -174,25 +160,19 @@ HandleResult SystemHandler::handleHomeRequest(
 
     ESP_LOGI(TAG, "Home request (force_full=%d)", force_full);
 
-    // Locals, not statics: this handler can be dispatched concurrently from
-    // httpd and the cloudlink task; shared statics race in serialize().
+    // Homing runs asynchronously (tens of seconds); the reply confirms the
+    // run STARTED. Completion is observable through SystemInfo.is_homing /
+    // is_homed, which is pushed to LAN + cloud when the run ends.
     Kd__V1__HomeResponse home_resp = KD__V1__HOME_RESPONSE__INIT;
-    char error_buf[128];
-
-    auto* motion_controller = SandTablePlayer::getMotionController();
-    if (!motion_controller) {
+    esp_err_t err = homing_service::start(force_full);
+    if (err == ESP_OK) {
+        home_resp.success = true;
+        home_resp.error = nullptr;
+    }
+    else {
         home_resp.success = false;
-        home_resp.error = const_cast<char*>("Motion controller not initialized");
-    } else {
-        auto result = motion_controller->home(force_full);
-        if (result.is_ok()) {
-            home_resp.success = true;
-            home_resp.error = nullptr;
-        } else {
-            home_resp.success = false;
-            snprintf(error_buf, sizeof(error_buf), "Homing failed: %s", motion_error_to_string(result.error()));
-            home_resp.error = error_buf;
-        }
+        home_resp.error = const_cast<char*>(
+            err == ESP_ERR_INVALID_STATE ? "Homing already in progress" : "Failed to start homing");
     }
 
     Kd__V1__TranquilMessage resp = KD__V1__TRANQUIL_MESSAGE__INIT;

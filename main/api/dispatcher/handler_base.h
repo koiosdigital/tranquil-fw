@@ -145,8 +145,9 @@ protected:
     static ResponseMessage serialize(const Kd__V1__TranquilMessage* msg) {
         size_t len = kd__v1__tranquil_message__get_packed_size(msg);
 
-        // Enforce max response size for local API
-        static constexpr size_t MAX_RESPONSE = 16 * 1024;
+        // Response ceiling. Matches the cloud link's 32 KB cap; local WS
+        // frames have no smaller limit outbound. Buffers live in PSRAM.
+        static constexpr size_t MAX_RESPONSE = 32 * 1024;
         if (len > MAX_RESPONSE) {
             ESP_LOGE("HandlerBase", "Response exceeds %zu bytes: %zu", MAX_RESPONSE, len);
             return ResponseMessage();

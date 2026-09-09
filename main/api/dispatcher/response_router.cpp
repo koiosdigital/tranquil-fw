@@ -2,6 +2,7 @@
 #include "response_router.h"
 #include "websocket_server.h"
 #include "messages.h"
+#include "sockets.h"
 
 #include <esp_log.h>
 #include <esp_heap_caps.h>
@@ -13,6 +14,15 @@ ResponseRouter& ResponseRouter::instance() {
     return instance;
 }
 
+// Routing rules:
+//   * broadcast        -> every local WS client (the requester included when
+//                         it is a local client)
+//   * otherwise        -> unicast to the requesting local client
+//   * cloud requester  -> ALWAYS answered on the cloud link, in addition to
+//                         any local broadcast (a cloud command must get its
+//                         CommandResult; a cloud SetSchedule must both notify
+//                         LAN clients and confirm to the cloud)
+//   * send_to_cloud    -> also pushed to the cloud (deduped against the above)
 esp_err_t ResponseRouter::route(
     const ResponseMessage& response,
     const MessageContext& ctx,
@@ -22,45 +32,42 @@ esp_err_t ResponseRouter::route(
         return ESP_ERR_INVALID_ARG;
     }
 
-    esp_err_t ret = ESP_OK;
-
-    // Handle REST responses (special case - converted by REST adapter)
+    // REST responses are serialized by the REST adapter; nothing to route.
     if (ctx.source == MessageSource::REST_API) {
-        // REST responses are handled by the REST adapter directly
-        // This router doesn't handle REST serialization
         return ESP_OK;
     }
 
-    // Broadcast to all local clients if requested
+    esp_err_t ret = ESP_OK;
+    bool sent_to_cloud = false;
+
     if (result.broadcast) {
         esp_err_t bcast_ret = broadcastToLocal(response);
-        if (bcast_ret != ESP_OK) {
+        if (bcast_ret != ESP_OK && bcast_ret != ESP_ERR_INVALID_STATE) {
             ESP_LOGW(TAG, "Broadcast failed: %s", esp_err_to_name(bcast_ret));
             ret = bcast_ret;
         }
     }
-    // Otherwise send unicast to original requester
     else if (ctx.source == MessageSource::LOCAL_WEBSOCKET && ctx.socket_fd >= 0) {
         esp_err_t send_ret = sendToLocalClient(ctx.socket_fd, response);
-        if (send_ret != ESP_OK) {
+        if (send_ret != ESP_OK && send_ret != ESP_ERR_INVALID_STATE) {
             ESP_LOGW(TAG, "Unicast to fd=%d failed: %s", ctx.socket_fd, esp_err_to_name(send_ret));
             ret = send_ret;
         }
     }
-    // If from cloud, respond back to cloud
-    else if (ctx.source == MessageSource::CLOUD_WEBSOCKET) {
+
+    if (ctx.source == MessageSource::CLOUD_WEBSOCKET) {
         esp_err_t cloud_ret = sendToCloud(response);
+        sent_to_cloud = true;
         if (cloud_ret != ESP_OK) {
             ESP_LOGW(TAG, "Cloud response failed: %s", esp_err_to_name(cloud_ret));
             ret = cloud_ret;
         }
     }
 
-    // Additionally send to cloud if requested (for state changes)
-    if (result.send_to_cloud && ctx.source != MessageSource::CLOUD_WEBSOCKET) {
+    if (result.send_to_cloud && !sent_to_cloud) {
         esp_err_t cloud_ret = sendToCloud(response);
         if (cloud_ret != ESP_OK) {
-            ESP_LOGW(TAG, "Cloud send failed: %s", esp_err_to_name(cloud_ret));
+            ESP_LOGD(TAG, "Cloud send skipped/failed: %s", esp_err_to_name(cloud_ret));
         }
     }
 
@@ -74,14 +81,19 @@ esp_err_t ResponseRouter::broadcastToLocal(const ResponseMessage& response) {
 
 esp_err_t ResponseRouter::sendToCloud(const ResponseMessage& response) {
     if (!response.valid()) return ESP_ERR_INVALID_ARG;
-
-    bool queued = cloud_msg_queue_raw(response.data(), response.len());
-
-    return queued ? ESP_OK : ESP_FAIL;
+    return forwardToCloud(response.data(), response.len());
 }
 
 esp_err_t ResponseRouter::forwardToCloud(const uint8_t* data, size_t len) {
     if (!data || len == 0) return ESP_ERR_INVALID_ARG;
+
+    // Only hand messages to cloudlink while the session is actually up.
+    // Queuing while offline just fills the outbox with telemetry that is
+    // stale by the time the link comes back (the reconnect handshake then
+    // re-syncs everything that matters).
+    if (!cloud_sockets_is_ready()) {
+        return ESP_ERR_INVALID_STATE;
+    }
 
     bool queued = cloud_msg_queue_raw(data, len);
 
@@ -97,6 +109,5 @@ esp_err_t ResponseRouter::sendToRest(httpd_req_t* req, const ResponseMessage& re
     (void)req;
     (void)response;
     // REST responses need JSON conversion, handled by REST adapter
-    // This function is a placeholder for future JSON serialization
     return ESP_ERR_NOT_SUPPORTED;
 }

@@ -78,6 +78,10 @@ namespace sand_table {
         motion_.theta_current_ma = 400;
         motion_.rho_current_ma = 400;
         motion_.stallguard_threshold = 30;
+        motion_.accel_steps_s2 = MotionConfig::kDefaultAccelStepsS2;
+        motion_.junction_dv_steps_s = MotionConfig::kDefaultJunctionDvStepsS;
+        motion_.theta_max_rot_per_min = MotionConfig::kDefaultThetaMaxRotPerMin;
+        motion_.motor_idle_timeout_s = MotionConfig::kDefaultMotorIdleTimeoutS;
 
         // LED defaults - current hardware: FW1906 RGBCCT, 84 px, RGB order,
         // warm/cool white swapped. (0=WS2812/1=SK6812/2=FW1906; format 3/4/5;
@@ -112,6 +116,13 @@ namespace sand_table {
         nvs.get_u16(kKeyThetaCurrMa, &motion_.theta_current_ma);
         nvs.get_u16(kKeyRhoCurrMa, &motion_.rho_current_ma);
         nvs.get_u8(kKeySgThreshold, &motion_.stallguard_threshold);
+        nvs.get_u32(kKeyAccel, &motion_.accel_steps_s2);
+        nvs.get_u32(kKeyJunctionDv, &motion_.junction_dv_steps_s);
+        uint32_t theta_rot_x100 = 0;
+        if (nvs.get_u32(kKeyThetaRot, &theta_rot_x100) == ESP_OK && theta_rot_x100 > 0) {
+            motion_.theta_max_rot_per_min = static_cast<float>(theta_rot_x100) / 100.0f;
+        }
+        nvs.get_u32(kKeyIdleTimeout, &motion_.motor_idle_timeout_s);
 
         // Check if we found at least one key (to distinguish empty from missing)
         return nvs.find_key(kKeyStepsPerRev);
@@ -142,6 +153,19 @@ namespace sand_table {
         if (err != ESP_OK) return err;
 
         err = nvs.set_u8(kKeySgThreshold, motion_.stallguard_threshold);
+        if (err != ESP_OK) return err;
+
+        err = nvs.set_u32(kKeyAccel, motion_.accel_steps_s2);
+        if (err != ESP_OK) return err;
+
+        err = nvs.set_u32(kKeyJunctionDv, motion_.junction_dv_steps_s);
+        if (err != ESP_OK) return err;
+
+        err = nvs.set_u32(kKeyThetaRot,
+            static_cast<uint32_t>(motion_.theta_max_rot_per_min * 100.0f + 0.5f));
+        if (err != ESP_OK) return err;
+
+        err = nvs.set_u32(kKeyIdleTimeout, motion_.motor_idle_timeout_s);
         if (err != ESP_OK) return err;
 
         return nvs.commit();
@@ -452,6 +476,25 @@ namespace sand_table {
 
     uint8_t MotionConfig::stallguard_threshold() {
         return ConfigManager::instance().motion_config().stallguard_threshold;
+    }
+
+    uint32_t MotionConfig::accel_steps_s2() {
+        const uint32_t v = ConfigManager::instance().motion_config().accel_steps_s2;
+        return v > 0 ? v : kDefaultAccelStepsS2;
+    }
+
+    uint32_t MotionConfig::junction_dv_steps_s() {
+        const uint32_t v = ConfigManager::instance().motion_config().junction_dv_steps_s;
+        return v > 0 ? v : kDefaultJunctionDvStepsS;
+    }
+
+    float MotionConfig::theta_max_rot_per_min() {
+        const float v = ConfigManager::instance().motion_config().theta_max_rot_per_min;
+        return v > 0.0f ? v : kDefaultThetaMaxRotPerMin;
+    }
+
+    uint32_t MotionConfig::motor_idle_timeout_s() {
+        return ConfigManager::instance().motion_config().motor_idle_timeout_s;
     }
 
 } // namespace sand_table

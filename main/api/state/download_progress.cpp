@@ -1,9 +1,10 @@
 // Download progress broadcaster implementation
 #include "download_progress.h"
 #include "websocket_server.h"
-#include "messages.h"  // cloud_msg_queue_raw — fan progress out to the cloud too
+#include "response_router.h"  // fan progress out to the cloud too (gated on session)
 
 #include <esp_log.h>
+#include <esp_heap_caps.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <kd/v1/tranquil.pb-c.h>
@@ -59,7 +60,7 @@ void send_report(const std::vector<std::pair<std::string, uint8_t>>& snapshot,
     msg.pattern_download_progress = &report;
 
     size_t len = kd__v1__tranquil_message__get_packed_size(&msg);
-    auto* buf = static_cast<uint8_t*>(malloc(len));
+    auto* buf = static_cast<uint8_t*>(heap_caps_malloc(len, MALLOC_CAP_SPIRAM));
     if (!buf) {
         ESP_LOGE(TAG, "Failed to alloc %zu bytes for progress report", len);
         return;
@@ -71,9 +72,9 @@ void send_report(const std::vector<std::pair<std::string, uint8_t>>& snapshot,
     // ...and the cloud link, so an app connected off-LAN still sees progress
     // (proto: pattern_download_progress is "&&& sent to cloud"). No-op when the
     // cloud session is down.
-    cloud_msg_queue_raw(buf, len);
+    ResponseRouter::instance().forwardToCloud(buf, len);
 
-    free(buf);
+    heap_caps_free(buf);
 }
 
 }  // namespace

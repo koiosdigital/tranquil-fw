@@ -21,8 +21,12 @@ void cloud_sockets_init();
 // Deinitialize and clean up
 void cloud_sockets_deinit();
 
-// Check if connected to cloud server
+// Check if connected to cloud server (socket up; welcome may be pending)
 bool cloud_sockets_is_connected();
+
+// True once the cloud session is established (welcome received). Telemetry
+// senders gate on this so nothing is queued into the outbox while offline.
+bool cloud_sockets_is_ready();
 
 // Largest message (bytes) cloudlink will accept for send/receive. Senders of
 // variable-size payloads (coredumps, bundles) should check before packing.

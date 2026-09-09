@@ -1,12 +1,19 @@
 // Motion/LED configuration + preset REST API (NVS-backed via ConfigManager).
+//
+// Every write applies live where the hardware allows it: motor currents and
+// StallGuard go to the TMC drivers, motion shaping is read per segment, the
+// LED strip is rebuilt by led_runtime. Only microsteps / steps_per_rev need a
+// reboot + re-home (the calibration is expressed in those steps).
 #include "config_api.h"
 #include "api_common.h"
 #include "config_manager.h"
 #include "motion_controller.h"
 #include "SandTablePlayer.h"
+#include "led/led_runtime.h"
 
 #include <esp_log.h>
 #include <strings.h>
+#include <cmath>
 
 static const char* TAG = "config_api";
 
@@ -41,82 +48,149 @@ static int led_order_code(const char* s) {
     return -1;
 }
 
-// GET /api/config
-static esp_err_t config_get_handler(httpd_req_t* req) {
+static void write_config_json(ChunkBuf* cb, bool led_applied, bool reboot_required) {
     auto& cfg = sand_table::ConfigManager::instance();
     const auto& motion = cfg.motion_config();
     const auto& led = cfg.led_config();
     const auto& cal = cfg.calibration();
 
-    httpd_resp_set_type(req, "application/json");
-    ChunkBuf cb;
-    chunk_buf_init(&cb, req);
-
-    chunk_buf_printf(&cb,
+    chunk_buf_printf(cb,
         "{\"motion\":{\"steps_per_rev\":%lu,\"microsteps\":%u,"
         "\"rho_max_rpm\":%ld,",
         (unsigned long)motion.steps_per_rev, (unsigned)motion.microsteps,
         (long)motion.rho_max_rpm);
-    chunk_buf_printf(&cb,
-        "\"theta_current_ma\":%u,\"rho_current_ma\":%u,\"stallguard_threshold\":%u},",
+    chunk_buf_printf(cb,
+        "\"theta_current_ma\":%u,\"rho_current_ma\":%u,\"stallguard_threshold\":%u,",
         (unsigned)motion.theta_current_ma, (unsigned)motion.rho_current_ma,
         (unsigned)motion.stallguard_threshold);
-    chunk_buf_printf(&cb,
+    chunk_buf_printf(cb,
+        "\"accel_steps_s2\":%lu,\"junction_dv_steps_s\":%lu,",
+        (unsigned long)motion.accel_steps_s2, (unsigned long)motion.junction_dv_steps_s);
+    chunk_buf_printf(cb,
+        "\"theta_max_rot_per_min\":%.2f,\"motor_idle_timeout_s\":%lu},",
+        (double)motion.theta_max_rot_per_min, (unsigned long)motion.motor_idle_timeout_s);
+    chunk_buf_printf(cb,
         "\"led\":{\"has_leds\":%s,\"led_count\":%u,\"is_rgbw\":%s,"
         "\"ic_type\":\"%s\",\"format\":\"%s\",\"color_order\":\"%s\",\"white_swap\":%s},",
         led.has_leds ? "true" : "false", (unsigned)led.led_count,
         led.is_rgbw ? "true" : "false",
         led_ic_name(led.ic_type), led_format_name(led.format),
         led_order_name(led.color_order), led.white_swap ? "true" : "false");
-    chunk_buf_printf(&cb,
+    chunk_buf_printf(cb,
         "\"calibration\":{\"theta_steps_per_rotation\":%ld,\"rho_max_steps\":%ld,"
         "\"is_valid\":%s,\"timestamp\":%lu},",
         (long)cal.theta_steps_per_rotation, (long)cal.rho_max_steps,
         cal.is_valid ? "true" : "false", (unsigned long)cal.timestamp);
-    chunk_buf_write_str(&cb, "\"active_preset_id\":");
-    chunk_buf_write_json_string(&cb, cfg.active_preset_id());
-    chunk_buf_write(&cb, "}", 1);
+    chunk_buf_printf(cb, "\"is_homed\":%s,\"led_applied\":%s,\"reboot_required\":%s,",
+        SandTablePlayer::isHomed() ? "true" : "false",
+        led_applied ? "true" : "false", reboot_required ? "true" : "false");
+    chunk_buf_write_str(cb, "\"active_preset_id\":");
+    chunk_buf_write_json_string(cb, cfg.active_preset_id());
+    chunk_buf_write(cb, "}", 1);
+}
+
+static esp_err_t send_config(httpd_req_t* req, bool led_applied, bool reboot_required) {
+    httpd_resp_set_type(req, "application/json");
+    ChunkBuf cb;
+    chunk_buf_init(&cb, req);
+    write_config_json(&cb, led_applied, reboot_required);
     chunk_buf_finish(&cb);
     return ESP_OK;
 }
 
+// GET /api/config
+static esp_err_t config_get_handler(httpd_req_t* req) {
+    return send_config(req, false, false);
+}
+
+// Read a numeric field if present. Presence (not "> 0") decides whether a
+// field is applied, so 0 is a legal value where it means something
+// (motor_idle_timeout_s = 0 -> never de-energize; stallguard 0).
+static bool get_num(cJSON* obj, const char* key, double& out) {
+    cJSON* item = cJSON_GetObjectItem(obj, key);
+    if (!item || !cJSON_IsNumber(item)) return false;
+    out = item->valuedouble;
+    return true;
+}
+
 // PATCH /api/config - partial update: {"motion":{...}, "led":{...}}
-// Zero/absent fields are left unchanged (mirrors the previous WS semantics).
+// Absent fields are left unchanged. Returns the updated config plus
+// `led_applied` (strip rebuilt live) and `reboot_required` (microsteps /
+// steps_per_rev changed; take effect after reboot + re-home).
 static esp_err_t config_patch_handler(httpd_req_t* req) {
     cJSON* json = parse_json_body(req, 2048);
     if (!json) return ESP_FAIL;
 
     auto& cfg = sand_table::ConfigManager::instance();
     bool changed = false;
+    bool led_applied = false;
+    bool reboot_required = false;
+    const char* bad_field = nullptr;
 
     cJSON* motion_json = cJSON_GetObjectItem(json, "motion");
     if (motion_json && cJSON_IsObject(motion_json)) {
         sand_table::RuntimeMotionConfig motion = cfg.motion_config();
-
-        auto get_num = [motion_json](const char* key, double def) -> double {
-            cJSON* item = cJSON_GetObjectItem(motion_json, key);
-            return (item && cJSON_IsNumber(item)) ? item->valuedouble : def;
-        };
-
+        const sand_table::RuntimeMotionConfig before = motion;
         double v;
-        if ((v = get_num("steps_per_rev", 0)) > 0) motion.steps_per_rev = (uint32_t)v;
-        if ((v = get_num("microsteps", 0)) > 0) motion.microsteps = (uint16_t)v;
-        if ((v = get_num("rho_max_rpm", 0)) > 0) motion.rho_max_rpm = (int32_t)v;
-        if ((v = get_num("theta_current_ma", 0)) > 0) motion.theta_current_ma = (uint16_t)v;
-        if ((v = get_num("rho_current_ma", 0)) > 0) motion.rho_current_ma = (uint16_t)v;
-        if ((v = get_num("stallguard_threshold", 0)) > 0) motion.stallguard_threshold = (uint8_t)v;
+
+        if (get_num(motion_json, "steps_per_rev", v)) {
+            if (v < 1 || v > 10000) bad_field = "steps_per_rev"; else motion.steps_per_rev = (uint32_t)v;
+        }
+        if (get_num(motion_json, "microsteps", v)) {
+            const int m = (int)v;
+            if (m != 1 && m != 2 && m != 4 && m != 8 && m != 16 && m != 32 && m != 64 && m != 128 && m != 256) {
+                bad_field = "microsteps";
+            } else {
+                motion.microsteps = (uint16_t)m;
+            }
+        }
+        if (get_num(motion_json, "rho_max_rpm", v)) {
+            if (v < 1 || v > 100) bad_field = "rho_max_rpm"; else motion.rho_max_rpm = (int32_t)v;
+        }
+        if (get_num(motion_json, "theta_current_ma", v)) {
+            if (v < 100 || v > 1500) bad_field = "theta_current_ma"; else motion.theta_current_ma = (uint16_t)v;
+        }
+        if (get_num(motion_json, "rho_current_ma", v)) {
+            if (v < 100 || v > 1500) bad_field = "rho_current_ma"; else motion.rho_current_ma = (uint16_t)v;
+        }
+        if (get_num(motion_json, "stallguard_threshold", v)) {
+            if (v < 0 || v > 255) bad_field = "stallguard_threshold"; else motion.stallguard_threshold = (uint8_t)v;
+        }
+        if (get_num(motion_json, "accel_steps_s2", v)) {
+            if (v < 500 || v > 100000) bad_field = "accel_steps_s2"; else motion.accel_steps_s2 = (uint32_t)v;
+        }
+        if (get_num(motion_json, "junction_dv_steps_s", v)) {
+            if (v < 10 || v > 5000) bad_field = "junction_dv_steps_s"; else motion.junction_dv_steps_s = (uint32_t)v;
+        }
+        if (get_num(motion_json, "theta_max_rot_per_min", v)) {
+            if (v < 0.5 || v > 60) bad_field = "theta_max_rot_per_min"; else motion.theta_max_rot_per_min = (float)v;
+        }
+        if (get_num(motion_json, "motor_idle_timeout_s", v)) {
+            if (v < 0 || v > 86400) bad_field = "motor_idle_timeout_s"; else motion.motor_idle_timeout_s = (uint32_t)v;
+        }
+
+        if (bad_field) {
+            cJSON_Delete(json);
+            char msg[64];
+            snprintf(msg, sizeof(msg), "Out of range: %s", bad_field);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, msg);
+            return ESP_FAIL;
+        }
 
         esp_err_t ret = cfg.set_motion_config(motion);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Failed to set motion config: %s", esp_err_to_name(ret));
         } else {
             changed = true;
-            // Push run/hold current to the TMC drivers now so the change
-            // takes effect without a reboot. (Microstep resolution and the
-            // step calibration are boot-time; RPM/StallGuard are read live by
-            // motion/homing.)
+            reboot_required = motion.steps_per_rev != before.steps_per_rev ||
+                              motion.microsteps != before.microsteps;
+            // Currents, StallGuard and the shaping knobs apply now.
             if (auto* mc = SandTablePlayer::getMotionController()) {
                 mc->apply_motor_config();
+                mc->apply_motion_tunables();
+                if (motion.stallguard_threshold != before.stallguard_threshold) {
+                    mc->apply_stallguard_config();
+                }
             }
         }
     }
@@ -128,15 +202,16 @@ static esp_err_t config_patch_handler(httpd_req_t* req) {
         cJSON* has_leds = cJSON_GetObjectItem(led_json, "has_leds");
         if (has_leds && cJSON_IsBool(has_leds)) led.has_leds = cJSON_IsTrue(has_leds);
         cJSON* led_count = cJSON_GetObjectItem(led_json, "led_count");
-        if (led_count && cJSON_IsNumber(led_count) && led_count->valueint > 0) {
+        if (led_count && cJSON_IsNumber(led_count) && led_count->valueint > 0 && led_count->valueint <= 2000) {
             led.led_count = (uint16_t)led_count->valueint;
         }
         // Legacy is_rgbw first so an explicit `format` below always wins.
         cJSON* is_rgbw = cJSON_GetObjectItem(led_json, "is_rgbw");
         if (is_rgbw && cJSON_IsBool(is_rgbw)) led.format = cJSON_IsTrue(is_rgbw) ? 4 : 3;
 
-        // Strip type/layout. ic_type/format/color_order accept either the
-        // string name (e.g. "fw1906", "rgbcct", "grb") or the raw int code.
+        // Strip type/layout by NAME ("fw1906", "rgbcct", "grb"). Numeric
+        // codes are accepted only in the firmware's own numbering (format
+        // 3/4/5), never the proto LEDFormat enum (1/2/3) - use strings.
         cJSON* ic = cJSON_GetObjectItem(led_json, "ic_type");
         if (ic && cJSON_IsString(ic)) { int v = led_ic_code(ic->valuestring); if (v >= 0) led.ic_type = (uint8_t)v; }
         else if (ic && cJSON_IsNumber(ic) && ic->valueint >= 0 && ic->valueint <= 2) led.ic_type = (uint8_t)ic->valueint;
@@ -159,20 +234,23 @@ static esp_err_t config_patch_handler(httpd_req_t* req) {
             ESP_LOGE(TAG, "Failed to set LED config: %s", esp_err_to_name(ret));
         } else {
             changed = true;
+            // Rebuild the strip now - no reboot.
+            led_runtime::apply(led);
+            led_applied = true;
         }
     }
 
     cJSON_Delete(json);
 
-    ESP_LOGI(TAG, "Config PATCH: changed=%d", changed);
+    ESP_LOGI(TAG, "Config PATCH: changed=%d led_applied=%d reboot_required=%d",
+        changed, led_applied, reboot_required);
 
     if (!changed) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No valid config in body");
         return ESP_FAIL;
     }
 
-    // Return the updated config
-    return config_get_handler(req);
+    return send_config(req, led_applied, reboot_required);
 }
 
 // DELETE /api/config/calibration
@@ -227,17 +305,12 @@ static esp_err_t presets_load_handler(httpd_req_t* req) {
         return ESP_FAIL;
     }
 
-    esp_err_t ret = sand_table::ConfigManager::instance().load_preset(preset_id->valuestring);
+    auto& cfg = sand_table::ConfigManager::instance();
+    const sand_table::RuntimeMotionConfig motion_before = cfg.motion_config();
+
+    esp_err_t ret = cfg.load_preset(preset_id->valuestring);
     ESP_LOGI(TAG, "LoadPreset '%s': %s", preset_id->valuestring, esp_err_to_name(ret));
     cJSON_Delete(json);
-
-    // A preset changes motor current (among other things) — push it to the
-    // drivers immediately so it applies without a reboot.
-    if (ret == ESP_OK) {
-        if (auto* mc = SandTablePlayer::getMotionController()) {
-            mc->apply_motor_config();
-        }
-    }
 
     if (ret != ESP_OK) {
         if (ret == ESP_ERR_NOT_FOUND) {
@@ -248,8 +321,21 @@ static esp_err_t presets_load_handler(httpd_req_t* req) {
         return ESP_FAIL;
     }
 
+    // A preset changes motor current / shaping and the strip - push all of it
+    // to the hardware immediately so it applies without a reboot.
+    if (auto* mc = SandTablePlayer::getMotionController()) {
+        mc->apply_motor_config();
+        mc->apply_motion_tunables();
+        mc->apply_stallguard_config();
+    }
+    led_runtime::apply(cfg.led_config());
+
+    const auto& motion_after = cfg.motion_config();
+    const bool reboot_required = motion_after.steps_per_rev != motion_before.steps_per_rev ||
+                                 motion_after.microsteps != motion_before.microsteps;
+
     // Return the updated config so the client sees the applied values
-    return config_get_handler(req);
+    return send_config(req, true, reboot_required);
 }
 
 void config_api_register_handlers(httpd_handle_t server) {

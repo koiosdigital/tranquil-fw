@@ -16,6 +16,10 @@ public:
     bool canHandle(Kd__V1__TranquilMessage__MessageCase msg_case) const override;
     std::vector<Kd__V1__TranquilMessage__MessageCase> supportedMessages() const override;
 
+    // Builds a Playlists message from the manifest. Public so the library
+    // notifier can push it on change / on cloud (re)connect.
+    ResponseMessage buildPlaylistListMessage();
+
 private:
     PlaylistHandler() = default;
 

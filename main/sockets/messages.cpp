@@ -14,6 +14,7 @@
 
 #include "drm/drm_license.h"
 #include "sockets.h"
+#include "system_info.h"
 
 #include <cinttypes>
 
@@ -58,26 +59,13 @@ bool cloud_msg_queue(const Kd__V1__TranquilMessage* message) {
 }
 
 void cloud_msg_send_device_info() {
-    // Locals, not statics: cloud_msg_queue() packs synchronously, but this can
-    // be invoked from multiple contexts and a shared static would race between
-    // get_packed_size() and pack().
-    Kd__V1__SystemInfo info = KD__V1__SYSTEM_INFO__INIT;
-    char model[] = "tranquil";
-
-    const esp_app_desc_t* app_desc = esp_app_get_description();
-
-    info.firmware_version = const_cast<char*>(app_desc->version);
-    info.hardware_model = model;
-    info.device_id = kd_common_get_device_name();
-    info.free_heap = esp_get_free_heap_size();
-    info.hostname = kd_common_get_wifi_hostname();
-
-    Kd__V1__TranquilMessage msg = KD__V1__TRANQUIL_MESSAGE__INIT;
-    msg.message_case = KD__V1__TRANQUIL_MESSAGE__MESSAGE_SYSTEM_INFO;
-    msg.system_info = &info;
-    cloud_msg_queue(&msg);
-
-    ESP_LOGI(TAG, "Sent device info");
+    // Same builder as the WS handler / REST endpoint so the cloud sees the
+    // full snapshot (homed/homing, uptime, RSSI, IP, PSRAM).
+    ResponseMessage msg = system_info::build_message();
+    if (msg.valid()) {
+        cloud_msg_queue_raw(msg.data(), msg.len());
+        ESP_LOGI(TAG, "Sent device info");
+    }
 }
 
 void cloud_msg_upload_coredump() {

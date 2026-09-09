@@ -212,6 +212,7 @@ namespace sand_table {
 
         // Motor run/hold current from runtime config.
         apply_motor_config();
+        apply_motion_tunables();
 
         ESP_LOGI(TAG, "TMC2209 drivers initialized (microsteps=%lu)",
             static_cast<unsigned long>(MechanicalConfig::microsteps()));
@@ -388,6 +389,10 @@ namespace sand_table {
             // Try to get next segment from queue
             MotionSegment segment;
             if (segment_queue_.pop(segment)) {
+                // Motion is flowing — reset the producer-stall tracker
+                last_planner_pending_ = 0;
+                planner_stall_ticks_ = 0;
+
                 // Motor steps already calculated in enqueue_segment() before velocity planning
 
                 // Running reflects actual execution, set HERE. Setting it
@@ -420,9 +425,33 @@ namespace sand_table {
                 }
             }
             else {
-                // Queue empty, check if we should go idle
-                if (state_.load(std::memory_order_acquire) == SystemState::Running &&
-                    velocity_planner_->empty()) {
+                // Queue empty. The planner may still hold gated segments
+                // (see transfer_ready_segments): if the producer is
+                // actively adding, its count keeps changing — wait. If it
+                // has gone quiet (stream ended, network stall), flush the
+                // gate so the held tail executes its planned decel-to-zero
+                // instead of parking the ball mid-path indefinitely.
+                // Advisory single-word read; exactness not required.
+                const size_t pending = velocity_planner_->segment_count();
+                if (pending > 0) {
+                    if (pending == last_planner_pending_) {
+                        if (++planner_stall_ticks_ >= kPlannerStallFlushTicks) {
+                            transfer_ready_segments(true);
+                            planner_stall_ticks_ = 0;
+                        }
+                    }
+                    else {
+                        last_planner_pending_ = pending;
+                        planner_stall_ticks_ = 0;
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                    continue;
+                }
+                last_planner_pending_ = 0;
+                planner_stall_ticks_ = 0;
+
+                // Queue and planner both empty, check if we should go idle
+                if (state_.load(std::memory_order_acquire) == SystemState::Running) {
                     state_.store(SystemState::Idle, std::memory_order_release);
                     reset_inactivity_timer();
                 }
@@ -497,11 +526,34 @@ namespace sand_table {
     }
 
     void MotionController::reset_inactivity_timer() {
-        if (inactivity_timer_) {
-            armed_epoch_.store(enable_epoch_.load(std::memory_order_acquire),
-                std::memory_order_release);
-            xTimerReset(inactivity_timer_, 0);
+        if (!inactivity_timer_) return;
+        if (MotionConfig::motor_idle_timeout_s() == 0) {
+            // "Never de-energize": keep the motors powered.
+            xTimerStop(inactivity_timer_, 0);
+            return;
         }
+        armed_epoch_.store(enable_epoch_.load(std::memory_order_acquire),
+            std::memory_order_release);
+        xTimerReset(inactivity_timer_, 0);
+    }
+
+    void MotionController::apply_motion_tunables() {
+        if (!inactivity_timer_) return;
+        const uint32_t timeout_s = MotionConfig::motor_idle_timeout_s();
+        if (timeout_s == 0) {
+            xTimerStop(inactivity_timer_, 0);
+            ESP_LOGI(TAG, "Motor idle timeout disabled");
+            return;
+        }
+        // xTimerChangePeriod also (re)starts the timer; that is the desired
+        // behaviour when the motors are idle, and harmless otherwise since
+        // enable_motors() stops it and the epoch check guards the callback.
+        xTimerChangePeriod(inactivity_timer_, pdMS_TO_TICKS(timeout_s * 1000), 0);
+        ESP_LOGI(TAG, "Motor idle timeout: %lus, accel=%lu steps/s2, junction dv=%lu steps/s, theta cap=%.1f rot/min",
+            static_cast<unsigned long>(timeout_s),
+            static_cast<unsigned long>(MotionConfig::accel_steps_s2()),
+            static_cast<unsigned long>(MotionConfig::junction_dv_steps_s()),
+            static_cast<double>(MotionConfig::theta_max_rot_per_min()));
     }
 
     void MotionController::enable_motors() {
@@ -804,14 +856,24 @@ namespace sand_table {
         return added;
     }
 
-    void MotionController::transfer_ready_segments() {
-        // Transfer all available segments from velocity planner to execution queue
-        // Lookahead works naturally: if segments queue faster than execution,
-        // velocity planner calculates junction velocities before transfer
+    void MotionController::transfer_ready_segments(bool flush) {
+        // Transfer planned segments to the execution queue — but NOT
+        // eagerly. A popped segment's exit velocity is frozen, and the
+        // planner's backward pass can only keep junction speeds up while
+        // enough successors remain in its buffer (the tail always plans
+        // down to zero). Draining the planner as fast as possible (the
+        // old behavior) left most junctions planned with <=2 segments of
+        // lookahead — i.e. effectively unplanned, with timing-dependent
+        // stops. Hold back PLANNER_COMMIT_LOOKAHEAD segments unless
+        // flushing (stream ended/stalled): the held tail ends in a
+        // planned decel-to-zero, so a flush is a clean controlled stop.
         if (xSemaphoreTake(planner_mutex_, pdMS_TO_TICKS(100)) != pdTRUE) {
             return;  // Retry next loop iteration
         }
-        while (!velocity_planner_->empty() && !segment_queue_.full()) {
+        while (!segment_queue_.full() &&
+               (flush ? !velocity_planner_->empty()
+                      : velocity_planner_->segment_count() >
+                            MotionConfig::PLANNER_COMMIT_LOOKAHEAD)) {
             auto popped = velocity_planner_->pop_segment();
             if (popped) {
                 (void)segment_queue_.push(*popped);  // Already checked !full() above

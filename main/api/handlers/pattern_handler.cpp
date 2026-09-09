@@ -3,7 +3,7 @@
 #include "ManifestDatabase.h"
 #include "download_tracker.h"
 #include "download_progress.h"
-#include "websocket_server.h"
+#include "library_notifier.h"
 
 #include <esp_log.h>
 #include <cstring>
@@ -75,8 +75,9 @@ ResponseMessage PatternHandler::buildPatternListMessage() {
     std::vector<Kd__V1__PatternInfo*> pattern_ptrs;
     std::vector<Kd__V1__PatternInfo> pattern_infos;
 
-    // Limit to 100 patterns to avoid excessive memory usage
-    size_t count = std::min(patterns.size(), static_cast<size_t>(100));
+    // Cap the socket list. 200 entries pack to ~30 KB, inside the 32 KB
+    // response ceiling; larger libraries browse the paginated REST list.
+    size_t count = std::min(patterns.size(), static_cast<size_t>(200));
     pattern_infos.resize(count);
 
     for (size_t i = 0; i < count; i++) {
@@ -92,6 +93,9 @@ ResponseMessage PatternHandler::buildPatternListMessage() {
         pattern_infos[i].start_point = patterns[i].start_point;
         pattern_infos[i].created_at = const_cast<char*>(patterns[i].created_at.c_str());
         pattern_infos[i].last_played_at = const_cast<char*>(patterns[i].last_played_at.c_str());
+        pattern_infos[i].is_owned = patterns[i].purchased;
+        pattern_infos[i].purchased_at = patterns[i].purchased_at;
+        pattern_infos[i].receipt_id = const_cast<char*>(patterns[i].receipt_id.c_str());
         pattern_ptrs.push_back(&pattern_infos[i]);
     }
 
@@ -102,7 +106,7 @@ ResponseMessage PatternHandler::buildPatternListMessage() {
     resp.message_case = KD__V1__TRANQUIL_MESSAGE__MESSAGE_DOWNLOADED_PATTERNS;
     resp.downloaded_patterns = &downloaded;
 
-    ESP_LOGI(TAG, "DownloadedPatterns: returning %zu patterns", count);
+    ESP_LOGD(TAG, "DownloadedPatterns: returning %zu patterns", count);
     return serialize(&resp);
 }
 
@@ -116,17 +120,11 @@ void PatternHandler::notifyPatternDownloadComplete(const std::string& pattern_uu
 
     if (!success) return;
 
-    // Push the refreshed pattern list so clients see the new pattern without
-    // polling. The requester is included, so no separate unicast is needed.
-    ResponseMessage msg = buildPatternListMessage();
-    if (msg.valid()) {
-        esp_err_t err = websocket_broadcast(msg.data(), msg.len());
-        ESP_LOGI(TAG, "Broadcast pattern list after download of %s: %s",
-            pattern_uuid.c_str(), esp_err_to_name(err));
-    } else {
-        ESP_LOGW(TAG, "Failed to build pattern list broadcast for %s",
-            pattern_uuid.c_str());
-    }
+    // Push the refreshed pattern list (debounced, LAN + cloud) so clients see
+    // the new pattern without polling. A bulk playlist download coalesces
+    // into one push instead of one per pattern.
+    ESP_LOGI(TAG, "Pattern %s downloaded; scheduling list push", pattern_uuid.c_str());
+    library_notifier::patterns_changed();
 }
 
 HandleResult PatternHandler::handleDeletePattern(
@@ -153,8 +151,10 @@ HandleResult PatternHandler::handleDeletePattern(
 
     if (ret == ESP_OK) {
         response = makeCommandResult(true);
-        // Broadcast pattern list change to local clients
-        return HandleResult::ok(true, false);
+        // Requester gets the CommandResult; everyone (LAN + cloud) gets the
+        // updated list via the notifier.
+        library_notifier::patterns_changed();
+        return HandleResult::ok();
     } else {
         response = makeCommandResult(false, "Failed to delete pattern");
         return HandleResult::ok();
@@ -190,7 +190,8 @@ HandleResult PatternHandler::handleModifyPattern(
 
     if (ret == ESP_OK) {
         response = makeCommandResult(true);
-        return HandleResult::ok(true, false);
+        library_notifier::patterns_changed();
+        return HandleResult::ok();
     } else {
         response = makeCommandResult(false, "Failed to update pattern");
         return HandleResult::ok();
@@ -279,7 +280,9 @@ HandleResult PatternHandler::handleRequestPatternDownload(
 
     // From cloud: this is the designed round-trip for cloud-initiated
     // downloads (app → cloud command → us → forward back → cloud replies
-    // with a PatternDownloadResponse; see tranquil.proto message 6).
+    // with a PatternDownloadResponse; see tranquil.proto message 6). Track
+    // it so progress reaches the cloud poller from 0%.
+    DownloadProgressBroadcaster::instance().track(msg->pattern_uuid);
     ESP_LOGI(TAG, "Cloud-initiated download, forwarding back for download URL");
     return HandleResult::forwardToCloud();
 }

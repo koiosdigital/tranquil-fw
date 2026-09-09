@@ -15,6 +15,8 @@
 #include "ManifestDatabase.h"
 #include "download_progress.h"
 #include "download_tracker.h"
+#include "library_notifier.h"
+#include "player_state_broadcaster.h"
 
 static const char* TAG = "cloud_handlers";
 
@@ -134,8 +136,6 @@ namespace {
 
         ESP_LOGI(TAG, "Join response: claimed=%d, needs_claimed=%d",
             response->is_claimed, response->needs_claimed);
-
-        cloud_msg_send_device_info();
 
         bool needs_claim = response->needs_claimed || !response->is_claimed;
         if (!needs_claim) {
@@ -314,11 +314,18 @@ void cloud_handle_message(Kd__V1__TranquilMessage* message) {
 
     esp_err_t ret = MessageDispatcher::instance().dispatch(message, ctx, &response, &result);
 
-    // Route the handler's response ourselves: the (msg, ctx, out, out)
-    // dispatch overload only fills the out-params — unlike the raw-bytes
-    // overload it does NOT invoke ResponseRouter, so without this the cloud
-    // never receives command results (and local clients miss broadcasts of
-    // cloud-triggered state changes).
+    // The (msg, ctx, out, out) dispatch overload only fills the out-params:
+    // it neither routes the response nor honours forward_to_cloud. Do both
+    // here. forward_to_cloud on the cloud path is the designed round-trip for
+    // cloud-initiated pattern downloads (Worker -> us -> back to Worker with a
+    // proper RequestPatternDownload -> PatternDownloadResponse); dropping it
+    // used to leave every app-initiated cloud download stuck at 0%.
+    if (result.forward_to_cloud &&
+        message->message_case == KD__V1__TRANQUIL_MESSAGE__MESSAGE_REQUEST_PATTERN_DOWNLOAD &&
+        message->request_pattern_download && message->request_pattern_download->pattern_uuid) {
+        cloud_msg_send_pattern_download_request(message->request_pattern_download->pattern_uuid);
+    }
+
     if (result.has_response) {
         if (response.valid()) {
             ResponseRouter::instance().route(response, ctx, result);
@@ -339,14 +346,18 @@ void cloud_handle_message(Kd__V1__TranquilMessage* message) {
 }
 
 void handlers_on_connected() {
-    // Report identity, upload any pending coredump, then request the license
-    // and purchase receipts. Claim is device-initiated on the vn path (the
-    // backend only answers ClaimDevice — it never pushes an unsolicited
-    // JoinResponse), so drive it here too.
-    cloud_msg_send_device_info();
+    // Device-initiated handshake. Claim first (the Worker answers ClaimDevice
+    // and never pushes an unsolicited JoinResponse), then the license and
+    // purchase receipts. CertReport is gone: SaaS PKI owns renewal and the
+    // Worker discarded the ~2 KB PEM on every connect.
     cloud_msg_upload_coredump();
-    cloud_msg_send_cert_report();
+    cloud_msg_send_claim_if_needed();
     cloud_msg_send_license_request();
     cloud_msg_send_sync_purchases_request();
-    cloud_msg_send_claim_if_needed();
+
+    // Then the state the cloud caches for off-LAN control: player state now,
+    // the list snapshots (patterns / playlists / schedule / LED / system info)
+    // through the notifier task. The Worker never has to ask.
+    PlayerStateBroadcaster::instance().pushToCloudNow();
+    library_notifier::cloud_snapshot();
 }

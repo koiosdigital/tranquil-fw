@@ -66,6 +66,12 @@ namespace sand_table {
         /// and re-read from config on each home.
         void apply_motor_config();
 
+        /// Re-read the runtime motion shaping knobs that are NOT read per
+        /// segment - currently the motor idle timeout (a FreeRTOS timer
+        /// period). Acceleration / junction / theta caps are read live by the
+        /// planner and executor and need no push.
+        void apply_motion_tunables();
+
         // =========================================================================
         // Homing
         // =========================================================================
@@ -330,8 +336,23 @@ namespace sand_table {
 
         // Segment handling
         bool enqueue_segment(MotionSegment& segment);
-        void transfer_ready_segments();
+        // Move planned segments to the execution queue. Holds back
+        // PLANNER_COMMIT_LOOKAHEAD segments so junction speeds are only
+        // committed with real lookahead behind them; flush=true overrides
+        // the gate (stream ended or stalled — the held tail is planned
+        // down to zero, so flushing executes a clean controlled stop).
+        void transfer_ready_segments(bool flush = false);
         Result<void> execute_segment(const MotionSegment& segment);
+
+        // Producer-stall detection for the flush above (stepper task
+        // only). If the execution queue is empty but the planner still
+        // holds gated segments and its count stops changing for
+        // kPlannerStallFlushTicks idle sleeps (~10ms each), the producer
+        // has gone quiet — flush so the ball stops on the planned
+        // decel-to-zero tail instead of parking mid-path.
+        static constexpr uint32_t kPlannerStallFlushTicks = 4;
+        size_t last_planner_pending_ = 0;
+        uint32_t planner_stall_ticks_ = 0;
     };
 
 } // namespace sand_table

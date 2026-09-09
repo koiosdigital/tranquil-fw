@@ -1,5 +1,6 @@
 // Unified player control handler implementation
 #include "player_handler.h"
+#include "player_state_broadcaster.h"
 #include "SandTablePlayer.h"
 
 #include <esp_log.h>
@@ -12,13 +13,17 @@ PlayerHandler& PlayerHandler::instance() {
     return instance;
 }
 
+// Every mutating command answers the REQUESTER with a CommandResult
+// (unicast, or back to the cloud). The resulting PlayerState reaches every
+// client - LAN and cloud - through PlayerStateBroadcaster, which notices the
+// change on its next 100 ms tick. Broadcasting the CommandResult itself to
+// all clients (the old behaviour) told everyone about a result they could
+// not correlate, and told nobody what actually changed.
 HandleResult PlayerHandler::handle(
     const Kd__V1__TranquilMessage* msg,
     const MessageContext& ctx,
     ResponseMessage& response
 ) {
-    (void)ctx;  // Context not currently used but available for future needs
-
     switch (msg->message_case) {
         case KD__V1__TRANQUIL_MESSAGE__MESSAGE_PLAY_PATTERN:
             return handlePlayPattern(msg->play_pattern, response);
@@ -45,7 +50,7 @@ HandleResult PlayerHandler::handle(
             return handlePlaylistNavigate(msg->playlist_navigate_command, response);
 
         case KD__V1__TRANQUIL_MESSAGE__MESSAGE_GET_PLAYER_STATE:
-            return handleGetPlayerState(response);
+            return handleGetPlayerState(msg->get_player_state, ctx, response);
 
         default:
             return HandleResult::notHandled();
@@ -96,14 +101,8 @@ HandleResult PlayerHandler::handlePlayPattern(
     ESP_LOGI(TAG, "PlayPattern: %s", msg->pattern_uuid);
     esp_err_t ret = SandTablePlayer::playPattern(msg->pattern_uuid);
 
-    if (ret == ESP_OK) {
-        response = makeCommandResult(true);
-        // Broadcast state change to all local clients, also notify cloud
-        return HandleResult::ok(true, true);
-    } else {
-        response = makeCommandResult(false, "Failed to play pattern");
-        return HandleResult::ok();
-    }
+    response = makeCommandResult(ret == ESP_OK, ret == ESP_OK ? nullptr : "Failed to play pattern");
+    return HandleResult::ok();
 }
 
 HandleResult PlayerHandler::handleSetPaused(
@@ -119,8 +118,7 @@ HandleResult PlayerHandler::handleSetPaused(
     esp_err_t ret = msg->paused ? SandTablePlayer::pause() : SandTablePlayer::resume();
 
     response = makeCommandResult(ret == ESP_OK);
-    // State change - broadcast to locals, notify cloud
-    return HandleResult::ok(true, true);
+    return HandleResult::ok();
 }
 
 HandleResult PlayerHandler::handleStopPlayback(ResponseMessage& response) {
@@ -128,8 +126,7 @@ HandleResult PlayerHandler::handleStopPlayback(ResponseMessage& response) {
     esp_err_t ret = SandTablePlayer::stop();
 
     response = makeCommandResult(ret == ESP_OK);
-    // State change - broadcast to locals, notify cloud
-    return HandleResult::ok(true, true);
+    return HandleResult::ok();
 }
 
 HandleResult PlayerHandler::handlePlaylistPlay(
@@ -142,23 +139,21 @@ HandleResult PlayerHandler::handlePlaylistPlay(
         return HandleResult::ok();
     }
 
-    ESP_LOGI(TAG, "PlaylistPlay: %s (shuffle=%d, loop=%d)",
-        msg->playlist_uuid, msg->shuffle, msg->loop);
+    ESP_LOGI(TAG, "PlaylistPlay: %s (shuffle=%d, loop=%d, start=%s)",
+        msg->playlist_uuid, msg->shuffle, msg->loop,
+        (msg->start_pattern_uuid && msg->start_pattern_uuid[0]) ? msg->start_pattern_uuid : "-");
 
-    esp_err_t ret = SandTablePlayer::playPlaylist(
-        msg->playlist_uuid,
-        msg->shuffle,
-        msg->loop
-    );
-
-    if (ret == ESP_OK) {
-        response = makeCommandResult(true);
-        // State change - broadcast to locals, notify cloud
-        return HandleResult::ok(true, true);
-    } else {
-        response = makeCommandResult(false, "Failed to play playlist");
-        return HandleResult::ok();
+    esp_err_t ret;
+    if (msg->start_pattern_uuid && msg->start_pattern_uuid[0]) {
+        ret = SandTablePlayer::playPlaylistFromPattern(
+            msg->playlist_uuid, msg->start_pattern_uuid, msg->shuffle, msg->loop);
     }
+    else {
+        ret = SandTablePlayer::playPlaylist(msg->playlist_uuid, msg->shuffle, msg->loop);
+    }
+
+    response = makeCommandResult(ret == ESP_OK, ret == ESP_OK ? nullptr : "Failed to play playlist");
+    return HandleResult::ok();
 }
 
 HandleResult PlayerHandler::handleSetShuffle(
@@ -174,7 +169,7 @@ HandleResult PlayerHandler::handleSetShuffle(
     esp_err_t ret = SandTablePlayer::setShuffle(msg->shuffle);
 
     response = makeCommandResult(ret == ESP_OK);
-    return HandleResult::ok(true, true);
+    return HandleResult::ok();
 }
 
 HandleResult PlayerHandler::handleSetLoop(
@@ -190,7 +185,7 @@ HandleResult PlayerHandler::handleSetLoop(
     esp_err_t ret = SandTablePlayer::setLoop(msg->enabled);
 
     response = makeCommandResult(ret == ESP_OK);
-    return HandleResult::ok(true, true);
+    return HandleResult::ok();
 }
 
 HandleResult PlayerHandler::handleSetFeedRate(
@@ -206,8 +201,7 @@ HandleResult PlayerHandler::handleSetFeedRate(
     SandTablePlayer::setFeedRate(msg->feed_rate_rpm);
 
     response = makeCommandResult(true);
-    // Feed rate change - broadcast but not urgent for cloud
-    return HandleResult::ok(true, false);
+    return HandleResult::ok();
 }
 
 HandleResult PlayerHandler::handlePlaylistNavigate(
@@ -236,10 +230,19 @@ HandleResult PlayerHandler::handlePlaylistNavigate(
     if (ret == ESP_ERR_INVALID_STATE) detail = "Not in playlist mode";
     else if (ret != ESP_OK) detail = "Navigation failed";
     response = makeCommandResult(ret == ESP_OK, detail);
-    return HandleResult::ok(true, true);
+    return HandleResult::ok();
 }
 
-HandleResult PlayerHandler::handleGetPlayerState(ResponseMessage& response) {
+HandleResult PlayerHandler::handleGetPlayerState(
+    const Kd__V1__GetPlayerState* msg,
+    const MessageContext& ctx,
+    ResponseMessage& response
+) {
+    // A cloud query carrying watch_seconds means a remote user has the
+    // player page open: keep progress flowing at the fast cadence.
+    if (ctx.isCloud() && msg && msg->watch_seconds > 0) {
+        PlayerStateBroadcaster::instance().noteCloudAttention(msg->watch_seconds);
+    }
     response = buildPlayerStateResponse();
     // GetPlayerState is a query - unicast response only
     return HandleResult::ok(false, false);
@@ -284,7 +287,6 @@ ResponseMessage PlayerHandler::buildPlayerStateResponse() {
             break;
     }
 
-    // Copy UUIDs to static buffers
     strncpy(pattern_uuid, status.current_pattern_uuid.c_str(), sizeof(pattern_uuid) - 1);
     pattern_uuid[sizeof(pattern_uuid) - 1] = '\0';
 
