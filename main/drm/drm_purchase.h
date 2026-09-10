@@ -71,6 +71,18 @@ extern "C" {
      */
     esp_err_t drm_purchase_delete(const char* pattern_uuid);
 
+    /**
+     * @brief Freshness digest of the receipts on the SD card: SHA-256 over the
+     * receipt_ids sorted bytewise and joined with "\n" (the server computes
+     * the same over the owner's purchases). Signatures are not re-verified
+     * here; a corrupt file just makes the digest miss and the server resends.
+     *
+     * @param out   32-byte buffer; zeroed when there are no receipts
+     * @param count Receives the number of receipts found (may be NULL)
+     * @return ESP_OK (also when there are no receipts)
+     */
+    esp_err_t drm_purchase_receipts_digest(uint8_t out[32], size_t* count);
+
 #ifdef __cplusplus
 }
 #endif

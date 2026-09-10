@@ -233,6 +233,26 @@ esp_err_t drm_license_get_info(drm_license_info_t* info) {
     return ESP_OK;
 }
 
+esp_err_t drm_license_get_payload_hash(uint8_t out[32]) {
+    if (!license_state.initialized || out == nullptr) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    raii::MutexGuard guard(license_state.mutex);
+    if (!license_state.loaded || license_state.payload == nullptr || license_state.payload_len == 0) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    size_t hash_len = 0;
+    psa_status_t status = psa_hash_compute(PSA_ALG_SHA_256,
+        license_state.payload, license_state.payload_len, out, 32, &hash_len);
+    if (status != PSA_SUCCESS || hash_len != 32) {
+        ESP_LOGW(TAG, "License payload hash failed: %d", (int)status);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
 esp_err_t drm_license_save(const uint8_t* payload, size_t payload_len,
     const uint8_t* signature, size_t signature_len) {
     if (!license_state.initialized) {

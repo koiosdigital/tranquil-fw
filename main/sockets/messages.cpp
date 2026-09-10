@@ -13,6 +13,7 @@
 #include <koios/cloudlink.h>
 
 #include "drm/drm_license.h"
+#include "drm/drm_purchase.h"
 #include "sockets.h"
 #include "system_info.h"
 
@@ -213,15 +214,11 @@ void cloud_msg_send_license_request() {
     // Set device ID from certificate CN
     req.device_id = kd_common_get_device_name();
 
-    // Get current license hash if we have a license
+    // Freshness: SHA-256 over the serialized LicensePayload we hold. The
+    // server compares it with the license it last issued and answers
+    // `unchanged` (no re-mint, no re-save) when they match.
     static uint8_t license_hash[32] = { 0 };
-    drm_license_info_t info;
-    if (drm_license_get_info(&info) == ESP_OK) {
-        // Hash the current license info as a freshness check
-        // In production, this would be the hash of the actual license file
-        size_t hash_len = 0;
-        psa_hash_compute(PSA_ALG_SHA_256, reinterpret_cast<const uint8_t*>(&info),
-            sizeof(info), license_hash, sizeof(license_hash), &hash_len);
+    if (drm_license_get_payload_hash(license_hash) == ESP_OK) {
         req.current_license_hash.data = license_hash;
         req.current_license_hash.len = sizeof(license_hash);
     }
@@ -271,10 +268,20 @@ void cloud_msg_send_pattern_download_request(const char* pattern_uuid) {
 void cloud_msg_send_sync_purchases_request() {
     Kd__V1__SyncPurchasesRequest req = KD__V1__SYNC_PURCHASES_REQUEST__INIT;
 
+    // Freshness: digest of the receipt ids on the SD card. The server sends
+    // nothing back when it matches the owner's entitlements.
+    static uint8_t digest[32] = { 0 };
+    size_t count = 0;
+    if (drm_purchase_receipts_digest(digest, &count) == ESP_OK && count > 0) {
+        req.receipts_digest.data = digest;
+        req.receipts_digest.len = sizeof(digest);
+        req.receipt_count = static_cast<uint32_t>(count);
+    }
+
     Kd__V1__TranquilMessage msg = KD__V1__TRANQUIL_MESSAGE__INIT;
     msg.message_case = KD__V1__TRANQUIL_MESSAGE__MESSAGE_SYNC_PURCHASES_REQUEST;
     msg.sync_purchases_request = &req;
 
     cloud_msg_queue(&msg);
-    ESP_LOGI(TAG, "Sent sync purchases request");
+    ESP_LOGI(TAG, "Sent sync purchases request (%zu receipts held)", count);
 }

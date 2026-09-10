@@ -12,6 +12,11 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <dirent.h>
+#include <psa/crypto.h>
+#include <algorithm>
+#include <string>
+#include <vector>
 
 static const char* TAG = "drm_purchase";
 
@@ -282,6 +287,78 @@ esp_err_t drm_purchase_save(const char* pattern_uuid,
     }
 
     ESP_LOGI(TAG, "Saved purchase receipt for: %s", pattern_uuid);
+    return ESP_OK;
+}
+
+// Read one receipt file's receipt_id without verifying the signature.
+static bool read_receipt_id(const char* path, std::string& out_id) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+
+    bool ok = false;
+    PurchaseFileHeader header;
+    if (fread(&header, sizeof(header), 1, f) == 1 &&
+        header.magic == DRM_PURCHASE_MAGIC && header.version == DRM_PURCHASE_VERSION &&
+        header.payload_len > 0 && header.payload_len <= 512) {
+        uint8_t payload[512];
+        if (fread(payload, 1, header.payload_len, f) == header.payload_len) {
+            Kd__V1__PurchaseReceipt* pb = kd__v1__purchase_receipt__unpack(
+                nullptr, header.payload_len, payload);
+            if (pb) {
+                if (pb->receipt_id && pb->receipt_id[0]) {
+                    out_id = pb->receipt_id;
+                    ok = true;
+                }
+                kd__v1__purchase_receipt__free_unpacked(pb, nullptr);
+            }
+        }
+    }
+    fclose(f);
+    return ok;
+}
+
+esp_err_t drm_purchase_receipts_digest(uint8_t out[32], size_t* count) {
+    if (!out) return ESP_ERR_INVALID_ARG;
+    memset(out, 0, 32);
+    if (count) *count = 0;
+
+    std::vector<std::string> ids;
+    DIR* dir = opendir("/sd/patterns");
+    if (dir) {
+        constexpr const char* kSuffix = ".licdat";
+        const size_t suffix_len = strlen(kSuffix);
+        struct dirent* ent;
+        while ((ent = readdir(dir)) != nullptr) {
+            const size_t name_len = strlen(ent->d_name);
+            if (name_len <= suffix_len ||
+                strcmp(ent->d_name + name_len - suffix_len, kSuffix) != 0) {
+                continue;
+            }
+            std::string path = std::string("/sd/patterns/") + ent->d_name;
+            std::string id;
+            if (read_receipt_id(path.c_str(), id)) ids.push_back(std::move(id));
+        }
+        closedir(dir);
+    }
+
+    if (count) *count = ids.size();
+    if (ids.empty()) return ESP_OK;
+
+    std::sort(ids.begin(), ids.end());
+    std::string joined;
+    for (size_t i = 0; i < ids.size(); i++) {
+        if (i) joined.push_back('\n');
+        joined += ids[i];
+    }
+
+    size_t hash_len = 0;
+    psa_status_t status = psa_hash_compute(PSA_ALG_SHA_256,
+        reinterpret_cast<const uint8_t*>(joined.data()), joined.size(), out, 32, &hash_len);
+    if (status != PSA_SUCCESS || hash_len != 32) {
+        ESP_LOGW(TAG, "Receipt digest failed: %d", (int)status);
+        memset(out, 0, 32);
+        return ESP_FAIL;
+    }
     return ESP_OK;
 }
 

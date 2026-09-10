@@ -154,6 +154,16 @@ extern "C" {
      */
     bool drm_license_has_store_token(void);
 
+    /**
+     * @brief SHA-256 over the serialized LicensePayload the device holds (the
+     * bytes the server signature covers). Sent as LicenseRequest freshness so
+     * the server can answer "unchanged" instead of re-minting.
+     *
+     * @param out 32-byte buffer
+     * @return ESP_OK, or ESP_ERR_NOT_FOUND when no license is loaded
+     */
+    esp_err_t drm_license_get_payload_hash(uint8_t out[32]);
+
 #ifdef __cplusplus
 }
 #endif

@@ -8,6 +8,9 @@
 #include <esp_log.h>
 #include <esp_system.h>
 #include <esp_heap_caps.h>
+#include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <kd_common.h>
 
 #include "drm/drm_license.h"
@@ -28,6 +31,13 @@ namespace {
         if (!response->success) {
             ESP_LOGE(TAG, "License request failed: %s",
                 response->error ? response->error : "unknown error");
+            return;
+        }
+
+        // Freshness hit: the license we hold is the one the server last
+        // issued and it is not near expiry. Nothing to verify or re-save.
+        if (response->unchanged) {
+            ESP_LOGI(TAG, "License up to date");
             return;
         }
 
@@ -345,15 +355,63 @@ void cloud_handle_message(Kd__V1__TranquilMessage* message) {
     ESP_LOGD(TAG, "Unhandled cloud message: %d", message->message_case);
 }
 
+namespace {
+
+// The license (and its embedded store token) is only refreshed when the
+// server sees a LicenseRequest, and that used to happen on connect alone. A
+// table that stays connected for weeks would sail past the 30-day validity,
+// so re-ask once a day; the server answers `unchanged` until the license is
+// close to expiry, at which point it mints a fresh one.
+constexpr int64_t kLicenseRefreshUs = 24LL * 60 * 60 * 1000 * 1000;
+esp_timer_handle_t s_license_refresh_timer = nullptr;
+
+void license_refresh_task(void*) {
+    if (cloud_sockets_is_ready()) {
+        cloud_msg_send_license_request();
+        cloud_msg_send_sync_purchases_request();
+    }
+    vTaskDelete(nullptr);
+}
+
+// esp_timer task: 4 KB stack, so hand the hashing + packing to a task.
+void license_refresh_cb(void*) {
+    if (xTaskCreate(license_refresh_task, "lic_refresh", 6144, nullptr, 3, nullptr) != pdPASS) {
+        ESP_LOGW(TAG, "Failed to spawn license refresh task");
+    }
+}
+
+void arm_license_refresh() {
+    if (!s_license_refresh_timer) {
+        const esp_timer_create_args_t args = {
+            .callback = license_refresh_cb,
+            .arg = nullptr,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "lic_refresh",
+            .skip_unhandled_events = true,
+        };
+        if (esp_timer_create(&args, &s_license_refresh_timer) != ESP_OK) {
+            s_license_refresh_timer = nullptr;
+            return;
+        }
+    }
+    esp_timer_stop(s_license_refresh_timer);
+    esp_timer_start_periodic(s_license_refresh_timer, kLicenseRefreshUs);
+}
+
+}  // namespace
+
 void handlers_on_connected() {
     // Device-initiated handshake. Claim first (the Worker answers ClaimDevice
     // and never pushes an unsolicited JoinResponse), then the license and
     // purchase receipts. CertReport is gone: SaaS PKI owns renewal and the
-    // Worker discarded the ~2 KB PEM on every connect.
+    // Worker discarded the ~2 KB PEM on every connect. Both requests carry a
+    // freshness digest, so a reconnect with nothing changed costs the server
+    // a lookup, not a re-mint.
     cloud_msg_upload_coredump();
     cloud_msg_send_claim_if_needed();
     cloud_msg_send_license_request();
     cloud_msg_send_sync_purchases_request();
+    arm_license_refresh();
 
     // Then the state the cloud caches for off-LAN control: player state now,
     // the list snapshots (patterns / playlists / schedule / LED / system info)
