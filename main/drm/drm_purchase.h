@@ -32,12 +32,23 @@ extern "C" {
     /**
      * @brief Check if a purchase receipt exists and is valid for this device
      *
-     * Validates the receipt file at /sd/patterns/{uuid}.licdat
+     * Validates the receipt file at /sd/patterns/{uuid}.licdat. The verdict
+     * is cached per pattern (see drm_purchase_cache_clear); the file is only
+     * re-verified after drm_purchase_save/drm_purchase_delete for that
+     * pattern or a cache clear.
      *
      * @param pattern_uuid Pattern UUID to check
      * @return true if valid purchase receipt exists for this device
      */
     bool drm_purchase_is_valid(const char* pattern_uuid);
+
+    /**
+     * @brief Drop every cached drm_purchase_is_valid() verdict
+     *
+     * Called on license reload and factory reset; also call it after any
+     * out-of-band change to the receipt files (e.g. wiping the SD card).
+     */
+    void drm_purchase_cache_clear(void);
 
     /**
      * @brief Load and verify a purchase receipt

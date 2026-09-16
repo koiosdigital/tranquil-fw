@@ -17,6 +17,9 @@ constexpr size_t kReadRequestSize = 4;
 constexpr size_t kReadResponseSize = 8;
 constexpr size_t kReadBufferSize = 12;
 constexpr uint32_t kTxTimeoutMs = 100;
+// Upper bound per read; a reply normally arrives within a few hundred us
+// (the datasheet's SENDDELAY x 8 bit times), so the timeout only matters for
+// a driver that is not answering.
 constexpr uint32_t kRxTimeoutMs = 200;
 constexpr uint32_t kResponseDelayUs = 500;
 constexpr uint32_t kBusLockTimeoutMs = 1000;
@@ -190,23 +193,42 @@ std::optional<uint32_t> UartBus::read_register(uint8_t addr, uint8_t reg) {
     // Wait for response
     esp_rom_delay_us(kResponseDelayUs);
 
+    // Read exactly what the bus delivers rather than "up to 12 bytes": the
+    // old read asked for 12 and so ALWAYS sat out the full 200 ms timeout
+    // when the wiring has no TX echo (8 bytes arrive, the 12th never does),
+    // and every status poll paid for it. On a single-wire bus the RX line
+    // first sees our own 4-byte request echoed, then the 8-byte reply;
+    // with separate lines only the reply. Read 4, decide, then read the
+    // rest — uart_read_bytes returns as soon as the requested count is in.
     std::array<uint8_t, kReadBufferSize> buffer{};
-    const int read_bytes = uart_read_bytes(uart_port_, buffer.data(), buffer.size(), pdMS_TO_TICKS(kRxTimeoutMs));
-
-    if (read_bytes < static_cast<int>(kReadResponseSize)) {
+    int got = uart_read_bytes(uart_port_, buffer.data(), kReadRequestSize, pdMS_TO_TICKS(kRxTimeoutMs));
+    if (got < static_cast<int>(kReadRequestSize)) {
         return std::nullopt;
     }
 
-    // Find response packet (starts with sync byte and master address 0xFF)
     const uint8_t* response = nullptr;
-    for (int i = 0; i <= read_bytes - static_cast<int>(kReadResponseSize); ++i) {
-        if (buffer[i] == kSyncByte && buffer[i + 1] == kReplyMasterAddr) {
-            response = &buffer[i];
-            break;
+    if (std::memcmp(buffer.data(), request.data(), kReadRequestSize) == 0) {
+        // Echo drained; the reply follows.
+        got = uart_read_bytes(uart_port_, buffer.data(), kReadResponseSize, pdMS_TO_TICKS(kRxTimeoutMs));
+        if (got < static_cast<int>(kReadResponseSize)) {
+            return std::nullopt;
         }
+        response = buffer.data();
+    }
+    else {
+        // No echo: these 4 bytes are the head of the reply.
+        got = uart_read_bytes(uart_port_, buffer.data() + kReadRequestSize,
+            kReadResponseSize - kReadRequestSize, pdMS_TO_TICKS(kRxTimeoutMs));
+        if (got < static_cast<int>(kReadResponseSize - kReadRequestSize)) {
+            return std::nullopt;
+        }
+        response = buffer.data();
     }
 
-    if (!response) {
+    // Reply framing: sync byte, then the master address 0xFF
+    if (response[0] != kSyncByte || response[1] != kReplyMasterAddr) {
+        ESP_LOGD(TAG, "Read addr=%u reg=0x%02X: bad reply framing %02X %02X",
+            addr, reg, response[0], response[1]);
         return std::nullopt;
     }
 

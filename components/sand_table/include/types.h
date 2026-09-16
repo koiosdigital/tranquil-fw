@@ -23,6 +23,10 @@ namespace sand_table {
         Timeout,
         HomingFailed,
         EmergencyStop,
+        // The runtime motion config (steps_per_rev / microsteps) no longer
+        // matches what the drivers were programmed with at boot; the
+        // request (homing) is refused until the device reboots.
+        RebootRequired,
     };
 
     template<typename T>
@@ -189,6 +193,8 @@ namespace sand_table {
         bool is_homed = false;
         size_t queue_depth = 0;
         size_t queue_capacity = 0;
+        // Why state == Error (the failed segment's error); None otherwise.
+        MotionError last_error = MotionError::None;
     };
 
     // =============================================================================

@@ -54,8 +54,9 @@ static_assert(sizeof(EncryptedPatternHeader) == 576,
  * Opens encrypted .dat pattern files (KDEP magic), recovers the AES key
  * using the DS peripheral, and provides streaming decryption access.
  *
- * Uses PSA Crypto API for AES-CTR. Bufferless design: decrypts one point
- * at a time directly from file. CTR mode is seekable via position-based
+ * Uses PSA Crypto API for AES-CTR. Reads and decrypts the ciphertext in
+ * small blocks (kBlockPoints points per fread / psa_cipher_update) rather
+ * than one 6-byte point at a time. CTR mode is seekable via position-based
  * counter calculation, enabling rewind and peek support.
  *
  * Note: Integrity (SHA-256) is verified on download only, not during playback.
@@ -117,6 +118,15 @@ private:
     // Point tracking
     size_t current_point_ = 0;
 
+    // Block-buffered reads (see BinaryPatternReader): one fread + one
+    // psa_cipher_update per kBlockPoints points. block_ holds plaintext.
+    static constexpr size_t kBlockPoints = 128;
+    uint8_t cipher_block_[kBlockPoints * sizeof(BinaryPoint)];
+    BinaryPoint block_[kBlockPoints];
+    size_t block_count_ = 0;      // points held in block_
+    size_t block_pos_ = 0;        // next unread point in block_
+    size_t points_fetched_ = 0;   // points pulled from the file so far
+
     // Terminal read/decrypt failure: once the file offset and CTR keystream
     // can no longer be trusted to be in sync, hasMore() returns false so
     // playback ends cleanly instead of spinning on garbage.
@@ -129,6 +139,10 @@ private:
     // Helper functions
     void getFilePath(const char* uuid, char* path, size_t path_size);
     PatternPoint readBinaryPoint();
+    // Refill block_ (read + decrypt). False at end of data or on a
+    // read/decrypt failure (read_failed_ set).
+    bool fillBlock();
+    void resetBlock() { block_count_ = block_pos_ = points_fetched_ = 0; }
 
     // Streaming helpers
     esp_err_t openFile(const char* path, const char* uuid);

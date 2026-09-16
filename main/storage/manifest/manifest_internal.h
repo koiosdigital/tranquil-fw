@@ -46,6 +46,43 @@ public:
     manifest::JsonlTable patterns{"Pattern", PATTERNS_PATH, MAX_PATTERNS};
     manifest::JsonlTable playlists{"Playlist", PLAYLISTS_PATH, MAX_PLAYLISTS};
     manifest::JsonlTable jobs{"Job", JOBS_PATH, MAX_JOBS};
+
+    // Deferred persistence (ManifestDatabase::BatchScope). While batch_depth
+    // > 0, mutating ops only mark their table dirty; the outermost scope
+    // exit saves every dirty table once. BatchScope holds `mutex` for its
+    // whole lifetime, so the dirty flags belong to one thread at a time.
+    int batch_depth = 0;
+    bool patterns_dirty = false;
+    bool playlists_dirty = false;
+    bool jobs_dirty = false;
+
+    // Persist `table` now, or defer it to the end of the enclosing batch.
+    // Every mutating ManifestDatabase op goes through this, never
+    // table.save() directly.
+    bool save(manifest::JsonlTable& table) {
+        if (batch_depth > 0) {
+            dirtyFlag(table) = true;
+            return true;
+        }
+        return table.save();
+    }
+
+    // Save every table dirtied inside a batch (called by the outermost
+    // BatchScope on exit).
+    bool flush() {
+        bool ok = true;
+        if (patterns_dirty) { ok = patterns.save() && ok; patterns_dirty = false; }
+        if (playlists_dirty) { ok = playlists.save() && ok; playlists_dirty = false; }
+        if (jobs_dirty) { ok = jobs.save() && ok; jobs_dirty = false; }
+        return ok;
+    }
+
+private:
+    bool& dirtyFlag(manifest::JsonlTable& table) {
+        if (&table == &patterns) return patterns_dirty;
+        if (&table == &playlists) return playlists_dirty;
+        return jobs_dirty;
+    }
 };
 
 using ManifestLock = std::lock_guard<std::recursive_mutex>;

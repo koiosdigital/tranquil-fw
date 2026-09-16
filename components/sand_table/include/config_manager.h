@@ -40,9 +40,12 @@ struct RuntimeMotionConfig {
     float theta_max_rot_per_min = 12.0f;
     uint32_t motor_idle_timeout_s = 30;
 
-    // Derived calculations
+    // Derived calculations. Never 0: it is the denominator of the coupling
+    // compensation (load_motion_config clamps both factors to >= 1; this is
+    // the last line of defence for a config assembled in code).
     uint32_t effective_steps_per_rev() const {
-        return steps_per_rev * microsteps;
+        const uint32_t v = steps_per_rev * microsteps;
+        return v > 0 ? v : 1;
     }
 };
 

@@ -12,6 +12,9 @@
 #include "config_manager.h"
 #include "ManifestDatabase.h"
 #include "SandTablePlayer.h"
+#include "drm/drm_purchase.h"
+#include "sockets.h"
+#include "storage/jobs/job_processor.h"
 
 static const char* TAG = "factory_reset";
 
@@ -81,11 +84,27 @@ static esp_err_t erase_nvs_namespace(const char* ns) {
 esp_err_t tranquil_factory_reset() {
     ESP_LOGW(TAG, "=== FACTORY RESET STARTING ===");
 
-    // Stop playback first
+    // Quiesce every SD-card writer BEFORE the wipe below, or a job worker /
+    // cloud handler keeps creating files under the delete (and a pattern the
+    // player still has open would be unlinked out from under it — FATFS has
+    // no file locking here).
+    //  1. Player: releases the open pattern file.
+    //  2. Cloud: drop inbound messages (license / receipt / download
+    //     responses all write to the card) and refuse new download jobs.
+    //     A soft quiesce, not a deinit — this may run inside cloudlink's own
+    //     message callback (cloud-initiated reset), where tearing the client
+    //     down would be use-after-free.
+    //  3. Job processor: joins the running conversion/thumbnail/download
+    //     workers (bounded wait) so nothing is mid-write.
     SandTablePlayer::stop();
+    cloud_sockets_quiesce();
+    jobs::JobProcessor::instance().stop();
 
     // Close database to ensure clean state
     ManifestDatabase::instance().shutdown();
+
+    // The receipt files are about to disappear; drop the cached verdicts.
+    drm_purchase_cache_clear();
 
     // -------------------------------------------------------------------------
     // Clear NVS settings (WiFi, NTP, claim token, etc.)
@@ -96,8 +115,10 @@ esp_err_t tranquil_factory_reset() {
     ESP_LOGI(TAG, "Clearing claim token...");
     kd_common_clear_claim_token();
 
+    // kd_common owns the NTP namespace name; erasing a guessed name here
+    // used to silently miss it.
     ESP_LOGI(TAG, "Clearing NTP configuration...");
-    erase_nvs_namespace("ntp_cfg2");
+    kd_common_ntp_reset();
 
     ESP_LOGI(TAG, "Clearing PixelDriver configuration...");
     erase_nvs_namespace("pixdriver");

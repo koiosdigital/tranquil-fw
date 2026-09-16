@@ -7,6 +7,10 @@
 //   20-80   HTTP transfer (byte progress mapped into the band)
 //   90      thumbnailer started
 //   100     thumbnailer done — pattern fully usable
+//
+// Entries that stop progressing (a cloud that never answered, a job that
+// died without a terminal report) are dropped after 5 minutes so they do
+// not ride along in every later report forever.
 #pragma once
 
 #include <cstdint>
@@ -41,13 +45,27 @@ public:
     // failures so clients can clear their UI instead of timing out.
     void drop(const std::string& pattern_uuid);
 
+    // Forget entries that have not progressed for STALE_US (no broadcast;
+    // clients time their own bars out). Called from the 30 s schedule tick
+    // on the esp_timer task, so it gives up when the lock is busy.
+    void expireStale();
+
 private:
     DownloadProgressBroadcaster() = default;
+
+    struct Entry {
+        uint8_t pct;
+        int64_t updated_us;
+    };
 
     void set(const std::string& pattern_uuid, uint8_t pct, bool only_if_tracked);
     // Pack the current map into a PatternDownloadProgressReport and broadcast
     // to local WS clients. Called with the lock held only to snapshot.
     void broadcast();
+    // Erase stale entries. Lock held by the caller. Returns how many.
+    size_t pruneLocked(int64_t now_us);
 
-    std::map<std::string, uint8_t> active_;
+    std::map<std::string, Entry> active_;
+
+    static constexpr int64_t STALE_US = 5 * 60 * 1000 * 1000LL;
 };

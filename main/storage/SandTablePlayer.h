@@ -129,10 +129,19 @@ public:
     static sand_table::MotionController* getMotionController();
 
     // Pattern info
-    static const Pattern* getCurrentPattern();
     static const char* getCurrentPatternUUID();
     static const char* getCurrentPlaylistUUID();
     static bool isPatternLoaded();
+
+    // True when `uuid` is the pattern currently loaded by the player (playing,
+    // paused, or finished-but-still-open). Callers that are about to delete
+    // or replace that pattern's file must stop() first: FATFS has no file
+    // locking, so unlinking under the open reader corrupts playback.
+    static bool isPlayingPattern(const char* uuid);
+
+    // Block until playback is STOPPED and the motion controller has drained
+    // (bounded). For callers that must own the sequencer next (homing).
+    static bool waitStopped(TickType_t timeout);
 
 private:
     SandTablePlayer() = delete;
@@ -144,7 +153,18 @@ private:
     static void serviceTaskWrapper(void* param);
     static void serviceTask();
 
-    // Pattern file handling
+    // Pattern file handling. loadPatternFile() = prepareFile() +
+    // installPreparedFile(); the split lets play*() do the expensive part
+    // (encrypted open ~1.7 s of RSA, progress pre-scan of the whole file)
+    // WITHOUT state_mutex_ held, so status/control calls never block on it.
+    struct PreparedFile {
+        std::unique_ptr<IPatternReader> reader;
+        size_t total_lines = 0;
+        double total_path_len = 0.0;
+        bool is_encrypted = false;
+    };
+    static esp_err_t prepareFile(const char* pattern_uuid, PreparedFile& out);
+    static void installPreparedFile(PreparedFile&& prepared);  // file_mutex_
     static esp_err_t loadPatternFile(const char* pattern_uuid);
     static void unloadPatternFile();
     static PatternLine peekNextLine();
@@ -180,9 +200,11 @@ private:
     static std::atomic<bool> shutdown_requested_;
     static std::atomic<bool> service_task_exited_;
 
-    // Playback state
-    static PlaybackState playback_state_;
-    static PlayMode play_mode_;
+    // Playback state. Atomic: mutated under state_mutex_, but read without
+    // it by the status getters and the service task's per-line exit hint
+    // (relaxed loads there — the locked snapshot is authoritative).
+    static std::atomic<PlaybackState> playback_state_;
+    static std::atomic<PlayMode> play_mode_;
 
     // Pattern state
     static char current_pattern_uuid_[MAX_UUID_LEN];
@@ -213,8 +235,8 @@ private:
     static std::vector<std::string> playlist_patterns_;
     static std::vector<size_t> playlist_order_;
     static size_t playlist_index_;
-    static bool is_shuffle_;
-    static bool is_loop_;
+    static std::atomic<bool> is_shuffle_;
+    static std::atomic<bool> is_loop_;
 
     // Pattern position tracking
     static PatternPosition pattern_position_;
@@ -236,6 +258,13 @@ private:
     // work bounded while still saturating the motion queue (the queue-full
     // return from processPatternLine is the real throttle).
     static constexpr int kMaxLinesPerTick = 64;
-    static constexpr size_t SERVICE_TASK_STACK_SIZE = 4096;
+    // 12 KB: the service task nests pattern open (encrypted: RSA key
+    // recovery + PSA cipher setup), the path pre-scan, manifest lookups
+    // (cJSON + std::string) and float-heavy logging. 4 KB overflowed.
+    static constexpr size_t SERVICE_TASK_STACK_SIZE = 12288;
     static constexpr UBaseType_t SERVICE_TASK_PRIORITY = 5;
+    // Random pick: bounded retries when a drawn pattern turns out to be an
+    // unauthorized encrypted one (its verdict is cached, so a retry is
+    // cheap; the bound only guards a library with nothing playable).
+    static constexpr int kMaxRandomPickAttempts = 64;
 };

@@ -1,14 +1,10 @@
-// System REST API: device info, homing, reboot, factory reset.
+// System REST API: a thin JSON codec over system_ops (device info, homing,
+// reboot, factory reset).
 #include "system_api.h"
 #include "api_common.h"
-#include "system_info.h"
-#include "homing_service.h"
-#include "SandTablePlayer.h"
-#include "factory_reset.h"
+#include "ops/system_ops.h"
 
 #include <esp_log.h>
-#include <esp_system.h>
-#include <esp_timer.h>
 
 static const char* TAG = "system_api";
 
@@ -16,29 +12,10 @@ using namespace api_common;
 
 // GET /api/system/info
 static esp_err_t system_info_handler(httpd_req_t* req) {
-    system_info::Snapshot s;
-    system_info::snapshot(s);
-
     httpd_resp_set_type(req, "application/json");
     ChunkBuf cb;
     chunk_buf_init(&cb, req);
-    chunk_buf_write_str(&cb, "{\"firmware_version\":");
-    chunk_buf_write_json_string(&cb, s.firmware_version);
-    chunk_buf_write_str(&cb, ",\"hardware_model\":");
-    chunk_buf_write_json_string(&cb, s.hardware_model);
-    chunk_buf_write_str(&cb, ",\"device_id\":");
-    chunk_buf_write_json_string(&cb, s.device_id);
-    chunk_buf_write_str(&cb, ",\"hostname\":");
-    chunk_buf_write_json_string(&cb, s.hostname);
-    chunk_buf_write_str(&cb, ",\"ip_address\":");
-    chunk_buf_write_json_string(&cb, s.ip_address);
-    chunk_buf_printf(&cb, ",\"is_homed\":%s,\"is_homing\":%s,\"free_heap\":%lu,\"free_psram\":%lu,",
-        s.is_homed ? "true" : "false", s.is_homing ? "true" : "false",
-        (unsigned long)s.free_heap, (unsigned long)s.free_psram);
-    chunk_buf_printf(&cb, "\"uptime_s\":%lu,\"wifi_rssi\":%ld,\"quiet_hours_active\":%s,\"timezone\":",
-        (unsigned long)s.uptime_s, (long)s.wifi_rssi, s.quiet_hours_active ? "true" : "false");
-    chunk_buf_write_json_string(&cb, s.timezone);
-    chunk_buf_write(&cb, "}", 1);
+    system_ops::info_to_json(&cb);
     chunk_buf_finish(&cb);
     return ESP_OK;
 }
@@ -56,16 +33,15 @@ static esp_err_t system_home_handler(httpd_req_t* req) {
         cJSON_Delete(json);
     }
 
-    ESP_LOGI(TAG, "Home request (force_full=%d)", force_full);
-
-    esp_err_t err = homing_service::start(force_full);
+    OpResult r = system_ops::home(force_full);
     httpd_resp_set_type(req, "application/json");
-    if (err == ESP_ERR_INVALID_STATE) {
+    if (r.err == ESP_ERR_INVALID_STATE) {
+        // Documented as 409 (a run is already in progress).
         httpd_resp_set_status(req, "409 Conflict");
         httpd_resp_sendstr(req, "{\"success\":false,\"error\":\"Homing already in progress\"}");
         return ESP_OK;
     }
-    if (err != ESP_OK) {
+    if (!r.ok()) {
         httpd_resp_set_status(req, "500 Internal Server Error");
         httpd_resp_sendstr(req, "{\"success\":false,\"error\":\"Failed to start homing\"}");
         return ESP_OK;
@@ -76,53 +52,23 @@ static esp_err_t system_home_handler(httpd_req_t* req) {
     return ESP_OK;
 }
 
-static void restart_timer_callback(void* arg) {
-    (void)arg;
-    ESP_LOGW(TAG, "Restarting device...");
-    esp_restart();
-}
-
-static void schedule_restart(uint32_t delay_ms) {
-    esp_timer_handle_t restart_timer;
-    esp_timer_create_args_t timer_args = {
-        .callback = restart_timer_callback,
-        .arg = nullptr,
-        .dispatch_method = ESP_TIMER_TASK,
-        .name = "restart",
-    };
-    if (esp_timer_create(&timer_args, &restart_timer) == ESP_OK) {
-        esp_timer_start_once(restart_timer, static_cast<uint64_t>(delay_ms) * 1000);
-        ESP_LOGI(TAG, "Device will restart in %lums", static_cast<unsigned long>(delay_ms));
-    }
-    else {
-        ESP_LOGW(TAG, "Failed to create restart timer, restarting immediately");
-        esp_restart();
-    }
-}
-
-// POST /api/system/reboot - restart (settings and library are kept)
+// POST /api/system/reboot - restart (settings and library are kept).
+// Refused for browser origins (see api_common::reject_browser_origin).
 static esp_err_t system_reboot_handler(httpd_req_t* req) {
+    if (reject_browser_origin(req)) return ESP_FAIL;
     ESP_LOGW(TAG, "Reboot requested via REST");
-    SandTablePlayer::stop();
-    esp_err_t send_err = send_ok(req);
-    schedule_restart(500);
-    return send_err;
+    OpResult r = system_ops::reboot("REST");
+    if (!r.ok()) return send_op_error(req, r);
+    return send_ok(req);
 }
 
-// POST /api/system/factory-reset
+// POST /api/system/factory-reset. LAN-only and refused for browser origins.
 static esp_err_t system_factory_reset_handler(httpd_req_t* req) {
+    if (reject_browser_origin(req)) return ESP_FAIL;
     ESP_LOGW(TAG, "Factory reset requested via REST");
-
-    esp_err_t err = tranquil_factory_reset();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Factory reset failed: %s", esp_err_to_name(err));
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Factory reset failed");
-        return ESP_FAIL;
-    }
-
-    esp_err_t send_err = send_ok(req);
-    schedule_restart(300);
-    return send_err;
+    OpResult r = system_ops::factory_reset("REST");
+    if (!r.ok()) return send_op_error(req, r);
+    return send_ok(req);
 }
 
 void system_api_register_handlers(httpd_handle_t server) {

@@ -31,7 +31,4 @@ private:
 
     // Send to specific local WebSocket client
     esp_err_t sendToLocalClient(int fd, const ResponseMessage& response);
-
-    // Send JSON response to REST client
-    esp_err_t sendToRest(httpd_req_t* req, const ResponseMessage& response);
 };

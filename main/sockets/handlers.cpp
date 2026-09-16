@@ -13,6 +13,10 @@
 #include <freertos/task.h>
 #include <kd_common.h>
 
+#include <atomic>
+#include <cstring>
+#include <vector>
+
 #include "drm/drm_license.h"
 #include "drm/drm_purchase.h"
 #include "ManifestDatabase.h"
@@ -219,66 +223,171 @@ namespace {
         sockets_invalidate_cert_cache();
     }
 
-    void handle_sync_purchases_response(Kd__V1__SyncPurchasesResponse* response) {
-        if (response == nullptr) return;
+    // --- Purchase receipt sync -------------------------------------------
+    //
+    // The server answers SyncPurchasesRequest with one bundle per owned
+    // pattern. Each receipt costs an RSA verify + a file write, and stamping
+    // ownership on the manifest used to REWRITE (and fsync) the whole
+    // patterns snapshot once per receipt — a 100-receipt sync was seconds of
+    // SD traffic on cloudlink's event task, stalling every other cloud
+    // message. Now the bundles are copied out of the protobuf (PSRAM), the
+    // work moves to a short-lived task, receipt files are written first (no
+    // manifest lock held across the RSA work), and the manifest rows are
+    // updated inside ONE BatchScope: a single snapshot save at the end.
 
-        size_t count = response->n_receipts;
-        ESP_LOGI(TAG, "Received %zu purchase receipts from server", count);
+    struct ReceiptCopy {
+        char pattern_uuid[40];
+        uint16_t payload_len;
+        uint16_t signature_len;
+        uint8_t payload[512];    // drm_purchase_verify rejects larger anyway
+        uint8_t signature[512];
+    };
 
-        size_t saved = 0;
+    struct ReceiptBatch {
+        ReceiptCopy* items;  // PSRAM, count entries
+        size_t count;
+    };
+
+    std::atomic<bool> s_receipt_sync_running{ false };
+
+    void process_receipt_batch(const ReceiptBatch& batch) {
+        struct Owned {
+            const ReceiptCopy* receipt;
+            int64_t purchased_at;
+            std::string receipt_id;
+        };
+        std::vector<Owned> owned;
+        owned.reserve(batch.count);
         size_t failed = 0;
 
-        for (size_t i = 0; i < count; i++) {
-            Kd__V1__PurchaseReceiptBundle* bundle = response->receipts[i];
-            if (!bundle || !bundle->pattern_uuid) {
-                ESP_LOGW(TAG, "Skipping receipt %zu: missing data", i);
-                failed++;
-                continue;
-            }
-
-            if (bundle->payload.data == nullptr || bundle->payload.len == 0 ||
-                bundle->signature.data == nullptr || bundle->signature.len == 0) {
-                ESP_LOGW(TAG, "Skipping receipt for %s: missing payload or signature",
-                    bundle->pattern_uuid);
-                failed++;
-                continue;
-            }
-
-            // Save the purchase receipt (this verifies signature and device binding)
-            esp_err_t err = drm_purchase_save(bundle->pattern_uuid,
-                bundle->payload.data, bundle->payload.len,
-                bundle->signature.data, bundle->signature.len);
-
-            if (err == ESP_OK) {
-                ESP_LOGI(TAG, "Saved receipt for pattern: %s", bundle->pattern_uuid);
-                saved++;
-
-                // Update ManifestDatabase if this pattern exists (pattern_uuid is external_uuid)
-                auto existing = ManifestDatabase::instance().getPatternByExternalUuid(bundle->pattern_uuid);
-                if (existing.has_value()) {
-                    Pattern updated = existing.value();
-                    updated.purchased = true;
-
-                    // Get purchase info for timestamp and receipt_id
-                    drm_purchase_info_t info;
-                    if (drm_purchase_verify(bundle->pattern_uuid, &info) == ESP_OK) {
-                        updated.purchased_at = info.purchased_at;
-                        updated.receipt_id = info.receipt_id;
-                    }
-
-                    // Update by internal ID
-                    ManifestDatabase::instance().updatePattern(existing->id, updated);
-                    ESP_LOGD(TAG, "Updated manifest for pattern: %s", bundle->pattern_uuid);
-                }
-            }
-            else {
+        // Phase 1: verify + save every receipt file, and read back the
+        // ownership metadata while the receipt is fresh. All the crypto
+        // happens here, with no manifest lock held.
+        for (size_t i = 0; i < batch.count; i++) {
+            const ReceiptCopy& r = batch.items[i];
+            esp_err_t err = drm_purchase_save(r.pattern_uuid,
+                r.payload, r.payload_len, r.signature, r.signature_len);
+            if (err != ESP_OK) {
                 ESP_LOGW(TAG, "Failed to save receipt for %s: %s",
-                    bundle->pattern_uuid, esp_err_to_name(err));
+                    r.pattern_uuid, esp_err_to_name(err));
                 failed++;
+                continue;
+            }
+            ESP_LOGI(TAG, "Saved receipt for pattern: %s", r.pattern_uuid);
+
+            Owned o{ &r, 0, "" };
+            drm_purchase_info_t info;
+            if (drm_purchase_verify(r.pattern_uuid, &info) == ESP_OK) {
+                o.purchased_at = info.purchased_at;
+                o.receipt_id = info.receipt_id;
+            }
+            owned.push_back(std::move(o));
+        }
+
+        // Phase 2: stamp ownership on the manifest rows that exist locally
+        // (pattern_uuid is the external uuid). One batch = one snapshot
+        // write, regardless of how many rows change.
+        size_t updated_rows = 0;
+        if (!owned.empty()) {
+            ManifestDatabase::BatchScope batch_scope;
+            auto& db = ManifestDatabase::instance();
+            for (const Owned& o : owned) {
+                auto existing = db.getPatternByExternalUuid(o.receipt->pattern_uuid);
+                if (!existing.has_value()) continue;
+
+                Pattern updated = existing.value();
+                updated.purchased = true;
+                updated.purchased_at = o.purchased_at;
+                updated.receipt_id = o.receipt_id;
+                if (db.updatePattern(existing->id, updated) == ESP_OK) {
+                    updated_rows++;
+                }
             }
         }
 
-        ESP_LOGI(TAG, "Purchase sync complete: %zu saved, %zu failed", saved, failed);
+        ESP_LOGI(TAG, "Purchase sync complete: %zu saved, %zu failed, %zu manifest rows updated",
+            owned.size(), failed, updated_rows);
+    }
+
+    void receipt_sync_task(void* arg) {
+        auto* batch = static_cast<ReceiptBatch*>(arg);
+        process_receipt_batch(*batch);
+        heap_caps_free(batch->items);
+        delete batch;
+        s_receipt_sync_running.store(false, std::memory_order_release);
+        vTaskDelete(nullptr);
+    }
+
+    void handle_sync_purchases_response(Kd__V1__SyncPurchasesResponse* response) {
+        if (response == nullptr) return;
+
+        const size_t count = response->n_receipts;
+        ESP_LOGI(TAG, "Received %zu purchase receipts from server", count);
+        if (count == 0) return;
+
+        // One sync at a time. A second response while one is still being
+        // written can only come from a reconnect storm; the request is
+        // re-sent on every connect and daily, so dropping it is safe and
+        // avoids two tasks racing on the same receipt files.
+        bool expected = false;
+        if (!s_receipt_sync_running.compare_exchange_strong(expected, true)) {
+            ESP_LOGW(TAG, "Receipt sync already in progress, dropping %zu receipts (re-synced later)",
+                count);
+            return;
+        }
+
+        auto* items = static_cast<ReceiptCopy*>(
+            heap_caps_calloc(count, sizeof(ReceiptCopy), MALLOC_CAP_SPIRAM));
+        if (items == nullptr) {
+            ESP_LOGE(TAG, "Failed to allocate receipt batch (%zu receipts)", count);
+            s_receipt_sync_running.store(false, std::memory_order_release);
+            return;
+        }
+
+        // Copy the bundles out: the protobuf is freed as soon as this
+        // handler returns, and the work continues on its own task.
+        size_t copied = 0;
+        for (size_t i = 0; i < count; i++) {
+            Kd__V1__PurchaseReceiptBundle* bundle = response->receipts[i];
+            if (!bundle || !bundle->pattern_uuid ||
+                bundle->payload.data == nullptr || bundle->payload.len == 0 ||
+                bundle->signature.data == nullptr || bundle->signature.len == 0) {
+                ESP_LOGW(TAG, "Skipping receipt %zu: missing data", i);
+                continue;
+            }
+            ReceiptCopy& r = items[copied];
+            if (strlen(bundle->pattern_uuid) >= sizeof(r.pattern_uuid) ||
+                bundle->payload.len > sizeof(r.payload) ||
+                bundle->signature.len > sizeof(r.signature)) {
+                ESP_LOGW(TAG, "Skipping receipt for %s: oversized (payload=%zu, sig=%zu)",
+                    bundle->pattern_uuid, bundle->payload.len, bundle->signature.len);
+                continue;
+            }
+            strcpy(r.pattern_uuid, bundle->pattern_uuid);
+            r.payload_len = static_cast<uint16_t>(bundle->payload.len);
+            r.signature_len = static_cast<uint16_t>(bundle->signature.len);
+            memcpy(r.payload, bundle->payload.data, bundle->payload.len);
+            memcpy(r.signature, bundle->signature.data, bundle->signature.len);
+            copied++;
+        }
+
+        if (copied == 0) {
+            heap_caps_free(items);
+            s_receipt_sync_running.store(false, std::memory_order_release);
+            ESP_LOGI(TAG, "Purchase sync: nothing usable in %zu receipts", count);
+            return;
+        }
+
+        auto* batch = new ReceiptBatch{ items, copied };
+        // 8 KB: drm_purchase_save/verify nest RSA verification + protobuf
+        // unpack + x509 parsing of the device cert.
+        if (xTaskCreate(receipt_sync_task, "receipt_sync", 8192, batch, 3, nullptr) != pdPASS) {
+            ESP_LOGW(TAG, "Failed to spawn receipt sync task, processing inline");
+            process_receipt_batch(*batch);
+            heap_caps_free(items);
+            delete batch;
+            s_receipt_sync_running.store(false, std::memory_order_release);
+        }
     }
 
 }  // namespace

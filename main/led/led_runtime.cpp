@@ -39,13 +39,18 @@ bool hardware_equal(const sand_table::RuntimeLEDConfig& a, const sand_table::Run
            a.color_order == b.color_order && a.white_swap == b.white_swap;
 }
 
+// Both bring_up/tear_down run with s_mutex AND PixelDriver::Lock held (see
+// init/apply): the driver lock is what keeps the driver task and the LED API
+// handlers off the channel list while it is rebuilt.
 void bring_up_locked(const sand_table::RuntimeLEDConfig& cfg) {
     if (!cfg.has_leds || cfg.led_count == 0) {
         ESP_LOGI(TAG, "LEDs disabled");
         return;
     }
     // LED pin stays in sdkconfig (hardware config); strip type/layout is
-    // runtime config from NVS.
+    // runtime config from NVS. Channel ids are stable per strip, so the
+    // effect settings persisted under this id survive a reconfigure — do
+    // not treat a (re)added channel as a fresh one.
     s_channel_id = PixelDriver::addChannel(ChannelConfig(
         (gpio_num_t)CONFIG_LED_PIN, cfg.led_count, to_format(cfg.format), "",
         to_ic(cfg.ic_type), to_order(cfg.color_order), cfg.white_swap));
@@ -81,8 +86,11 @@ void init() {
     PixelDriver::initialize(60);
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    s_active = sand_table::ConfigManager::instance().led_config();
-    bring_up_locked(s_active);
+    {
+        PixelDriver::Lock driver_lock;
+        s_active = sand_table::ConfigManager::instance().led_config();
+        bring_up_locked(s_active);
+    }
     xSemaphoreGive(s_mutex);
 }
 
@@ -94,9 +102,16 @@ void apply(const sand_table::RuntimeLEDConfig& cfg) {
         return;
     }
     ESP_LOGI(TAG, "Applying new LED hardware config");
-    tear_down_locked();
-    s_active = cfg;
-    bring_up_locked(s_active);
+    {
+        // Hold the driver's (recursive) lock across the whole
+        // stop/remove/add/start sequence: anything holding a raw
+        // PixelChannel* from getChannel() (the LED API, led_state) must
+        // not observe the channel mid-teardown.
+        PixelDriver::Lock driver_lock;
+        tear_down_locked();
+        s_active = cfg;
+        bring_up_locked(s_active);
+    }
     xSemaphoreGive(s_mutex);
 
     // Channel state (and channel count) changed for every client.

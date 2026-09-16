@@ -146,6 +146,11 @@ std::optional<Job> JobQueue::claimNextPendingJob() {
     return ManifestDatabase::instance().claimNextPendingJob();
 }
 
+std::optional<Job> JobQueue::claimNextPendingJob(bool (*eligible)(const Job&, void* ctx), void* ctx) {
+    if (!initialized_) return std::nullopt;
+    return ManifestDatabase::instance().claimNextPendingJob(eligible, ctx);
+}
+
 esp_err_t JobQueue::markCompleted(uint32_t job_id) {
     if (!initialized_) return ESP_ERR_INVALID_STATE;
     return ManifestDatabase::instance().markJobCompleted(job_id);

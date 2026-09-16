@@ -8,6 +8,7 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <cerrno>
@@ -59,10 +60,16 @@ JsonlTable::JsonlTable(const char* name, const char* path, uint32_t max_records)
     : name_(name), path_(path), max_records_(max_records) {}
 
 JsonlTable::~JsonlTable() {
+    clearRecords();
+    ps_free(records_);
+}
+
+void JsonlTable::clearRecords() {
     for (size_t i = 0; i < count_; i++) {
         ps_free(records_[i].json);
     }
-    ps_free(records_);
+    count_ = 0;
+    next_id_ = 1;
 }
 
 bool JsonlTable::ensureCapacity(size_t needed) {
@@ -82,8 +89,20 @@ bool JsonlTable::ensureCapacity(size_t needed) {
 }
 
 Record* JsonlTable::find(uint32_t id) const {
-    for (size_t i = 0; i < count_; i++) {
-        if (records_[i].id == id) return &records_[i];
+    // Binary search: records_ is sorted by id (see the header). With
+    // thousands of patterns the old linear scan ran on every getPattern(),
+    // i.e. per playlist entry and per status broadcast.
+    size_t lo = 0;
+    size_t hi = count_;
+    while (lo < hi) {
+        const size_t mid = lo + (hi - lo) / 2;
+        if (records_[mid].id < id) {
+            lo = mid + 1;
+        } else if (records_[mid].id > id) {
+            hi = mid;
+        } else {
+            return &records_[mid];
+        }
     }
     return nullptr;
 }
@@ -126,7 +145,8 @@ bool JsonlTable::storeJson(Record& rec, cJSON* obj) {
 // Load / save
 // ─────────────────────────────────────────────────────────────────────────────
 
-JsonlTable::LoadResult JsonlTable::loadFile(const char* path) {
+JsonlTable::LoadResult JsonlTable::loadFile(const char* path, bool* complete) {
+    if (complete) *complete = false;
     FILE* f = fopen(path, "r");
     if (!f) {
         // Distinguish "no snapshot yet" from a sick SD card: silently starting
@@ -175,11 +195,21 @@ JsonlTable::LoadResult JsonlTable::loadFile(const char* path) {
             // Not a meta line — fall through and treat as a record.
         }
 
+        // End-of-snapshot trailer (see save()): proves the file was written
+        // to the end. Not a record.
+        if (cJSON_GetObjectItem(obj, "eof")) {
+            if (complete) *complete = true;
+            cJSON_Delete(obj);
+            continue;
+        }
+
         const cJSON* id_item = cJSON_GetObjectItem(obj, "id");
         uint32_t id = (id_item && cJSON_IsNumber(id_item))
             ? static_cast<uint32_t>(id_item->valuedouble) : 0;
 
-        if (id == 0 || find(id) || count_ >= max_records_ || !ensureCapacity(count_ + 1)) {
+        // Duplicate ids are dropped after the sort below (find() needs the
+        // sorted invariant, which does not hold mid-load).
+        if (id == 0 || count_ >= max_records_ || !ensureCapacity(count_ + 1)) {
             skipped++;
             cJSON_Delete(obj);
             continue;
@@ -201,6 +231,23 @@ JsonlTable::LoadResult JsonlTable::loadFile(const char* path) {
     ps_free(line);
     fclose(f);
 
+    // Establish the sorted-by-id invariant find() relies on. Snapshots are
+    // written in id order, so this is normally a no-op pass; duplicate ids
+    // (corruption) keep one copy.
+    std::sort(records_, records_ + count_,
+        [](const Record& a, const Record& b) { return a.id < b.id; });
+    size_t w = 0;
+    for (size_t r = 0; r < count_; r++) {
+        if (w > 0 && records_[w - 1].id == records_[r].id) {
+            ps_free(records_[r].json);
+            skipped++;
+            continue;
+        }
+        if (w != r) records_[w] = records_[r];
+        w++;
+    }
+    count_ = w;
+
     if (next_id_ <= max_id) next_id_ = max_id + 1;
     if (skipped) {
         ESP_LOGW(TAG, "%s: skipped %zu unreadable lines in %s", name_, skipped, path);
@@ -212,12 +259,29 @@ JsonlTable::LoadResult JsonlTable::loadFile(const char* path) {
 
 bool JsonlTable::load() {
     char scratch[64];
+    bool complete = false;
 
-    // A leftover .tmp is an interrupted save — never a source of truth.
+    // A leftover .tmp is an interrupted save. save() fsyncs the whole file
+    // and appends a trailer BEFORE renaming it into place, so a .tmp that
+    // carries the trailer is a complete snapshot — and the newest one (each
+    // save rewrites it; a successful save renames it away). Recover from
+    // it rather than dropping the last mutation. A .tmp without the trailer
+    // was cut mid-write and is discarded.
     snprintf(scratch, sizeof(scratch), "%s.tmp", path_);
+    LoadResult res = loadFile(scratch, &complete);
+    if (res == LoadResult::Ok && complete) {
+        ESP_LOGW(TAG, "%s: recovered %zu records from interrupted save %s",
+            name_, count_, scratch);
+        save();  // materialize as the current snapshot
+        return true;
+    }
+    if (res == LoadResult::Ok) {
+        ESP_LOGW(TAG, "%s: discarding truncated interrupted save %s", name_, scratch);
+        clearRecords();
+    }
     unlink(scratch);
 
-    LoadResult res = loadFile(path_);
+    res = loadFile(path_, &complete);
     if (res == LoadResult::Ok) return true;
     if (res == LoadResult::Error) {
         ESP_LOGE(TAG, "%s: failed to read snapshot %s", name_, path_);
@@ -225,7 +289,7 @@ bool JsonlTable::load() {
     }
 
     snprintf(scratch, sizeof(scratch), "%s.bak", path_);
-    res = loadFile(scratch);
+    res = loadFile(scratch, &complete);
     if (res == LoadResult::Ok) {
         ESP_LOGW(TAG, "%s: recovered from backup snapshot", name_);
         save();
@@ -256,6 +320,9 @@ bool JsonlTable::save() {
     for (size_t i = 0; ok && i < count_; i++) {
         ok = fprintf(f, "%s\n", records_[i].json) > 0;
     }
+    // End-of-snapshot trailer: load() only trusts an interrupted .tmp that
+    // reached this line.
+    if (ok) ok = fprintf(f, "{\"eof\":1}\n") > 0;
 
     if (ok) ok = (fflush(f) == 0);
     if (ok) fsync(fileno(f));
@@ -348,6 +415,23 @@ cJSON* JsonlTable::get(uint32_t id) const {
         ESP_LOGE(TAG, "%s: stored record %lu unparseable", name_, (unsigned long)id);
     }
     return obj;
+}
+
+bool JsonlTable::uuidOf(uint32_t id, std::string& out) const {
+    Record* rec = find(id);
+    if (!rec) return false;
+    if (rec->uuid[0]) {
+        out = rec->uuid;
+        return true;
+    }
+    // Uncached (uuid absent or longer than the cache slot): parse.
+    cJSON* obj = cJSON_Parse(rec->json);
+    if (!obj) return false;
+    const cJSON* item = cJSON_GetObjectItem(obj, "uuid");
+    const bool found = item && cJSON_IsString(item) && item->valuestring[0];
+    if (found) out = item->valuestring;
+    cJSON_Delete(obj);
+    return found;
 }
 
 uint32_t JsonlTable::findByUuid(const char* uuid) const {

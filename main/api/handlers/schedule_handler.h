@@ -1,4 +1,4 @@
-// Unified schedule handler
+// Unified schedule handler: a thin protobuf codec over schedule_ops.
 #pragma once
 
 #include "handler_base.h"
@@ -18,8 +18,4 @@ public:
 
 private:
     ScheduleHandler() = default;
-
-    HandleResult handleScheduleRequest(const MessageContext& ctx, ResponseMessage& response);
-    HandleResult handleSetSchedule(const Kd__V1__TranquilSchedule* msg, const MessageContext& ctx, ResponseMessage& response);
-    HandleResult handleRunAction(const Kd__V1__RunScheduleAction* msg, const MessageContext& ctx, ResponseMessage& response);
 };

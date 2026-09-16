@@ -11,6 +11,60 @@ static const char* TAG = "ConfigManager";
 
 namespace sand_table {
 
+    namespace {
+        // Steps-per-motor-rev snapshot taken by MotionController::init_tmc()
+        // (see MechanicalConfig::applied_effective_steps_per_rev). 0 = not
+        // yet applied.
+        uint32_t s_applied_effective_steps_per_rev = 0;
+
+        template <typename T>
+        T clamp_field(const char* name, T value, T lo, T hi) {
+            if (value < lo || value > hi) {
+                ESP_LOGW(TAG, "%s=%ld out of range [%ld, %ld] in NVS - clamping",
+                    name, static_cast<long>(value), static_cast<long>(lo), static_cast<long>(hi));
+                return value < lo ? lo : hi;
+            }
+            return value;
+        }
+
+        bool is_valid_microsteps(uint16_t m) {
+            switch (m) {
+                case 1: case 2: case 4: case 8: case 16:
+                case 32: case 64: case 128: case 256:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        // Same ranges the REST layer validates on PATCH (config_api.cpp).
+        // NVS can hold anything: a partial write, a value from an older
+        // firmware with different limits, or a hand-edited flash image —
+        // and an out-of-range current or a 0 steps_per_rev reaches the
+        // drivers / the coupling divisor unchecked otherwise.
+        void clamp_motion_config(RuntimeMotionConfig& m) {
+            m.steps_per_rev = clamp_field<uint32_t>("steps_per_rev", m.steps_per_rev, 1, 10000);
+            if (!is_valid_microsteps(m.microsteps)) {
+                ESP_LOGW(TAG, "microsteps=%u not a supported TMC2209 resolution - using 16",
+                    m.microsteps);
+                m.microsteps = 16;
+            }
+            m.rho_max_rpm = clamp_field<int32_t>("rho_max_rpm", m.rho_max_rpm, 1, 100);
+            m.theta_current_ma = clamp_field<uint16_t>("theta_current_ma", m.theta_current_ma, 100, 1500);
+            m.rho_current_ma = clamp_field<uint16_t>("rho_current_ma", m.rho_current_ma, 100, 1500);
+            // stallguard_threshold is a uint8_t: 0-255 by construction.
+            m.accel_steps_s2 = clamp_field<uint32_t>("accel_steps_s2", m.accel_steps_s2, 500, 100000);
+            m.junction_dv_steps_s = clamp_field<uint32_t>("junction_dv_steps_s", m.junction_dv_steps_s, 10, 5000);
+            if (!(m.theta_max_rot_per_min >= 0.5f && m.theta_max_rot_per_min <= 60.0f)) {
+                ESP_LOGW(TAG, "theta_max_rot_per_min=%.2f out of range [0.5, 60] in NVS - clamping",
+                    static_cast<double>(m.theta_max_rot_per_min));
+                m.theta_max_rot_per_min = (m.theta_max_rot_per_min < 0.5f || !(m.theta_max_rot_per_min == m.theta_max_rot_per_min))
+                    ? 0.5f : 60.0f;
+            }
+            m.motor_idle_timeout_s = clamp_field<uint32_t>("motor_idle_timeout_s", m.motor_idle_timeout_s, 0, 86400);
+        }
+    }  // namespace
+
     ConfigManager& ConfigManager::instance() {
         static ConfigManager instance;
         return instance;
@@ -123,6 +177,8 @@ namespace sand_table {
             motion_.theta_max_rot_per_min = static_cast<float>(theta_rot_x100) / 100.0f;
         }
         nvs.get_u32(kKeyIdleTimeout, &motion_.motor_idle_timeout_s);
+
+        clamp_motion_config(motion_);
 
         // Check if we found at least one key (to distinguish empty from missing)
         return nvs.find_key(kKeyStepsPerRev);
@@ -456,6 +512,16 @@ namespace sand_table {
 
     uint32_t MechanicalConfig::effective_steps_per_rev() {
         return ConfigManager::instance().motion_config().effective_steps_per_rev();
+    }
+
+    uint32_t MechanicalConfig::applied_effective_steps_per_rev() {
+        return s_applied_effective_steps_per_rev > 0
+            ? s_applied_effective_steps_per_rev
+            : effective_steps_per_rev();
+    }
+
+    void MechanicalConfig::set_applied_effective_steps_per_rev(uint32_t steps) {
+        s_applied_effective_steps_per_rev = steps > 0 ? steps : 1;
     }
 
     // =============================================================================

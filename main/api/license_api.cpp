@@ -26,7 +26,11 @@ static esp_err_t send_json_response(httpd_req_t* req, cJSON* response, const cha
 }
 
 // GET /api/license/store-token
+// The token authenticates the owner to the store: never hand it to a
+// browser page (native apps send no Origin header; browsers always do).
 static esp_err_t handle_get_store_token(httpd_req_t* req) {
+    if (api_common::reject_browser_origin(req)) return ESP_FAIL;
+
     cJSON* response = cJSON_CreateObject();
 
     if (!drm_license_is_valid()) {

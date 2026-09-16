@@ -89,6 +89,7 @@ esp_err_t BinaryPatternReader::open(const char* uuid) {
     current_point_ = 0;
     has_peeked_ = false;
     read_failed_ = false;
+    resetBlock();
 
     ESP_LOGI(TAG, "Opened binary pattern: %s (%lu points)",
              path, (unsigned long)header_.point_count);
@@ -104,6 +105,7 @@ void BinaryPatternReader::close() {
     current_point_ = 0;
     has_peeked_ = false;
     read_failed_ = false;
+    resetBlock();
 }
 
 bool BinaryPatternReader::isOpen() const {
@@ -118,22 +120,40 @@ size_t BinaryPatternReader::getCurrentLine() const {
     return current_point_;
 }
 
+bool BinaryPatternReader::fillBlock() {
+    block_pos_ = 0;
+    block_count_ = 0;
+    if (!file_ || points_fetched_ >= header_.point_count) {
+        return false;  // end of data
+    }
+    const size_t remaining = header_.point_count - points_fetched_;
+    const size_t want = remaining < kBlockPoints ? remaining : kBlockPoints;
+    const size_t got = fread(block_, sizeof(BinaryPoint), want, file_);
+    if (got == 0) {
+        ESP_LOGE(TAG, "Failed to read binary points at index %zu", points_fetched_);
+        read_failed_ = true;  // terminal: end playback cleanly instead of spinning
+        return false;
+    }
+    block_count_ = got;
+    points_fetched_ += got;
+    return true;
+}
+
 PatternPoint BinaryPatternReader::readBinaryPoint() {
-    // Consume and account for every record read (current_point_++ per fread),
-    // skipping corrupt ones until a valid point, the point-count bound, or a
-    // read failure. Advancing current_point_ per record — not per valid point —
-    // keeps the file position, the count bound, and the peek/read cache in
-    // agreement. Previously a skipped record left current_point_ behind the
-    // file, so a peekNext() that hit a bad point advanced the stream without
-    // caching, and the following readNext() re-read and dropped the next
-    // (valid) point (silently skipping it and mis-counting path length).
+    // Consume and account for every record read (current_point_++ per
+    // record), skipping corrupt ones until a valid point, the point-count
+    // bound, or a read failure. Advancing current_point_ per record — not per
+    // valid point — keeps the stream position, the count bound, and the
+    // peek/read cache in agreement. Previously a skipped record left
+    // current_point_ behind the file, so a peekNext() that hit a bad point
+    // advanced the stream without caching, and the following readNext()
+    // re-read and dropped the next (valid) point (silently skipping it and
+    // mis-counting path length).
     while (file_ && !read_failed_ && current_point_ < header_.point_count) {
-        BinaryPoint bp;
-        if (fread(&bp, sizeof(bp), 1, file_) != 1) {
-            ESP_LOGE(TAG, "Failed to read binary point at index %zu", current_point_);
-            read_failed_ = true;  // terminal: end playback cleanly instead of spinning
+        if (block_pos_ >= block_count_ && !fillBlock()) {
             return PatternPoint();
         }
+        const BinaryPoint bp = block_[block_pos_++];
         ++current_point_;  // one record consumed, valid or not
 
         // Reject garbage motion targets: theta must be a finite, sane angle
@@ -198,7 +218,8 @@ bool BinaryPatternReader::hasMore() const {
 esp_err_t BinaryPatternReader::rewind() {
     if (!file_) return ESP_ERR_INVALID_STATE;
 
-    // Seek to start of points (after header)
+    // Seek to start of points (after header). The block buffer holds data
+    // from past the current point, so it is dropped with the file position.
     if (fseek(file_, sizeof(UnencryptedPatternHeader), SEEK_SET) != 0) {
         ESP_LOGE(TAG, "Rewind seek failed");
         read_failed_ = true;
@@ -207,6 +228,7 @@ esp_err_t BinaryPatternReader::rewind() {
     current_point_ = 0;
     has_peeked_ = false;
     read_failed_ = false;
+    resetBlock();
 
     return ESP_OK;
 }

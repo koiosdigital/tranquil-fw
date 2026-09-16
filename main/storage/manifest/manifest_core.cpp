@@ -32,6 +32,24 @@ bool ManifestDatabase::isInitialized() const {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// BatchScope (deferred persistence, see ManifestDatabase.h)
+// ─────────────────────────────────────────────────────────────────────────────
+
+ManifestDatabase::BatchScope::BatchScope(ManifestDatabase& db) : db_(db) {
+    db_.impl_->mutex.lock();
+    db_.impl_->batch_depth++;
+}
+
+ManifestDatabase::BatchScope::~BatchScope() {
+    if (--db_.impl_->batch_depth == 0) {
+        if (!db_.impl_->flush()) {
+            ESP_LOGE(TAG, "Batch flush failed: a snapshot was not saved");
+        }
+    }
+    db_.impl_->mutex.unlock();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Lifecycle
 // ─────────────────────────────────────────────────────────────────────────────
 

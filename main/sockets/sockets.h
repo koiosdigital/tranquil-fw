@@ -18,8 +18,16 @@
 // kd_common_init() (WiFi + crypto) to have run.
 void cloud_sockets_init();
 
-// Deinitialize and clean up
+// Deinitialize and clean up. Must NOT be called from cloudlink's own message
+// callback (i.e. from a cloud message handler) — see cloud_sockets_quiesce().
 void cloud_sockets_deinit();
+
+// Soft shutdown safe from ANY context, including a cloud message handler:
+// inbound messages are dropped from here on (license / receipt / download
+// responses all write to the SD card) and new pattern downloads are refused.
+// Used by factory reset so nothing writes the card while it is being wiped.
+// Irreversible until reboot.
+void cloud_sockets_quiesce();
 
 // Check if connected to cloud server (socket up; welcome may be pending)
 bool cloud_sockets_is_connected();
@@ -28,8 +36,9 @@ bool cloud_sockets_is_connected();
 // senders gate on this so nothing is queued into the outbox while offline.
 bool cloud_sockets_is_ready();
 
-// Largest message (bytes) cloudlink will accept for send/receive. Senders of
-// variable-size payloads (coredumps, bundles) should check before packing.
+// Largest message (bytes) cloudlink will accept, inbound and outbound
+// (32 KB, see sockets.cpp). Senders of variable-size payloads (coredumps,
+// bundles) should check before packing.
 size_t cloud_sockets_max_msg_size();
 
 // Make the next connection present the freshly stored device cert instead of

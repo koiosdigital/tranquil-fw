@@ -34,8 +34,10 @@ public:
                                const DownloadJobData& data,
                                int priority = 0);
 
-    // Job retrieval (for processor)
+    // Job retrieval (for processor). The filtered form only claims jobs
+    // `eligible` accepts (nullptr = any pending job).
     std::optional<Job> claimNextPendingJob();
+    std::optional<Job> claimNextPendingJob(bool (*eligible)(const Job&, void* ctx), void* ctx);
 
     // Job status updates (by internal ID)
     esp_err_t markCompleted(uint32_t job_id);

@@ -94,7 +94,7 @@ esp_err_t ManifestDatabase::addPlaylist(Playlist& playlist) {
         return ESP_ERR_NO_MEM;
     }
     playlist.id = id;
-    if (!impl_->playlists.save()) return ESP_FAIL;
+    if (!impl_->save(impl_->playlists)) return ESP_FAIL;
 
     ESP_LOGI(TAG, "Playlist added: id=%lu, uuid=%s", (unsigned long)playlist.id,
         playlist.external_uuid.c_str());
@@ -123,7 +123,7 @@ esp_err_t ManifestDatabase::updatePlaylist(uint32_t id, const Playlist& playlist
         ESP_LOGE(TAG, "Failed to update playlist %lu", (unsigned long)id);
         return ESP_FAIL;
     }
-    return impl_->playlists.save() ? ESP_OK : ESP_FAIL;
+    return impl_->save(impl_->playlists) ? ESP_OK : ESP_FAIL;
 }
 
 esp_err_t ManifestDatabase::deletePlaylist(uint32_t id) {
@@ -133,7 +133,7 @@ esp_err_t ManifestDatabase::deletePlaylist(uint32_t id) {
     if (!impl_->playlists.remove(id)) {
         return ESP_ERR_NOT_FOUND;
     }
-    if (!impl_->playlists.save()) return ESP_FAIL;
+    if (!impl_->save(impl_->playlists)) return ESP_FAIL;
 
     ESP_LOGI(TAG, "Playlist deleted: id=%lu", (unsigned long)id);
     return ESP_OK;

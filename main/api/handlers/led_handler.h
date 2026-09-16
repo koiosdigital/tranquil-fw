@@ -1,4 +1,4 @@
-// Unified LED control handler
+// Unified LED control handler: a thin protobuf codec over led_ops / led_state.
 #pragma once
 
 #include "handler_base.h"
@@ -18,8 +18,4 @@ public:
 
 private:
     LEDHandler() = default;
-
-    HandleResult handleLEDConfigRequest(ResponseMessage& response);
-    HandleResult handleSetLEDChannel(const Kd__V1__SetLEDChannel* msg, ResponseMessage& response);
-    HandleResult handleGetLEDEffects(ResponseMessage& response);
 };

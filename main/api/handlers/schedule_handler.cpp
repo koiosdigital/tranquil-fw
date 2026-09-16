@@ -1,6 +1,7 @@
 // Unified schedule handler implementation
 #include "schedule_handler.h"
 #include "schedule_manager.h"
+#include "ops/schedule_ops.h"
 
 #include <esp_log.h>
 
@@ -16,15 +17,55 @@ HandleResult ScheduleHandler::handle(
     const MessageContext& ctx,
     ResponseMessage& response
 ) {
+    const char* rid = ctx.request_id;
+
     switch (msg->message_case) {
         case KD__V1__TRANQUIL_MESSAGE__MESSAGE_SCHEDULE_REQUEST:
-            return handleScheduleRequest(ctx, response);
+            ESP_LOGI(TAG, "ScheduleRequest from %s", ctx.isLocal() ? "local" : "cloud");
+            response = ScheduleManager::instance().buildScheduleMessage(rid);
+            return response.valid() ? HandleResult::ok() : HandleResult::error();
 
-        case KD__V1__TRANQUIL_MESSAGE__MESSAGE_SCHEDULE:
-            return handleSetSchedule(msg->schedule, ctx, response);
+        case KD__V1__TRANQUIL_MESSAGE__MESSAGE_SCHEDULE: {
+            const auto* m = msg->schedule;
+            ESP_LOGI(TAG, "SetSchedule from %s with %zu items%s",
+                ctx.isLocal() ? "local" : "cloud",
+                m ? m->n_schedule_items : 0,
+                (m && m->quiet_hours) ? " + quiet hours" : "");
 
-        case KD__V1__TRANQUIL_MESSAGE__MESSAGE_RUN_SCHEDULE_ACTION:
-            return handleRunAction(msg->run_schedule_action, ctx, response);
+            if (!m) {
+                response = makeCommandResult(false, "Invalid schedule message", rid, ESP_ERR_INVALID_ARG);
+                return HandleResult::ok();
+            }
+
+            auto items = ScheduleManager::itemsFromProto(m);
+            auto quiet = ScheduleManager::quietFromProto(m);
+
+            // The requester is answered with the stored schedule below, so the
+            // notifier's push leaves it out; everyone else (LAN and cloud)
+            // gets the debounced Schedule push.
+            OpResult r = schedule_ops::set_schedule(std::move(items), quiet,
+                ctx.isLocal() ? ctx.socket_fd : -1, ctx.isCloud());
+            if (!r.ok()) {
+                response = makeCommandResult(r, rid);
+                return HandleResult::ok();
+            }
+
+            response = ScheduleManager::instance().buildScheduleMessage(rid);
+            return HandleResult::ok();
+        }
+
+        case KD__V1__TRANQUIL_MESSAGE__MESSAGE_RUN_SCHEDULE_ACTION: {
+            const auto* m = msg->run_schedule_action;
+            if (!m || !m->action) {
+                response = makeCommandResult(false, "Missing action", rid, ESP_ERR_INVALID_ARG);
+                return HandleResult::ok();
+            }
+            auto action = ScheduleManager::actionFromProto(m->action);
+            ESP_LOGI(TAG, "RunScheduleAction %s (force=%d) from %s",
+                ScheduleManager::actionName(action.type), m->force, ctx.isLocal() ? "local" : "cloud");
+            response = makeCommandResult(schedule_ops::run_action(action, m->force != 0), rid);
+            return HandleResult::ok();
+        }
 
         default:
             return HandleResult::notHandled();
@@ -48,66 +89,4 @@ std::vector<Kd__V1__TranquilMessage__MessageCase> ScheduleHandler::supportedMess
         KD__V1__TRANQUIL_MESSAGE__MESSAGE_SCHEDULE,
         KD__V1__TRANQUIL_MESSAGE__MESSAGE_RUN_SCHEDULE_ACTION,
     };
-}
-
-HandleResult ScheduleHandler::handleScheduleRequest(
-    const MessageContext& ctx,
-    ResponseMessage& response
-) {
-    ESP_LOGI(TAG, "ScheduleRequest from %s", ctx.isLocal() ? "local" : "cloud");
-    response = ScheduleManager::instance().buildScheduleMessage();
-    return response.valid() ? HandleResult::ok() : HandleResult::error();
-}
-
-HandleResult ScheduleHandler::handleSetSchedule(
-    const Kd__V1__TranquilSchedule* msg,
-    const MessageContext& ctx,
-    ResponseMessage& response
-) {
-    ESP_LOGI(TAG, "SetSchedule from %s with %zu items%s",
-        ctx.isLocal() ? "local" : "cloud",
-        msg ? msg->n_schedule_items : 0,
-        (msg && msg->quiet_hours) ? " + quiet hours" : "");
-
-    if (!msg) {
-        response = makeCommandResult(false, "Invalid schedule message");
-        return HandleResult::ok();
-    }
-
-    auto items = ScheduleManager::itemsFromProto(msg);
-    auto quiet = ScheduleManager::quietFromProto(msg);
-
-    esp_err_t ret = ScheduleManager::instance().setSchedule(std::move(items), quiet);
-    if (ret == ESP_ERR_INVALID_SIZE) {
-        response = makeCommandResult(false, "Too many schedule items or quiet windows");
-        return HandleResult::ok();
-    }
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set schedule: %s", esp_err_to_name(ret));
-        response = makeCommandResult(false, "Failed to save schedule");
-        return HandleResult::ok();
-    }
-
-    // Answer the requester with the stored schedule (ids assigned). Everyone
-    // else, LAN and cloud, gets the debounced Schedule push from the
-    // library notifier that setSchedule() posted.
-    response = ScheduleManager::instance().buildScheduleMessage();
-    return HandleResult::ok();
-}
-
-HandleResult ScheduleHandler::handleRunAction(
-    const Kd__V1__RunScheduleAction* msg,
-    const MessageContext& ctx,
-    ResponseMessage& response
-) {
-    if (!msg || !msg->action) {
-        response = makeCommandResult(false, "Missing action");
-        return HandleResult::ok();
-    }
-    auto action = ScheduleManager::actionFromProto(msg->action);
-    ESP_LOGI(TAG, "RunScheduleAction %s (force=%d) from %s",
-        ScheduleManager::actionName(action.type), msg->force, ctx.isLocal() ? "local" : "cloud");
-    auto res = ScheduleManager::instance().runAction(action, msg->force != 0);
-    response = makeCommandResult(res.ok, res.detail);
-    return HandleResult::ok();
 }

@@ -193,21 +193,15 @@ inline bool VelocityPlanner::add_segment(const MotionSegment& segment) {
 
     segments_[head_] = segment;
 
-    // Theta spin-rate safety cap, same formula as the executor's clamp in
-    // calculate_velocity_profile. Capping nominal HERE keeps junction
-    // planning consistent with what the executor will actually run —
-    // otherwise a capped segment's neighbors get junction speeds the
-    // executor then clamps into a discontinuity.
+    // Theta spin-rate safety cap (MotionConfig::theta_path_speed_cap — the
+    // same formula the executor clamps with in calculate_velocity_profile).
+    // Capping nominal HERE keeps junction planning consistent with what the
+    // executor will actually run — otherwise a capped segment's neighbors
+    // get junction speeds the executor then clamps into a discontinuity.
     MotionSegment& stored = segments_[head_];
-    if (stored.delta_theta_steps != 0 && stored.distance > 0.0f) {
-        const float rotations =
-            std::fabs(static_cast<float>(stored.delta_theta_rad)) /
-            (2.0f * static_cast<float>(M_PI));
-        if (rotations > 1e-6f) {
-            const float v_cap = MotionConfig::theta_max_rot_per_min() *
-                stored.distance / rotations;
-            stored.nominal_velocity = std::min(stored.nominal_velocity, v_cap);
-        }
+    if (stored.delta_theta_steps != 0) {
+        stored.nominal_velocity = std::min(stored.nominal_velocity,
+            MotionConfig::theta_path_speed_cap(stored.delta_theta_rad, stored.distance));
     }
 
     head_ = (head_ + 1) % kLookaheadDepth;

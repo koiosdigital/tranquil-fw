@@ -25,9 +25,13 @@ namespace sand_table {
             // pairing when exactly one axis has ROBOT_*_INVERT_DIRECTION set
             // (see config.h); every consumer of this ratio (compensation,
             // position readout, wrap unwind) inherits the sign from here.
+            // The steps-per-motor-rev is the value the drivers were
+            // PROGRAMMED with at boot (applied snapshot), not the live NVS
+            // number — a PATCHed microstep setting must not change the
+            // coupling until the reboot that actually applies it.
             rho_steps_per_theta_step_ = (steps_per_theta_rot_ > 0)
                 ? MechanicalConfig::COUPLING_SIGN *
-                    static_cast<double>(MechanicalConfig::effective_steps_per_rev()) /
+                    static_cast<double>(MechanicalConfig::applied_effective_steps_per_rev()) /
                     static_cast<double>(steps_per_theta_rot_)
                 : 0.0;
         }

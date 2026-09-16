@@ -58,10 +58,22 @@ static int cmd_home(int argc, char** argv) {
     bool force_full = (home_args.full->count > 0);
     printf("Starting %s homing...\n", force_full ? "full" : "quick");
 
+    // Same guarded entry as the REST/boot path: MotionController::home()
+    // claims the single homing slot, refuses to run under a latched e-stop
+    // or a stale motion config, and drains queued motion first. (The player
+    // is out of reach from this component; a playing pattern is halted by
+    // that drain and its feeder stops on the resulting InvalidState.)
     auto result = s_controller->home(force_full);
 
     if (result.is_err()) {
-        printf("{\"error\":true,\"message\":\"Homing failed\"}\n");
+        const char* why = "Homing failed";
+        switch (result.error()) {
+            case MotionError::InvalidState: why = "Homing already in progress"; break;
+            case MotionError::EmergencyStop: why = "Emergency stop latched (clear_estop first) or homing aborted"; break;
+            case MotionError::RebootRequired: why = "Motion config changed since boot - reboot required"; break;
+            default: break;
+        }
+        printf("{\"error\":true,\"message\":\"%s\"}\n", why);
         return 1;
     }
 
@@ -95,6 +107,24 @@ static int cmd_stop(int argc, char** argv) {
 
 static void register_stop() {
     kd_console_register_cmd("stop", "Emergency stop all motion", &cmd_stop);
+}
+
+// --- clear_estop ---
+static int cmd_clear_estop(int argc, char** argv) {
+    if (!s_controller) {
+        printf("{\"error\":true,\"message\":\"Motion controller not initialized\"}\n");
+        return 1;
+    }
+
+    s_controller->clear_emergency_stop();
+    printf("{\"error\":false,\"message\":\"Emergency stop cleared\"}\n");
+    return 0;
+}
+
+static void register_clear_estop() {
+    kd_console_register_cmd("clear_estop",
+        "Clear a latched emergency stop (moves and homing are refused while latched)",
+        &cmd_clear_estop);
 }
 
 // --- pos ---
@@ -369,8 +399,8 @@ static int cmd_set_theta_current(int argc, char** argv) {
     }
 
     int val = set_theta_curr_args.current->ival[0];
-    if (val < 100 || val > 2000) {
-        printf("{\"error\":true,\"message\":\"Current must be 100-2000 mA\"}\n");
+    if (val < 100 || val > 1500) {  // same range as the REST API / NVS clamp
+        printf("{\"error\":true,\"message\":\"Current must be 100-1500 mA\"}\n");
         return 1;
     }
 
@@ -419,8 +449,8 @@ static int cmd_set_rho_current(int argc, char** argv) {
     }
 
     int val = set_rho_curr_args.current->ival[0];
-    if (val < 100 || val > 2000) {
-        printf("{\"error\":true,\"message\":\"Current must be 100-2000 mA\"}\n");
+    if (val < 100 || val > 1500) {  // same range as the REST API / NVS clamp
+        printf("{\"error\":true,\"message\":\"Current must be 100-1500 mA\"}\n");
         return 1;
     }
 
@@ -656,6 +686,7 @@ void console_init(MotionController* controller) {
     // Core commands
     register_home();
     register_stop();
+    register_clear_estop();
     register_pos();
     register_rotate();
     register_status();

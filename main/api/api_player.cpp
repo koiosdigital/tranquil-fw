@@ -1,33 +1,41 @@
+// Player REST API: a thin JSON codec over player_ops.
 #include "api_player.h"
-#include "SandTablePlayer.h"
 #include "api_common.h"
+#include "ops/player_ops.h"
+
 #include "esp_log.h"
 #include "cJSON.h"
 #include "esp_http_server.h"
+#include <cstdio>
 #include <cstring>
 
 static const char* TAG = "api_player";
 
-// Helper: get state as cJSON
-cJSON* api_player_get_state_json() {
-    return SandTablePlayer::getStateJSON();
+using namespace api_common;
+
+namespace {
+
+bool has(const char* s) { return s && s[0] != '\0'; }
+
+// Shared response for GET/PATCH/play/stop/skip/previous.
+esp_err_t send_state(httpd_req_t* req) {
+    PlaybackStatus s = player_ops::snapshot();
+    httpd_resp_set_type(req, "application/json");
+    ChunkBuf cb;
+    chunk_buf_init(&cb, req);
+    player_ops::to_json(&cb, s);
+    chunk_buf_finish(&cb);
+    return ESP_OK;
+}
+
+const char* json_str(const cJSON* obj, const char* key) {
+    const cJSON* v = cJSON_GetObjectItem(obj, key);
+    return (v && cJSON_IsString(v)) ? v->valuestring : nullptr;
 }
 
 // GET /api/player - get state
-static esp_err_t handle_get_state(httpd_req_t* req) {
-    // Shared response path for GET/PATCH/play/stop/skip — both the JSON
-    // build and the print can fail under heap pressure.
-    cJSON* state = api_player_get_state_json();
-    char* resp = state ? cJSON_PrintUnformatted(state) : nullptr;
-    cJSON_Delete(state);
-    if (!resp) {
-        httpd_resp_send_500(req);
-        return ESP_ERR_NO_MEM;
-    }
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, resp);
-    free(resp);
-    return ESP_OK;
+esp_err_t handle_get_state(httpd_req_t* req) {
+    return send_state(req);
 }
 
 // POST /api/player/play - unified play endpoint
@@ -36,68 +44,27 @@ static esp_err_t handle_get_state(httpd_req_t* req) {
 //   { "playlist_uuid": "...", "shuffle": bool, "loop": bool } - play playlist from start
 //   { "playlist_uuid": "...", "pattern_uuid": "...", "shuffle": bool, "loop": bool } - play playlist from pattern
 //   { "random": true, "loop": bool } - play a random library pattern; loop = keep chaining random patterns
-static esp_err_t handle_play(httpd_req_t* req) {
+esp_err_t handle_play(httpd_req_t* req) {
     // Full body read (a truncated single recv left the remainder to be
     // parsed as the NEXT request on the keep-alive connection).
-    cJSON* root = api_common::parse_json_body(req, 2048);
+    cJSON* root = parse_json_body(req, 2048);
     if (!root) return ESP_FAIL;
 
-    cJSON* pattern_uuid = cJSON_GetObjectItem(root, "pattern_uuid");
-    cJSON* playlist_uuid = cJSON_GetObjectItem(root, "playlist_uuid");
-    cJSON* random_item = cJSON_GetObjectItem(root, "random");
+    player_ops::PlayRequest r;
+    r.pattern_uuid = json_str(root, "pattern_uuid");
+    r.playlist_uuid = json_str(root, "playlist_uuid");
+    const cJSON* random_item = cJSON_GetObjectItem(root, "random");
+    r.random = random_item && cJSON_IsBool(random_item) && cJSON_IsTrue(random_item);
+    const cJSON* shuffle_item = cJSON_GetObjectItem(root, "shuffle");
+    r.shuffle = shuffle_item && cJSON_IsBool(shuffle_item) && cJSON_IsTrue(shuffle_item);
+    const cJSON* loop_item = cJSON_GetObjectItem(root, "loop");
+    r.loop = loop_item && cJSON_IsBool(loop_item) && cJSON_IsTrue(loop_item);
 
-    bool has_pattern = pattern_uuid && cJSON_IsString(pattern_uuid) && strlen(pattern_uuid->valuestring) > 0;
-    bool has_playlist = playlist_uuid && cJSON_IsString(playlist_uuid) && strlen(playlist_uuid->valuestring) > 0;
-    bool random = random_item && cJSON_IsBool(random_item) && cJSON_IsTrue(random_item);
-
-    if (!has_pattern && !has_playlist && !random) {
-        cJSON_Delete(root);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing pattern_uuid, playlist_uuid or random");
-        return ESP_FAIL;
-    }
-
-    // Get optional flags
-    bool shuffle = false;
-    bool loop = false;
-    cJSON* shuffle_item = cJSON_GetObjectItem(root, "shuffle");
-    if (shuffle_item && cJSON_IsBool(shuffle_item)) {
-        shuffle = cJSON_IsTrue(shuffle_item);
-    }
-    cJSON* loop_item = cJSON_GetObjectItem(root, "loop");
-    if (loop_item && cJSON_IsBool(loop_item)) {
-        loop = cJSON_IsTrue(loop_item);
-    }
-
-    esp_err_t ret;
-
-    if (random) {
-        ret = SandTablePlayer::playRandom(loop);
-    } else if (has_playlist && has_pattern) {
-        // Playlist with pattern: start playlist from specific pattern
-        ret = SandTablePlayer::playPlaylistFromPattern(
-            playlist_uuid->valuestring, pattern_uuid->valuestring, shuffle, loop);
-    } else if (has_playlist) {
-        // Playlist only: start from beginning (or shuffle if enabled)
-        ret = SandTablePlayer::playPlaylist(playlist_uuid->valuestring, shuffle, loop);
-    } else {
-        // Pattern only: play single pattern
-        ret = SandTablePlayer::playPattern(pattern_uuid->valuestring);
-    }
-
+    OpResult res = player_ops::play(r);
     cJSON_Delete(root);
 
-    if (ret != ESP_OK) {
-        if (ret == ESP_ERR_NOT_FOUND) {
-            httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Pattern or playlist not found");
-        } else if (ret == ESP_ERR_INVALID_STATE) {
-            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Not homed or not initialized");
-        } else {
-            httpd_resp_send_500(req);
-        }
-        return ESP_FAIL;
-    }
-
-    return handle_get_state(req);
+    if (!res.ok()) return send_op_error(req, res);
+    return send_state(req);
 }
 
 // PATCH /api/player - update player state
@@ -109,186 +76,146 @@ static esp_err_t handle_play(httpd_req_t* req) {
 //   random_loop: bool - random-loop mode (on: chain random patterns after the current one, or start one if idle; off: finish the current pattern then stop)
 //   pattern_uuid: string - set playing pattern (stops current, plays new)
 //   playlist_uuid: string - set playing playlist (stops current, plays new)
-// If both pattern_uuid and playlist_uuid provided, starts playlist from pattern
-static esp_err_t handle_patch(httpd_req_t* req) {
-    cJSON* root = api_common::parse_json_body(req, 2048);
+// If both pattern_uuid and playlist_uuid provided, starts playlist from pattern.
+// Every present field is applied; the first failure names its field in the
+// error body.
+esp_err_t handle_patch(httpd_req_t* req) {
+    cJSON* root = parse_json_body(req, 2048);
     if (!root) return ESP_FAIL;
 
-    esp_err_t ret = ESP_OK;
+    const char* failed_field = nullptr;
+    OpResult failure;
+    auto note = [&](const char* field, const OpResult& r) {
+        if (!r.ok()) {
+            ESP_LOGW(TAG, "PATCH %s failed: %s", field, r.detail);
+            if (!failed_field) {
+                failed_field = field;
+                failure = r;
+            }
+        }
+    };
 
-    // Handle is_paused first (pause/resume)
-    cJSON* is_paused = cJSON_GetObjectItem(root, "is_paused");
+    const cJSON* is_paused = cJSON_GetObjectItem(root, "is_paused");
     if (is_paused && cJSON_IsBool(is_paused)) {
-        if (cJSON_IsTrue(is_paused)) {
-            ret = SandTablePlayer::pause();
-        } else {
-            ret = SandTablePlayer::resume();
-        }
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to set paused state");
-        }
+        note("is_paused", player_ops::set_paused(cJSON_IsTrue(is_paused)));
     }
 
-    // Handle loop
-    cJSON* loop = cJSON_GetObjectItem(root, "loop");
+    const cJSON* loop = cJSON_GetObjectItem(root, "loop");
     if (loop && cJSON_IsBool(loop)) {
-        ret = SandTablePlayer::setLoop(cJSON_IsTrue(loop));
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to set loop");
-        }
+        note("loop", player_ops::set_loop(cJSON_IsTrue(loop)));
     }
 
-    // Handle shuffle
-    cJSON* shuffle = cJSON_GetObjectItem(root, "shuffle");
+    const cJSON* shuffle = cJSON_GetObjectItem(root, "shuffle");
     if (shuffle && cJSON_IsBool(shuffle)) {
-        ret = SandTablePlayer::setShuffle(cJSON_IsTrue(shuffle));
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to set shuffle");
-        }
+        note("shuffle", player_ops::set_shuffle(cJSON_IsTrue(shuffle)));
     }
 
-    // Handle feed_rate
-    cJSON* feed_rate = cJSON_GetObjectItem(root, "feed_rate");
+    const cJSON* feed_rate = cJSON_GetObjectItem(root, "feed_rate");
     if (feed_rate && cJSON_IsNumber(feed_rate)) {
-        SandTablePlayer::setFeedRate(feed_rate->valuedouble);
+        note("feed_rate", player_ops::set_feed_rate(feed_rate->valuedouble));
     }
 
-    // Handle random_loop
-    cJSON* random_loop = cJSON_GetObjectItem(root, "random_loop");
+    const cJSON* random_loop = cJSON_GetObjectItem(root, "random_loop");
     if (random_loop && cJSON_IsBool(random_loop)) {
-        ret = SandTablePlayer::setRandomLoop(cJSON_IsTrue(random_loop));
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to set random loop: %s", esp_err_to_name(ret));
-            cJSON_Delete(root);
-            if (ret == ESP_ERR_NOT_FOUND) {
-                httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "No playable patterns");
-            } else if (ret == ESP_ERR_INVALID_STATE) {
-                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Not homed or not initialized");
-            } else {
-                httpd_resp_send_500(req);
-            }
-            return ESP_FAIL;
-        }
+        note("random_loop", player_ops::set_random_loop(cJSON_IsTrue(random_loop)));
     }
 
-    // Handle pattern/playlist changes (these start new playback)
-    cJSON* pattern_uuid = cJSON_GetObjectItem(root, "pattern_uuid");
-    cJSON* playlist_uuid = cJSON_GetObjectItem(root, "playlist_uuid");
-
-    bool has_pattern = pattern_uuid && cJSON_IsString(pattern_uuid) && strlen(pattern_uuid->valuestring) > 0;
-    bool has_playlist = playlist_uuid && cJSON_IsString(playlist_uuid) && strlen(playlist_uuid->valuestring) > 0;
-
-    if (has_pattern || has_playlist) {
-        // Get current shuffle/loop state for new playback
-        bool cur_shuffle = SandTablePlayer::isShuffle();
-        bool cur_loop = SandTablePlayer::isLoop();
-
-        // Use values from request if provided, otherwise use current
-        if (shuffle && cJSON_IsBool(shuffle)) {
-            cur_shuffle = cJSON_IsTrue(shuffle);
-        }
-        if (loop && cJSON_IsBool(loop)) {
-            cur_loop = cJSON_IsTrue(loop);
-        }
-
-        if (has_playlist && has_pattern) {
-            ret = SandTablePlayer::playPlaylistFromPattern(
-                playlist_uuid->valuestring, pattern_uuid->valuestring, cur_shuffle, cur_loop);
-        } else if (has_playlist) {
-            ret = SandTablePlayer::playPlaylist(playlist_uuid->valuestring, cur_shuffle, cur_loop);
-        } else {
-            ret = SandTablePlayer::playPattern(pattern_uuid->valuestring);
-        }
-
-        if (ret != ESP_OK) {
-            cJSON_Delete(root);
-            if (ret == ESP_ERR_NOT_FOUND) {
-                httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Pattern or playlist not found");
-            } else if (ret == ESP_ERR_INVALID_STATE) {
-                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Not homed or not initialized");
-            } else {
-                httpd_resp_send_500(req);
-            }
-            return ESP_FAIL;
-        }
+    // Pattern/playlist changes start new playback with the request's
+    // shuffle/loop when given, else the player's current settings.
+    const char* pattern_uuid = json_str(root, "pattern_uuid");
+    const char* playlist_uuid = json_str(root, "playlist_uuid");
+    if (has(pattern_uuid) || has(playlist_uuid)) {
+        player_ops::PlayRequest r;
+        r.pattern_uuid = pattern_uuid;
+        r.playlist_uuid = playlist_uuid;
+        r.shuffle = (shuffle && cJSON_IsBool(shuffle)) ? cJSON_IsTrue(shuffle) : SandTablePlayer::isShuffle();
+        r.loop = (loop && cJSON_IsBool(loop)) ? cJSON_IsTrue(loop) : SandTablePlayer::isLoop();
+        note(has(playlist_uuid) ? "playlist_uuid" : "pattern_uuid", player_ops::play(r));
     }
 
     cJSON_Delete(root);
-    return handle_get_state(req);
+
+    if (failed_field) {
+        // The detail buffer only has to outlive this synchronous send.
+        char detail[96];
+        snprintf(detail, sizeof(detail), "%s: %s", failed_field, failure.detail);
+        return send_op_error(req, OpResult{ failure.err, detail });
+    }
+
+    return send_state(req);
 }
 
 // POST /api/player/stop - stop playback
 // Supports optional: { "emergency_stop": bool }
-static esp_err_t handle_stop(httpd_req_t* req) {
+esp_err_t handle_stop(httpd_req_t* req) {
     bool emergency = false;
 
-    // Check if there's a body with emergency_stop
     if (req->content_len > 0) {
-        cJSON* root = api_common::parse_json_body(req, 512);
+        cJSON* root = parse_json_body(req, 512);
         if (!root) return ESP_FAIL;
-        cJSON* emergency_item = cJSON_GetObjectItem(root, "emergency_stop");
-        if (emergency_item && cJSON_IsBool(emergency_item)) {
-            emergency = cJSON_IsTrue(emergency_item);
-        }
+        const cJSON* emergency_item = cJSON_GetObjectItem(root, "emergency_stop");
+        emergency = emergency_item && cJSON_IsBool(emergency_item) && cJSON_IsTrue(emergency_item);
         cJSON_Delete(root);
     }
 
-    esp_err_t ret;
-    if (emergency) {
-        ret = SandTablePlayer::emergencyStop();
-    } else {
-        ret = SandTablePlayer::stop();
-    }
-
-    if (ret != ESP_OK) {
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
-
-    return handle_get_state(req);
+    OpResult r = player_ops::stop(emergency);
+    if (!r.ok()) return send_op_error(req, r);
+    return send_state(req);
 }
 
-// POST /api/player/skip - skip to next pattern (playlist mode only)
-static esp_err_t handle_skip(httpd_req_t* req) {
-    esp_err_t ret = SandTablePlayer::skip();
-    if (ret != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Not in playlist mode");
-        return ESP_FAIL;
-    }
-    return handle_get_state(req);
+// POST /api/player/skip - next pattern (playlist / random-loop mode only)
+esp_err_t handle_skip(httpd_req_t* req) {
+    OpResult r = player_ops::next();
+    if (!r.ok()) return send_op_error(req, r);
+    return send_state(req);
+}
+
+// POST /api/player/previous - previous pattern (playlist mode only)
+esp_err_t handle_previous(httpd_req_t* req) {
+    OpResult r = player_ops::previous();
+    if (!r.ok()) return send_op_error(req, r);
+    return send_state(req);
 }
 
 // URI handler definitions
-static httpd_uri_t player_state_uri = {
+httpd_uri_t player_state_uri = {
     .uri = "/api/player",
     .method = HTTP_GET,
     .handler = handle_get_state,
     .user_ctx = NULL
 };
-static httpd_uri_t player_patch_uri = {
+httpd_uri_t player_patch_uri = {
     .uri = "/api/player",
     .method = HTTP_PATCH,
     .handler = handle_patch,
     .user_ctx = NULL
 };
-static httpd_uri_t player_play_uri = {
+httpd_uri_t player_play_uri = {
     .uri = "/api/player/play",
     .method = HTTP_POST,
     .handler = handle_play,
     .user_ctx = NULL
 };
-static httpd_uri_t player_stop_uri = {
+httpd_uri_t player_stop_uri = {
     .uri = "/api/player/stop",
     .method = HTTP_POST,
     .handler = handle_stop,
     .user_ctx = NULL
 };
-static httpd_uri_t player_skip_uri = {
+httpd_uri_t player_skip_uri = {
     .uri = "/api/player/skip",
     .method = HTTP_POST,
     .handler = handle_skip,
     .user_ctx = NULL
 };
+httpd_uri_t player_previous_uri = {
+    .uri = "/api/player/previous",
+    .method = HTTP_POST,
+    .handler = handle_previous,
+    .user_ctx = NULL
+};
+
+}  // namespace
 
 void api_player_register_endpoints(httpd_handle_t server) {
     kd_common_api_register_uri_handler(server, &player_state_uri);
@@ -296,4 +223,5 @@ void api_player_register_endpoints(httpd_handle_t server) {
     kd_common_api_register_uri_handler(server, &player_play_uri);
     kd_common_api_register_uri_handler(server, &player_stop_uri);
     kd_common_api_register_uri_handler(server, &player_skip_uri);
+    kd_common_api_register_uri_handler(server, &player_previous_uri);
 }

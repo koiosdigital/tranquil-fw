@@ -1,8 +1,8 @@
 // Library / state change notifier implementation
 #include "library_notifier.h"
 
-#include "pattern_handler.h"
-#include "playlist_handler.h"
+#include "ops/library_ops.h"
+#include "ops/led_ops.h"
 #include "schedule_manager.h"
 #include "led_state.h"
 #include "system_info.h"
@@ -16,6 +16,7 @@
 #include <freertos/task.h>
 #include <freertos/event_groups.h>
 
+#include <atomic>
 #include <vector>
 
 static const char* TAG = "library_notifier";
@@ -29,6 +30,13 @@ constexpr TickType_t kDebounceTicks = pdMS_TO_TICKS(400);
 
 EventGroupHandle_t s_events = nullptr;
 TaskHandle_t s_task = nullptr;
+
+// Requester to leave out of the next schedule push (ARCH-B18). Consumed by
+// the push; if two sets race within one debounce window the later setter is
+// skipped (it holds the newest schedule) and the earlier one is pushed the
+// newer state, which is what it needs.
+std::atomic<int> s_sched_skip_fd{ -1 };
+std::atomic<bool> s_sched_skip_cloud{ false };
 
 constexpr EventBits_t bit(library_notifier::Event ev) {
     return static_cast<EventBits_t>(1u) << static_cast<unsigned>(ev);
@@ -47,12 +55,12 @@ void publish(const ResponseMessage& msg, bool to_local, bool to_cloud) {
 }
 
 void push_patterns(bool to_local, bool to_cloud) {
-    ResponseMessage msg = PatternHandler::instance().buildPatternListMessage();
+    ResponseMessage msg = library_ops::build_pattern_list_message();
     publish(msg, to_local, to_cloud);
 }
 
 void push_playlists(bool to_local, bool to_cloud) {
-    ResponseMessage msg = PlaylistHandler::instance().buildPlaylistListMessage();
+    ResponseMessage msg = library_ops::build_playlist_list_message();
     publish(msg, to_local, to_cloud);
 }
 
@@ -61,9 +69,20 @@ void push_led(bool to_local, bool to_cloud) {
     publish(msg, to_local, to_cloud);
 }
 
-void push_schedule(bool to_local, bool to_cloud) {
-    ResponseMessage msg = ScheduleManager::instance().buildScheduleMessage();
+// Static per firmware: only ever pushed as part of the cloud snapshot.
+void push_led_effects(bool to_local, bool to_cloud) {
+    ResponseMessage msg = led_ops::build_effects_message();
     publish(msg, to_local, to_cloud);
+}
+
+void push_schedule(bool to_local, bool to_cloud) {
+    const int skip_fd = s_sched_skip_fd.exchange(-1);
+    const bool skip_cloud = s_sched_skip_cloud.exchange(false);
+
+    ResponseMessage msg = ScheduleManager::instance().buildScheduleMessage();
+    if (!msg.valid()) return;
+    if (to_local) websocket_broadcast_except(msg.data(), msg.len(), skip_fd);
+    if (to_cloud && !skip_cloud) ResponseRouter::instance().sendToCloud(msg);
 }
 
 void push_system_info(bool to_local, bool to_cloud) {
@@ -94,6 +113,7 @@ void worker(void*) {
             push_playlists(false, true);
             push_schedule(false, true);
             push_led(false, true);
+            push_led_effects(false, true);
             // Anything that ALSO changed in this window is now covered.
             bits &= ~(bit(library_notifier::Event::PatternsChanged) |
                       bit(library_notifier::Event::PlaylistsChanged) |
@@ -141,6 +161,12 @@ void init() {
 void post(Event ev) {
     if (!s_events || ev >= Event::Count) return;
     xEventGroupSetBits(s_events, bit(ev));
+}
+
+void schedule_changed(int exclude_local_fd, bool exclude_cloud) {
+    s_sched_skip_fd.store(exclude_local_fd);
+    s_sched_skip_cloud.store(exclude_cloud);
+    post(Event::ScheduleChanged);
 }
 
 }  // namespace library_notifier

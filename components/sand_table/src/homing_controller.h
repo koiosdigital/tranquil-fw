@@ -104,7 +104,11 @@ namespace sand_table {
             return homing_active_.load(std::memory_order_acquire);
         }
 
-        /// Abort current homing operation
+        /// Abort the homing run in progress (from any task): raises the
+        /// sequencer stop so the current seek returns, and marks the run
+        /// aborted so the homing routine unwinds with EmergencyStop. The
+        /// routine itself clears homing_active_ when it exits — callers
+        /// must not assume the run is over when this returns.
         void abort();
 
         /// Set homed state without running homing sequence (for development)
@@ -209,6 +213,14 @@ namespace sand_table {
         void disable_hall_isr();
         void enable_diag_isr();
         void disable_diag_isr();
+
+        // Classify how a seek (execute_constant_speed) ended. A sequencer
+        // stop is expected when the armed sensor fired (`sensor_flag` set by
+        // its ISR); any other EmergencyStop — e-stop, abort(), a drain — or
+        // a hardware/timeout error marks the run aborted so the caller
+        // reports an abort instead of "edge not found". nullptr sensor_flag
+        // for blind moves (blanking, backoff), where every stop is external.
+        void note_seek_result(const Result<void>& result, const volatile bool* sensor_flag);
 
         // Cached calibration is usable only when marked valid AND in the
         // plausibility band (guards torn NVS writes / legacy garbage that

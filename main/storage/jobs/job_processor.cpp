@@ -131,28 +131,40 @@ namespace jobs {
             vTaskDelete(nullptr);
         }
 
+        // Claim filter: a job still in retry backoff is not claimable. Checked
+        // BEFORE the claim (a peek) — claiming it and releasing it again cost
+        // two full jobs-table rewrites on every poll while the backoff ran.
+        struct ClaimFilterCtx {
+            Impl* impl;
+            size_t deferred;
+        };
+
+        static bool claimFilter(const Job& job, void* c) {
+            auto* ctx = static_cast<ClaimFilterCtx*>(c);
+            if (ctx->impl->backoffDue(job.id)) return true;
+            ctx->deferred++;
+            return false;
+        }
+
         void processJobs() {
             // Process jobs while we have capacity
             while (running && activeJobs < config.max_concurrent) {
-                auto job = JobQueue::instance().claimNextPendingJob();
+                ClaimFilterCtx filter{ this, 0 };
+                auto job = JobQueue::instance().claimNextPendingJob(claimFilter, &filter);
                 if (!job) {
-                    // Nothing claimable. If jobs are pending anyway, something
-                    // is wrong (DB claim failure) — say so instead of silently
-                    // idling.
+                    // Nothing claimable. Jobs waiting out a backoff are
+                    // expected; pending jobs with NO backoff and no claim
+                    // mean something is wrong (DB claim failure) — say so
+                    // instead of silently idling.
+                    if (filter.deferred > 0) {
+                        ESP_LOGD(TAG, "%zu job(s) in retry backoff, deferring", filter.deferred);
+                        break;
+                    }
                     size_t pending = JobQueue::instance().getPendingCount();
                     if (pending > 0) {
                         ESP_LOGW(TAG, "%zu pending jobs but none claimable (active=%u)",
                             pending, (unsigned)activeJobs.load());
                     }
-                    break;
-                }
-
-                // In-memory retry backoff: a claimed job whose backoff hasn't
-                // elapsed goes back to Pending (without burning a retry) and we
-                // wait for the next poll/trigger instead of hammering it.
-                if (!backoffDue(job->id)) {
-                    ESP_LOGD(TAG, "Job %u in retry backoff, deferring", job->id);
-                    JobQueue::instance().releaseJob(job->id);
                     break;
                 }
 

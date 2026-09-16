@@ -5,6 +5,7 @@
 
 #include <esp_log.h>
 #include <esp_heap_caps.h>
+#include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <kd/v1/tranquil.pb-c.h>
@@ -16,10 +17,11 @@ static const char* TAG = "download_progress";
 
 namespace {
 
-// Callers span the httpd task and job worker tasks. The critical sections are
-// tiny (map ops + a snapshot copy) and never do blocking I/O while held —
-// socket sends happen outside the lock — so a blocking acquire cannot deadlock
-// and, unlike the old 500 ms timeout, never silently drops a progress tick.
+// Callers span the httpd task, job worker tasks and the cloudlink task. The
+// critical sections are tiny (map ops + a snapshot copy) and never do
+// blocking I/O while held — socket sends happen outside the lock — so a
+// blocking acquire cannot deadlock and never silently drops a progress tick.
+// The esp_timer tick (expireStale) is the exception: it uses a short timeout.
 SemaphoreHandle_t s_mutex() {
     static SemaphoreHandle_t m = xSemaphoreCreateMutex();
     return m;
@@ -27,7 +29,8 @@ SemaphoreHandle_t s_mutex() {
 
 class Lock {
 public:
-    Lock() : ok_(xSemaphoreTake(s_mutex(), portMAX_DELAY) == pdTRUE) {}
+    explicit Lock(TickType_t timeout = portMAX_DELAY)
+        : ok_(xSemaphoreTake(s_mutex(), timeout) == pdTRUE) {}
     ~Lock() { if (ok_) xSemaphoreGive(s_mutex()); }
     explicit operator bool() const { return ok_; }
 private:
@@ -103,7 +106,8 @@ void DownloadProgressBroadcaster::complete(const std::string& pattern_uuid) {
         if (!lock) return;
         auto it = active_.find(pattern_uuid);
         if (it == active_.end()) return;
-        it->second = 100;
+        it->second.pct = 100;
+        it->second.updated_us = esp_timer_get_time();
     }
     broadcast();
     Lock lock;
@@ -121,7 +125,7 @@ void DownloadProgressBroadcaster::fail(const std::string& pattern_uuid,
         if (!lock) return;
         auto it = active_.find(pattern_uuid);
         if (it != active_.end()) {
-            last_pct = it->second;
+            last_pct = it->second.pct;
             tracked = true;
             active_.erase(it);
         }
@@ -143,23 +147,46 @@ void DownloadProgressBroadcaster::drop(const std::string& pattern_uuid) {
     active_.erase(pattern_uuid);
 }
 
+void DownloadProgressBroadcaster::expireStale() {
+    Lock lock(pdMS_TO_TICKS(50));
+    if (!lock) return;
+    pruneLocked(esp_timer_get_time());
+}
+
+size_t DownloadProgressBroadcaster::pruneLocked(int64_t now_us) {
+    size_t dropped = 0;
+    for (auto it = active_.begin(); it != active_.end(); ) {
+        if (now_us - it->second.updated_us > STALE_US) {
+            ESP_LOGW(TAG, "Dropping stale download %s (stuck at %u%%)",
+                     it->first.c_str(), it->second.pct);
+            it = active_.erase(it);
+            dropped++;
+        } else {
+            ++it;
+        }
+    }
+    return dropped;
+}
+
 void DownloadProgressBroadcaster::set(const std::string& pattern_uuid, uint8_t pct,
                                       bool only_if_tracked) {
     if (pattern_uuid.empty()) return;
     if (pct > 100) pct = 100;
+    const int64_t now = esp_timer_get_time();
     {
         Lock lock;
         if (!lock) return;
         auto it = active_.find(pattern_uuid);
         if (it == active_.end()) {
             if (only_if_tracked) return;
-            active_[pattern_uuid] = pct;
-        } else if (pct <= it->second) {
+            active_[pattern_uuid] = Entry{ pct, now };
+        } else if (pct <= it->second.pct) {
             // Monotonic: never re-broadcast an unchanged value, and never let a
             // retry (which restarts the byte counter) drag the bar backwards.
             return;
         } else {
-            it->second = pct;
+            it->second.pct = pct;
+            it->second.updated_us = now;
         }
     }
     broadcast();
@@ -172,7 +199,11 @@ void DownloadProgressBroadcaster::broadcast() {
     {
         Lock lock;
         if (!lock) return;
-        snapshot.assign(active_.begin(), active_.end());
+        pruneLocked(esp_timer_get_time());
+        snapshot.reserve(active_.size());
+        for (const auto& kv : active_) {
+            snapshot.emplace_back(kv.first, kv.second.pct);
+        }
     }
     if (snapshot.empty()) return;
 

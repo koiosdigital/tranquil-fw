@@ -1,5 +1,5 @@
-// Unified system handler
-// Handles system-related protobuf messages (Ping, SystemInfo, Home, Reboot, FactoryReset)
+// Unified system handler: a thin protobuf codec over system_ops
+// (Ping, SystemInfo, Home, Reboot, FactoryReset).
 #pragma once
 
 #include "handler_base.h"
@@ -24,11 +24,4 @@ public:
 
 private:
     SystemHandler() = default;
-
-    // Individual message handlers
-    HandleResult handlePing(const Kd__V1__Ping* msg, ResponseMessage& response);
-    HandleResult handleGetSystemInfo(ResponseMessage& response);
-    HandleResult handleFactoryReset(const Kd__V1__FactoryResetRequest* msg, ResponseMessage& response);
-    HandleResult handleReboot(const Kd__V1__TranquilRebootRequest* msg, ResponseMessage& response);
-    HandleResult handleHomeRequest(const Kd__V1__HomeRequest* msg, ResponseMessage& response);
 };

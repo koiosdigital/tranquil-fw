@@ -31,7 +31,7 @@
     },
     {
       "name": "Playlists",
-      "description": "Playlist management"
+      "description": "Playlist management. Every mutation is pushed to WebSocket clients and the cloud as a Playlists snapshot."
     },
     {
       "name": "License",
@@ -81,7 +81,7 @@
           "Player"
         ],
         "summary": "Update player state",
-        "description": "Partially update player settings. All fields are optional. Setting pattern_uuid or playlist_uuid starts new playback.",
+        "description": "Partially update player settings. All fields are optional. Setting pattern_uuid or playlist_uuid starts new playback. Every field present is applied; if any of them fails, the response is that failure's status (400/404/500) with a text body of the form \"<field>: <reason>\".",
         "operationId": "patchPlayerState",
         "requestBody": {
           "required": true,
@@ -208,6 +208,31 @@
         }
       }
     },
+    "/api/player/previous": {
+      "post": {
+        "tags": [
+          "Player"
+        ],
+        "summary": "Go back to the previous pattern",
+        "description": "Return to the previous pattern in the current playlist. Only works in playlist mode.",
+        "operationId": "previous",
+        "responses": {
+          "200": {
+            "description": "Moved to the previous pattern, returns player state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlayerState"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Not in playlist mode"
+          }
+        }
+      }
+    },
     "/api/patterns": {
       "get": {
         "tags": [
@@ -315,7 +340,7 @@
           "Patterns"
         ],
         "summary": "Delete pattern",
-        "description": "Delete a pattern and its associated files.",
+        "description": "Delete a pattern and its associated files. If the pattern is currently playing, playback is stopped first. The updated pattern list is pushed to WebSocket clients and the cloud.",
         "operationId": "deletePattern",
         "parameters": [
           {
@@ -663,7 +688,7 @@
           "License"
         ],
         "summary": "Get store token",
-        "description": "Get the JWT store token from the device's DRM license. Used for authenticating with the pattern store.",
+        "description": "Get the JWT store token from the device's DRM license. Used for authenticating with the pattern store. Not reachable from browser pages: any request carrying an Origin header is refused with 403 (native apps send none).",
         "operationId": "getStoreToken",
         "responses": {
           "200": {
@@ -677,7 +702,7 @@
             }
           },
           "403": {
-            "description": "No valid license",
+            "description": "No valid license, or the request carried an Origin header (browser cross-origin requests are refused; text/plain body in that case)",
             "content": {
               "application/json": {
                 "schema": {
@@ -999,7 +1024,7 @@
           "System"
         ],
         "summary": "Factory reset the device",
-        "description": "Clears NVS, patterns, playlists and license, then restarts ~300ms after responding.",
+        "description": "Clears NVS, patterns, playlists and license, then restarts ~300ms after responding. LAN only, and not reachable from browser pages: any request carrying an Origin header is refused with 403.",
         "operationId": "factoryReset",
         "responses": {
           "200": {
@@ -1011,6 +1036,9 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "Request carried an Origin header (browser cross-origin requests are refused)"
           },
           "500": {
             "description": "Reset failed"
@@ -1214,7 +1242,7 @@
           "System"
         ],
         "summary": "Restart the table",
-        "description": "Stops playback and restarts the device after ~500 ms. Settings and the pattern library are kept.",
+        "description": "Stops playback and restarts the device after ~500 ms. Settings and the pattern library are kept. Not reachable from browser pages: any request carrying an Origin header is refused with 403.",
         "operationId": "rebootDevice",
         "responses": {
           "200": {
@@ -1226,6 +1254,9 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "Request carried an Origin header (browser cross-origin requests are refused)"
           }
         }
       }
@@ -1572,8 +1603,18 @@
           "name"
         ],
         "properties": {
+          "uuid": {
+            "type": "string",
+            "maxLength": 63,
+            "pattern": "^[A-Za-z0-9._-]+$",
+            "description": "Optional client-chosen id; omitted = device assigns one. 400 when malformed or already in use."
+          },
           "name": {
             "type": "string"
+          },
+          "featured_pattern": {
+            "type": "string",
+            "description": "Optional pattern UUID to feature"
           },
           "description": {
             "type": "string"
@@ -2269,7 +2310,7 @@
       },
       "UpdatePlaylistRequest": {
         "type": "object",
-        "description": "Partial update. pattern_uuids, when present, replaces the entire ordered list.",
+        "description": "Partial update. pattern_uuids, when present, replaces the entire ordered list (an empty array clears it). An empty name is ignored; an empty featured_pattern clears the featured pattern.",
         "properties": {
           "name": {
             "type": "string"

@@ -1,15 +1,20 @@
 // Unified pattern handler implementation
 #include "pattern_handler.h"
-#include "ManifestDatabase.h"
+#include "ops/library_ops.h"
 #include "download_tracker.h"
 #include "download_progress.h"
 #include "library_notifier.h"
 
 #include <esp_log.h>
 #include <cstring>
-#include <vector>
 
 static const char* TAG = "pattern_handler";
+
+namespace {
+
+bool has(const char* s) { return s && s[0] != '\0'; }
+
+}  // namespace
 
 PatternHandler& PatternHandler::instance() {
     static PatternHandler instance;
@@ -21,21 +26,81 @@ HandleResult PatternHandler::handle(
     const MessageContext& ctx,
     ResponseMessage& response
 ) {
+    const char* rid = ctx.request_id;
+
     switch (msg->message_case) {
         case KD__V1__TRANQUIL_MESSAGE__MESSAGE_DOWNLOADED_PATTERNS_REQUEST:
-            return handleDownloadedPatternsRequest(response);
+            response = library_ops::build_pattern_list_message(rid);
+            return HandleResult::ok(false, false);
 
-        case KD__V1__TRANQUIL_MESSAGE__MESSAGE_DELETE_PATTERN:
-            return handleDeletePattern(msg->delete_pattern, response);
+        case KD__V1__TRANQUIL_MESSAGE__MESSAGE_DELETE_PATTERN: {
+            const auto* m = msg->delete_pattern;
+            if (!m || !has(m->uuid)) {
+                ESP_LOGW(TAG, "DeletePattern: missing uuid");
+                response = makeCommandResult(false, "Missing uuid", rid, ESP_ERR_INVALID_ARG);
+                return HandleResult::ok();
+            }
+            ESP_LOGI(TAG, "DeletePattern: %s", m->uuid);
+            // Requester gets the CommandResult; everyone (LAN + cloud) gets
+            // the updated list via the notifier (posted by library_ops).
+            response = makeCommandResult(library_ops::delete_pattern(m->uuid), rid);
+            return HandleResult::ok();
+        }
 
-        case KD__V1__TRANQUIL_MESSAGE__MESSAGE_MODIFY_PATTERN:
-            return handleModifyPattern(msg->modify_pattern, response);
+        case KD__V1__TRANQUIL_MESSAGE__MESSAGE_MODIFY_PATTERN: {
+            const auto* m = msg->modify_pattern;
+            if (!m || !has(m->uuid)) {
+                ESP_LOGW(TAG, "ModifyPattern: missing uuid");
+                response = makeCommandResult(false, "Missing uuid", rid, ESP_ERR_INVALID_ARG);
+                return HandleResult::ok();
+            }
+            response = makeCommandResult(
+                library_ops::rename_pattern(m->uuid, m->name ? m->name : ""), rid);
+            return HandleResult::ok();
+        }
 
-        case KD__V1__TRANQUIL_MESSAGE__MESSAGE_GET_PATTERN_REQUEST:
-            return handleGetPatternRequest(msg->get_pattern_request, response);
+        case KD__V1__TRANQUIL_MESSAGE__MESSAGE_GET_PATTERN_REQUEST: {
+            const auto* m = msg->get_pattern_request;
+            if (!m || !has(m->uuid)) {
+                ESP_LOGW(TAG, "GetPatternRequest: missing uuid");
+                response = makeCommandResult(false, "Missing uuid", rid, ESP_ERR_INVALID_ARG);
+                return HandleResult::ok();
+            }
+            auto pattern = library_ops::get_pattern(m->uuid);
+            if (!pattern) {
+                ESP_LOGW(TAG, "GetPatternRequest: pattern not found: %s", m->uuid);
+                response = makeCommandResult(false, "Pattern not found", rid, ESP_ERR_NOT_FOUND);
+                return HandleResult::ok();
+            }
+            response = library_ops::build_pattern_info_message(*pattern, rid);
+            ESP_LOGI(TAG, "GetPatternRequest: returning info for %s", m->uuid);
+            return HandleResult::ok(false, false);
+        }
 
-        case KD__V1__TRANQUIL_MESSAGE__MESSAGE_REQUEST_PATTERN_DOWNLOAD:
-            return handleRequestPatternDownload(msg->request_pattern_download, ctx, response);
+        case KD__V1__TRANQUIL_MESSAGE__MESSAGE_REQUEST_PATTERN_DOWNLOAD: {
+            const auto* m = msg->request_pattern_download;
+            if (!m || !has(m->pattern_uuid)) {
+                ESP_LOGW(TAG, "RequestPatternDownload: missing pattern_uuid");
+                response = makeCommandResult(false, "Missing pattern_uuid", rid, ESP_ERR_INVALID_ARG);
+                return HandleResult::ok();
+            }
+
+            ESP_LOGI(TAG, "RequestPatternDownload: %s (from %s)",
+                m->pattern_uuid, ctx.isLocal() ? "local" : "cloud");
+
+            // Track the request so it can be aged out if the cloud never
+            // answers, and start the progress bar at 0% (accepted, job not
+            // started). Both sources forward to the cloud: a local request
+            // needs the download URL; a cloud-initiated one is the designed
+            // round-trip (app -> cloud command -> us -> forward back -> cloud
+            // replies with a PatternDownloadResponse; see tranquil.proto).
+            if (ctx.isLocal()) {
+                DownloadTracker::instance().trackDownload(m->pattern_uuid);
+            }
+            DownloadProgressBroadcaster::instance().track(m->pattern_uuid);
+            ESP_LOGI(TAG, "Forwarding pattern download request to cloud");
+            return HandleResult::forwardToCloud();
+        }
 
         default:
             return HandleResult::notHandled();
@@ -65,56 +130,6 @@ std::vector<Kd__V1__TranquilMessage__MessageCase> PatternHandler::supportedMessa
     };
 }
 
-ResponseMessage PatternHandler::buildPatternListMessage() {
-    auto patterns = ManifestDatabase::instance().getAllPatterns();
-
-    // Local storage is sufficient: serialize() packs the message into its
-    // own buffer before this scope ends. (This is also called from the job
-    // worker task, so statics here would race with the dispatcher.)
-    Kd__V1__DownloadedPatterns downloaded = KD__V1__DOWNLOADED_PATTERNS__INIT;
-    std::vector<Kd__V1__PatternInfo*> pattern_ptrs;
-    std::vector<Kd__V1__PatternInfo> pattern_infos;
-
-    // Cap the socket list. 200 entries pack to ~30 KB, inside the 32 KB
-    // response ceiling; larger libraries browse the paginated REST list.
-    size_t count = std::min(patterns.size(), static_cast<size_t>(200));
-    pattern_infos.resize(count);
-
-    for (size_t i = 0; i < count; i++) {
-        pattern_infos[i] = KD__V1__PATTERN_INFO__INIT;
-        // Note: These pointers are valid while patterns vector is in scope
-        // Use external_uuid as "uuid" for API compatibility
-        pattern_infos[i].uuid = const_cast<char*>(patterns[i].external_uuid.c_str());
-        pattern_infos[i].name = const_cast<char*>(patterns[i].name.c_str());
-        pattern_infos[i].creator = const_cast<char*>(patterns[i].creator.c_str());
-        pattern_infos[i].encrypted = patterns[i].encrypted;
-        pattern_infos[i].size_bytes = patterns[i].size_bytes;
-        pattern_infos[i].reversible = patterns[i].reversible;
-        pattern_infos[i].start_point = patterns[i].start_point;
-        pattern_infos[i].created_at = const_cast<char*>(patterns[i].created_at.c_str());
-        pattern_infos[i].last_played_at = const_cast<char*>(patterns[i].last_played_at.c_str());
-        pattern_infos[i].is_owned = patterns[i].purchased;
-        pattern_infos[i].purchased_at = patterns[i].purchased_at;
-        pattern_infos[i].receipt_id = const_cast<char*>(patterns[i].receipt_id.c_str());
-        pattern_ptrs.push_back(&pattern_infos[i]);
-    }
-
-    downloaded.n_patterns = pattern_ptrs.size();
-    downloaded.patterns = pattern_ptrs.data();
-
-    Kd__V1__TranquilMessage resp = KD__V1__TRANQUIL_MESSAGE__INIT;
-    resp.message_case = KD__V1__TRANQUIL_MESSAGE__MESSAGE_DOWNLOADED_PATTERNS;
-    resp.downloaded_patterns = &downloaded;
-
-    ESP_LOGD(TAG, "DownloadedPatterns: returning %zu patterns", count);
-    return serialize(&resp);
-}
-
-HandleResult PatternHandler::handleDownloadedPatternsRequest(ResponseMessage& response) {
-    response = buildPatternListMessage();
-    return HandleResult::ok(false, false);
-}
-
 void PatternHandler::notifyPatternDownloadComplete(const std::string& pattern_uuid, bool success) {
     DownloadTracker::instance().removeDownload(pattern_uuid);
 
@@ -125,164 +140,4 @@ void PatternHandler::notifyPatternDownloadComplete(const std::string& pattern_uu
     // into one push instead of one per pattern.
     ESP_LOGI(TAG, "Pattern %s downloaded; scheduling list push", pattern_uuid.c_str());
     library_notifier::patterns_changed();
-}
-
-HandleResult PatternHandler::handleDeletePattern(
-    const Kd__V1__DeletePattern* msg,
-    ResponseMessage& response
-) {
-    if (!msg || !msg->uuid) {
-        ESP_LOGW(TAG, "DeletePattern: missing uuid");
-        response = makeCommandResult(false, "Missing uuid");
-        return HandleResult::ok();
-    }
-
-    ESP_LOGI(TAG, "DeletePattern: %s", msg->uuid);
-
-    // Find pattern by external UUID and delete by internal ID
-    auto pattern = ManifestDatabase::instance().getPatternByExternalUuid(msg->uuid);
-    if (!pattern) {
-        ESP_LOGW(TAG, "DeletePattern: pattern not found: %s", msg->uuid);
-        response = makeCommandResult(false, "Pattern not found");
-        return HandleResult::ok();
-    }
-
-    esp_err_t ret = ManifestDatabase::instance().deletePattern(pattern->id);
-
-    if (ret == ESP_OK) {
-        response = makeCommandResult(true);
-        // Requester gets the CommandResult; everyone (LAN + cloud) gets the
-        // updated list via the notifier.
-        library_notifier::patterns_changed();
-        return HandleResult::ok();
-    } else {
-        response = makeCommandResult(false, "Failed to delete pattern");
-        return HandleResult::ok();
-    }
-}
-
-HandleResult PatternHandler::handleModifyPattern(
-    const Kd__V1__ModifyPattern* msg,
-    ResponseMessage& response
-) {
-    if (!msg || !msg->uuid) {
-        ESP_LOGW(TAG, "ModifyPattern: missing uuid");
-        response = makeCommandResult(false, "Missing uuid");
-        return HandleResult::ok();
-    }
-
-    // Get existing pattern by external UUID
-    auto pattern = ManifestDatabase::instance().getPatternByExternalUuid(msg->uuid);
-    if (!pattern) {
-        ESP_LOGW(TAG, "ModifyPattern: pattern not found: %s", msg->uuid);
-        response = makeCommandResult(false, "Pattern not found");
-        return HandleResult::ok();
-    }
-
-    // Update name if provided
-    if (msg->name && strlen(msg->name) > 0) {
-        pattern->name = msg->name;
-        ESP_LOGI(TAG, "ModifyPattern: rename %s to '%s'", msg->uuid, msg->name);
-    }
-
-    // Save updated pattern using internal ID
-    esp_err_t ret = ManifestDatabase::instance().updatePattern(pattern->id, *pattern);
-
-    if (ret == ESP_OK) {
-        response = makeCommandResult(true);
-        library_notifier::patterns_changed();
-        return HandleResult::ok();
-    } else {
-        response = makeCommandResult(false, "Failed to update pattern");
-        return HandleResult::ok();
-    }
-}
-
-HandleResult PatternHandler::handleGetPatternRequest(
-    const Kd__V1__GetPatternRequest* msg,
-    ResponseMessage& response
-) {
-    if (!msg || !msg->uuid) {
-        ESP_LOGW(TAG, "GetPatternRequest: missing uuid");
-        response = makeCommandResult(false, "Missing uuid");
-        return HandleResult::ok();
-    }
-
-    // Lookup by external UUID
-    auto pattern = ManifestDatabase::instance().getPatternByExternalUuid(msg->uuid);
-    if (!pattern) {
-        ESP_LOGW(TAG, "GetPatternRequest: pattern not found: %s", msg->uuid);
-        response = makeCommandResult(false, "Pattern not found");
-        return HandleResult::ok();
-    }
-
-    // Build PatternInfo response. Locals, not statics: httpd and the
-    // cloudlink task can run this concurrently, and shared static buffers
-    // raced between get_packed_size() and pack().
-    Kd__V1__PatternInfo info = KD__V1__PATTERN_INFO__INIT;
-    char uuid_buf[64] = {0}, name_buf[128] = {0}, creator_buf[64] = {0};
-    char created_buf[32] = {0}, played_buf[32] = {0};
-
-    // Use external_uuid as "uuid" for API compatibility
-    strncpy(uuid_buf, pattern->external_uuid.c_str(), sizeof(uuid_buf) - 1);
-    strncpy(name_buf, pattern->name.c_str(), sizeof(name_buf) - 1);
-    strncpy(creator_buf, pattern->creator.c_str(), sizeof(creator_buf) - 1);
-    strncpy(created_buf, pattern->created_at.c_str(), sizeof(created_buf) - 1);
-    strncpy(played_buf, pattern->last_played_at.c_str(), sizeof(played_buf) - 1);
-
-    info.uuid = uuid_buf;
-    info.name = name_buf;
-    info.creator = creator_buf;
-    info.encrypted = pattern->encrypted;
-    info.size_bytes = pattern->size_bytes;
-    info.reversible = pattern->reversible;
-    info.start_point = pattern->start_point;
-    info.created_at = created_buf;
-    info.last_played_at = played_buf;
-
-    Kd__V1__TranquilMessage resp = KD__V1__TRANQUIL_MESSAGE__INIT;
-    resp.message_case = KD__V1__TRANQUIL_MESSAGE__MESSAGE_PATTERN_INFO;
-    resp.pattern_info = &info;
-
-    response = serialize(&resp);
-
-    ESP_LOGI(TAG, "GetPatternRequest: returning info for %s", msg->uuid);
-    return HandleResult::ok(false, false);
-}
-
-HandleResult PatternHandler::handleRequestPatternDownload(
-    const Kd__V1__RequestPatternDownload* msg,
-    const MessageContext& ctx,
-    ResponseMessage& response
-) {
-    if (!msg || !msg->pattern_uuid) {
-        ESP_LOGW(TAG, "RequestPatternDownload: missing pattern_uuid");
-        response = makeCommandResult(false, "Missing pattern_uuid");
-        return HandleResult::ok();
-    }
-
-    ESP_LOGI(TAG, "RequestPatternDownload: %s (from %s)",
-        msg->pattern_uuid,
-        ctx.isLocal() ? "local" : "cloud");
-
-    // If request is from local client, forward to cloud
-    if (ctx.isLocal()) {
-        // Track the download so we can route progress back to this client
-        DownloadTracker::instance().trackDownload(msg->pattern_uuid, ctx.socket_fd);
-
-        // 0% = accepted, job not started yet
-        DownloadProgressBroadcaster::instance().track(msg->pattern_uuid);
-
-        ESP_LOGI(TAG, "Forwarding pattern download request to cloud (tracked socket %d)",
-            ctx.socket_fd);
-        return HandleResult::forwardToCloud();
-    }
-
-    // From cloud: this is the designed round-trip for cloud-initiated
-    // downloads (app → cloud command → us → forward back → cloud replies
-    // with a PatternDownloadResponse; see tranquil.proto message 6). Track
-    // it so progress reaches the cloud poller from 0%.
-    DownloadProgressBroadcaster::instance().track(msg->pattern_uuid);
-    ESP_LOGI(TAG, "Cloud-initiated download, forwarding back for download URL");
-    return HandleResult::forwardToCloud();
 }

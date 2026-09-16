@@ -216,8 +216,10 @@ void cloud_msg_send_license_request() {
 
     // Freshness: SHA-256 over the serialized LicensePayload we hold. The
     // server compares it with the license it last issued and answers
-    // `unchanged` (no re-mint, no re-save) when they match.
-    static uint8_t license_hash[32] = { 0 };
+    // `unchanged` (no re-mint, no re-save) when they match. A local is
+    // enough: cloud_msg_queue() packs the message into its own buffer
+    // (and cloudlink copies that) before returning.
+    uint8_t license_hash[32] = { 0 };
     if (drm_license_get_payload_hash(license_hash) == ESP_OK) {
         req.current_license_hash.data = license_hash;
         req.current_license_hash.len = sizeof(license_hash);
@@ -269,8 +271,9 @@ void cloud_msg_send_sync_purchases_request() {
     Kd__V1__SyncPurchasesRequest req = KD__V1__SYNC_PURCHASES_REQUEST__INIT;
 
     // Freshness: digest of the receipt ids on the SD card. The server sends
-    // nothing back when it matches the owner's entitlements.
-    static uint8_t digest[32] = { 0 };
+    // nothing back when it matches the owner's entitlements. Local: the
+    // frame is packed synchronously in cloud_msg_queue().
+    uint8_t digest[32] = { 0 };
     size_t count = 0;
     if (drm_purchase_receipts_digest(digest, &count) == ESP_OK && count > 0) {
         req.receipts_digest.data = digest;

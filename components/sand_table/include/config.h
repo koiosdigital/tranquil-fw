@@ -35,9 +35,8 @@ namespace sand_table {
         static constexpr uint8_t THETA_TMC_ADDR = CONFIG_ROBOT_THETA_TMC_ADDR;
         static constexpr uint8_t RHO_TMC_ADDR = CONFIG_ROBOT_RHO_TMC_ADDR;
 
-        // StallGuard DIAG pins
+        // StallGuard DIAG pin (rho only — theta homes on the Hall sensor)
         static constexpr gpio_num_t RHO_DIAG = static_cast<gpio_num_t>(CONFIG_ROBOT_RHO_STALLGUARD_DIAG_PIN);
-        static constexpr gpio_num_t THETA_DIAG = static_cast<gpio_num_t>(CONFIG_ROBOT_THETA_STALLGUARD_DIAG_PIN);
 
         // Per-axis direction inversion (Kconfig bools; the macro is absent
         // when unset). ALL motion code works in LOGICAL directions (positive
@@ -74,6 +73,18 @@ namespace sand_table {
         // SCALE comes entirely from the homing-observed rho_max_steps, so no
         // pinion/lead geometry is needed anywhere.
         static uint32_t effective_steps_per_rev();
+
+        // The steps-per-motor-rev the motion stack was BUILT against at
+        // boot: snapshotted by MotionController::init_tmc() when it programs
+        // the TMC microstep resolution. The coupling compensation, homing
+        // companion moves and path splitting use THIS, never the live NVS
+        // value — steps_per_rev/microsteps can be PATCHed at runtime, but the
+        // drivers keep the resolution they were programmed with until
+        // reboot, and a calibration is expressed in those steps. home()
+        // refuses to run while the live config differs (RebootRequired).
+        // Falls back to the live value until the snapshot is taken.
+        static uint32_t applied_effective_steps_per_rev();
+        static void set_applied_effective_steps_per_rev(uint32_t steps);
 
         // Legacy constexpr for compile-time contexts (uses defaults)
         static constexpr uint32_t STEPS_PER_REV = kDefaultStepsPerRev;
@@ -129,6 +140,22 @@ namespace sand_table {
         static float theta_max_rot_per_min();      // theta spin-rate cap
         static uint32_t motor_idle_timeout_s();    // 0 = never de-energize
 
+        // Theta spin-rate safety cap expressed as a PATH-speed ceiling
+        // (units/min) for one segment: path speed v turns |delta_theta| in
+        // distance/v minutes, so the rotation rate is v*rotations/distance;
+        // clamp v so it never exceeds theta_max_rot_per_min(). +infinity
+        // for a segment that does not rotate. The ONE formula shared by the
+        // velocity planner (nominal cap), the executor (profile clamp) and
+        // the live-feedrate scale ceiling.
+        static float theta_path_speed_cap(double delta_theta_rad, float distance) {
+            const float rotations = std::fabs(static_cast<float>(delta_theta_rad)) /
+                (2.0f * static_cast<float>(M_PI));
+            if (rotations <= 1e-6f || distance <= 0.0f) {
+                return INFINITY;
+            }
+            return theta_max_rot_per_min() * distance / rotations;
+        }
+
         static constexpr uint32_t kDefaultAccelStepsS2 = 10000;
         static constexpr uint32_t kDefaultJunctionDvStepsS = 250;
         static constexpr float kDefaultThetaMaxRotPerMin = 12.0f;
@@ -143,11 +170,13 @@ namespace sand_table {
         static constexpr uint32_t MOTOR_INACTIVITY_TIMEOUT_MS = kDefaultMotorIdleTimeoutS * 1000;
 
         // Hard cap on major-axis steps per motion segment. Sized so the
-        // interval table (MAX_SEGMENT_STEPS * sizeof(uint16_t)) fits in
-        // internal RAM — the RMT TX-done ISR reads it, and ISR-time access
-        // to SPIRAM crashes if flash cache is disabled (e.g. NVS commit).
-        // The path planner splits longer moves; the stepper controller
-        // REJECTS (never silently truncates) segments that exceed this.
+        // interval table (MAX_SEGMENT_STEPS * sizeof(uint16_t) = 16 KB)
+        // fits comfortably in internal RAM: it is read by the stepper task
+        // (chunk encoding in the refill loop — NOT by the RMT TX-done ISR),
+        // and that priority-24 task must not stall on PSRAM while the flash
+        // cache is off. The path planner splits longer moves; the stepper
+        // controller REJECTS (never silently truncates) segments that
+        // exceed this.
         static constexpr uint32_t MAX_SEGMENT_STEPS = 8192;
 
         // Per-motor step acceleration used for the per-segment trapezoid
@@ -204,6 +233,16 @@ namespace sand_table {
 
         // Maximum step rate (steps per second)
         static constexpr uint32_t MAX_STEP_RATE_HZ = 50000;
+
+        // Step-interval clamps derived from the limits above — the ONLY
+        // definitions; every interval table and scaler uses these.
+        //  - MIN: the max step rate (20 us at 50 kHz).
+        //  - MAX: one RMT symbol holds a 15-bit tick count (32767 us at
+        //    1 MHz); 32000 leaves margin. Its reciprocal is the slowest
+        //    representable step rate: 31 steps/s.
+        static constexpr uint32_t MIN_STEP_INTERVAL_US = 1000000 / MAX_STEP_RATE_HZ;
+        static constexpr uint32_t MAX_STEP_INTERVAL_US = 32000;
+        static constexpr uint32_t MIN_STEP_RATE_HZ = 1000000 / MAX_STEP_INTERVAL_US;  // 31
 
         // UART configuration for TMC2209
         static constexpr uint32_t TMC_UART_BAUD = CONFIG_ROBOT_TMC_BAUD_RATE;

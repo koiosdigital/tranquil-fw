@@ -3,6 +3,7 @@
 #include "ManifestDatabase.h"
 #include "PatternReader.h"
 #include "EncryptedPatternReader.h"
+#include "SandTablePlayer.h"
 #include "download_progress.h"
 #include "drm/drm_license.h"
 #include "drm/drm_purchase.h"
@@ -14,6 +15,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <unistd.h>
 #include <vector>
 
 static const char* TAG = "DownloadExecutor";
@@ -305,6 +307,18 @@ JobResult DownloadExecutor::performDownload(const std::string& pattern_uuid,
     snprintf(final_path, sizeof(final_path), "%s/%s.%s",
              PATTERNS_PATH, pattern_uuid.c_str(),
              format == PatternFormat::Text ? "thr" : "dat");
+
+    // FATFS rename() fails when the target exists, so a re-download of a
+    // pattern that is already on the card (the manifest-row-exists case
+    // below) failed here on every retry. Replace it: if the player has that
+    // very file open, stop it first — FATFS has no file locking, so an
+    // unlink under an open reader corrupts what it is streaming.
+    if (SandTablePlayer::isPlayingPattern(pattern_uuid.c_str())) {
+        ESP_LOGW(TAG, "Pattern %s is playing; stopping playback to replace its file",
+            pattern_uuid.c_str());
+        SandTablePlayer::stop();
+    }
+    unlink(final_path);
     if (rename(file_path, final_path) != 0) {
         ESP_LOGE(TAG, "Failed to move %s -> %s", file_path, final_path);
         remove(file_path);

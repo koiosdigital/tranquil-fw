@@ -53,11 +53,11 @@ cJSON* ManifestDatabase::playlistToJson(const Playlist& pl) {
     cJSON_AddStringToObject(json, "name", pl.name.c_str());
     cJSON_AddStringToObject(json, "description", pl.description.c_str());
 
-    // Convert featured_pattern_id to external UUID
+    // Convert featured_pattern_id to external UUID (cached uuid, no parse)
     std::string featured_uuid;
     if (pl.featured_pattern_id != 0) {
-        auto fp = db.getPattern(pl.featured_pattern_id);
-        if (fp) featured_uuid = fp->external_uuid;
+        auto fp = db.getPatternUuid(pl.featured_pattern_id);
+        if (fp) featured_uuid = *fp;
     }
     cJSON_AddStringToObject(json, "featured_pattern", featured_uuid.c_str());
 
@@ -71,9 +71,9 @@ cJSON* ManifestDatabase::playlistToJson(const Playlist& pl) {
     cJSON* patterns = cJSON_CreateArray();
     if (patterns) {
         for (uint32_t pid : pl.pattern_ids) {
-            auto p = db.getPattern(pid);
+            auto p = db.getPatternUuid(pid);
             if (p) {
-                cJSON* entry = cJSON_CreateString(p->external_uuid.c_str());
+                cJSON* entry = cJSON_CreateString(p->c_str());
                 // cJSON_AddItemToArray does NOT free the item on failure —
                 // an unchecked add leaks the node under OOM.
                 if (entry && !cJSON_AddItemToArray(patterns, entry)) {

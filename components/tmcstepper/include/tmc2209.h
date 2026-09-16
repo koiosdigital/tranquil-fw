@@ -132,6 +132,17 @@ private:
     void handle_stallguard_interrupt();
     [[nodiscard]] static uint8_t calculate_current_scale(uint16_t milliamps) noexcept;
 
+    // Read-modify-write helpers for the readable config registers (see
+    // ShadowRegisters). read_for_rmw returns the live value, or the shadow
+    // when the bus does not answer and the shadow is trustworthy
+    // (reset_to_defaults has run); nullopt otherwise. The write_* helpers
+    // update the shadow on a successful write.
+    enum class Register : uint8_t;
+    [[nodiscard]] std::optional<uint32_t> read_for_rmw(Register reg, uint32_t shadow);
+    [[nodiscard]] esp_err_t write_gconf(uint32_t value);
+    [[nodiscard]] esp_err_t write_chopconf(uint32_t value);
+    [[nodiscard]] esp_err_t write_pwmconf(uint32_t value);
+
     // Register addresses
     enum class Register : uint8_t {
         GCONF = 0x00,
@@ -162,8 +173,17 @@ private:
         PWM_AUTO = 0x72
     };
 
-    // Shadow registers for write-only registers
+    // Shadow registers. The write-only ones (IHOLD_IRUN, TPOWERDOWN, ...)
+    // can only be tracked here. GCONF/CHOPCONF/PWMCONF are readable, but a
+    // read-modify-write must not fall back to a hard-coded default when the
+    // UART read fails: that rewrote the whole register to power-on values
+    // (for GCONF: clearing pdn_disable/mstep_reg_select drops the driver
+    // back to standalone mode mid-run). Their shadows hold the last value
+    // THIS driver wrote and are the fallback instead.
     struct ShadowRegisters {
+        uint32_t gconf = 0x000000C0;     // pdn_disable | mstep_reg_select (reset_to_defaults)
+        uint32_t chopconf = 0x10000053;  // TMC2209 power-on default
+        uint32_t pwmconf = 0xC40C001E;   // TMC2209 power-on default
         uint32_t ihold_irun = 0x00081010;
         uint32_t tpowerdown = 0;
         uint32_t tpwmthrs = 0;

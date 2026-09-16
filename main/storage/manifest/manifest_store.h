@@ -15,6 +15,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <string>
 #include "cJSON.h"
 
 namespace manifest {
@@ -42,10 +43,13 @@ public:
     JsonlTable(const JsonlTable&) = delete;
     JsonlTable& operator=(const JsonlTable&) = delete;
 
-    // Load snapshot from disk (falls back to the .bak rotation copy).
-    // A missing file is not an error (the table starts empty); an I/O or
-    // allocation failure IS (returns false) so the owner can refuse to come
-    // up and overwrite real data with an empty table.
+    // Load snapshot from disk. Order of preference: a leftover .tmp that
+    // carries the end-of-snapshot trailer (an interrupted save that had
+    // already been written to the end — the newest data), then the current
+    // file, then the .bak rotation copy. A missing file is not an error
+    // (the table starts empty); an I/O or allocation failure IS (returns
+    // false) so the owner can refuse to come up and overwrite real data with
+    // an empty table.
     bool load();
 
     // Write the full snapshot atomically. Mutating methods below only touch
@@ -66,6 +70,11 @@ public:
     // Parsed copy of one record; caller owns the returned object.
     cJSON* get(uint32_t id) const;
 
+    // The record's "uuid" field without parsing (from the per-record cache;
+    // parses only when the uuid was too long to cache). False when the
+    // record is absent or has no uuid.
+    bool uuidOf(uint32_t id, std::string& out) const;
+
     // Fast lookup via the cached "uuid" field. Returns 0 when absent.
     uint32_t findByUuid(const char* uuid) const;
 
@@ -80,8 +89,13 @@ public:
 
 private:
     enum class LoadResult { Ok, Missing, Error };
-    LoadResult loadFile(const char* path);
+    // `complete` is set when the file ended with the end-of-snapshot
+    // trailer (written by save(); absent from snapshots older than it).
+    LoadResult loadFile(const char* path, bool* complete);
+    void clearRecords();
     bool ensureCapacity(size_t needed);
+    // records_ is kept sorted by id (load sorts; add appends a strictly
+    // larger id; remove/modify preserve order), so this is O(log n).
     Record* find(uint32_t id) const;
     bool storeJson(Record& rec, cJSON* obj);
 
@@ -89,7 +103,7 @@ private:
     const char* path_;
     uint32_t max_records_;
     uint32_t next_id_ = 1;
-    Record* records_ = nullptr;   // ps_malloc'd, compact
+    Record* records_ = nullptr;   // ps_malloc'd, compact, sorted by id
     size_t count_ = 0;
     size_t capacity_ = 0;
 };

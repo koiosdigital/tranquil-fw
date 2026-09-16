@@ -2,6 +2,7 @@
 #include "esp_log.h"
 #include "esp_rom_sys.h"
 #include "esp_attr.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -22,24 +23,12 @@ namespace sand_table {
     {
     }
 
-    StepperDriver::~StepperDriver() {
-        if (rmt_channel_) {
-            rmt_del_channel(rmt_channel_);
-        }
-        if (step_encoder_) {
-            rmt_del_encoder(step_encoder_);
-        }
-    }
+    StepperDriver::~StepperDriver() = default;
 
     Result<void> StepperDriver::init() {
         auto gpio_result = init_gpio();
         if (gpio_result.is_err()) {
             return gpio_result;
-        }
-
-        auto rmt_result = init_rmt();
-        if (rmt_result.is_err()) {
-            return rmt_result;
         }
 
         initialized_ = true;
@@ -77,7 +66,6 @@ namespace sand_table {
         gpio_set_drive_capability(pins_.dir, GPIO_DRIVE_CAP_3);  // 40mA max drive
         // Initial level = logical negative for this axis (invert-aware).
         gpio_set_level(pins_.dir, dir_pin_level(false) ? 1 : 0);
-        direction_positive_ = false;
 
         // Configure enable pin (active low typically)
         gpio_config_t enable_config = {
@@ -96,12 +84,6 @@ namespace sand_table {
         return Result<void>::ok();
     }
 
-    Result<void> StepperDriver::init_rmt() {
-        // For now, we'll use GPIO + timer for step generation
-        // RMT can be added later for more precise timing if needed
-        return Result<void>::ok();
-    }
-
     void StepperDriver::set_enabled(bool enabled) {
         enabled_ = enabled;
         // Active low enable pin
@@ -110,30 +92,8 @@ namespace sand_table {
     }
 
     void StepperDriver::set_direction(bool positive) {
-        // direction_positive_ stays LOGICAL (drives position counting in
-        // step_once); only the pin level is inverted per Kconfig.
-        direction_positive_ = positive;
+        // `positive` is LOGICAL; only the pin level is inverted per Kconfig.
         gpio_set_level(pins_.dir, dir_pin_level(positive) ? 1 : 0);
-    }
-
-    void StepperDriver::step_once() {
-        gpio_set_level(pins_.step, 1);
-        esp_rom_delay_us(HardwareConfig::MIN_STEP_PULSE_US);
-        gpio_set_level(pins_.step, 0);
-
-        // Update position
-        int32_t pos = position_.load(std::memory_order_relaxed);
-        pos += direction_positive_ ? 1 : -1;
-        position_.store(pos, std::memory_order_release);
-    }
-
-    void StepperDriver::step_fixed_rate(uint32_t steps, uint32_t interval_us) {
-        for (uint32_t i = 0; i < steps; ++i) {
-            step_once();
-            if (interval_us > HardwareConfig::MIN_STEP_PULSE_US) {
-                esp_rom_delay_us(interval_us - HardwareConfig::MIN_STEP_PULSE_US);
-            }
-        }
     }
 
     // =============================================================================
@@ -381,7 +341,7 @@ namespace sand_table {
         }
     }
 
-    void RmtStepSequencer::update_speed_scale() {
+    void RmtStepSequencer::update_speed_scale(uint16_t base_interval_us) {
         float target = 1.0f;
         if (live_feedrate_ && speed_reference_rpm_ > 0.0f) {
             const float live = live_feedrate_->load(std::memory_order_relaxed);
@@ -393,28 +353,46 @@ namespace sand_table {
         // then the per-segment ceiling (theta rotation-rate safety cap).
         target = std::max(0.05f, std::min({ target, 20.0f, speed_scale_ceiling_ }));
 
-        // Slew toward the target by at most 25% per chunk so a large
-        // feedrate change ramps over several chunks instead of stepping
-        // the motors instantaneously.
+        // Slew toward the target, bounded two ways per chunk:
+        //  1. at most 25% (ratio) so a big change ramps over several chunks;
+        //  2. by the motors' acceleration limit. The step RATE this chunk
+        //     runs at is scale / base_interval, so over one chunk (kChunkSize
+        //     steps at the current rate) the rate may change by at most
+        //     accel * chunk_time — i.e. the scale by accel * chunk_time *
+        //     base_interval. Without this, a feedrate jump from 1 to 5 at a
+        //     20 us base ramped 5x in ~8 ms: far past accel, losing steps.
         constexpr float kMaxRatioPerChunk = 1.25f;
+        float next = target;
         if (target > applied_speed_scale_ * kMaxRatioPerChunk) {
-            applied_speed_scale_ *= kMaxRatioPerChunk;
+            next = applied_speed_scale_ * kMaxRatioPerChunk;
         }
         else if (target < applied_speed_scale_ / kMaxRatioPerChunk) {
-            applied_speed_scale_ /= kMaxRatioPerChunk;
+            next = applied_speed_scale_ / kMaxRatioPerChunk;
         }
-        else {
-            applied_speed_scale_ = target;
+
+        if (base_interval_us > 0 && applied_speed_scale_ > 0.0f) {
+            const float base_s = static_cast<float>(base_interval_us) * 1e-6f;
+            const float chunk_time_s =
+                static_cast<float>(kChunkSize) * base_s / applied_speed_scale_;
+            const float accel = static_cast<float>(MotionConfig::accel_steps_s2());
+            const float max_dscale = accel * chunk_time_s * base_s;
+            if (next > applied_speed_scale_ + max_dscale) {
+                next = applied_speed_scale_ + max_dscale;
+            }
+            else if (next < applied_speed_scale_ - max_dscale) {
+                next = applied_speed_scale_ - max_dscale;
+            }
         }
+
+        applied_speed_scale_ = std::max(0.05f, next);
     }
 
     uint16_t RmtStepSequencer::scale_interval(uint16_t base_interval_us) const {
         if (applied_speed_scale_ == 1.0f) {
             return base_interval_us;
         }
-        constexpr float kMinIntervalUs =
-            1000000.0f / static_cast<float>(HardwareConfig::MAX_STEP_RATE_HZ);
-        constexpr float kMaxIntervalUs = 32000.0f;
+        constexpr float kMinIntervalUs = static_cast<float>(HardwareConfig::MIN_STEP_INTERVAL_US);
+        constexpr float kMaxIntervalUs = static_cast<float>(HardwareConfig::MAX_STEP_INTERVAL_US);
 
         float scaled = static_cast<float>(base_interval_us) / applied_speed_scale_;
         scaled = std::max(kMinIntervalUs, std::min(scaled, kMaxIntervalUs));
@@ -430,8 +408,9 @@ namespace sand_table {
         int32_t rho_steps_encoded = 0;
 
         // Live feedrate: re-read the override once per chunk, so a speed
-        // change lands within ~64 steps even mid-segment.
-        update_speed_scale();
+        // change lands within ~64 steps even mid-segment. The slew is bounded
+        // against this chunk's planned base interval.
+        update_speed_scale(steps_encoded_ < total_steps_ ? intervals_[steps_encoded_] : 0);
 
         for (size_t i = 0; i < kChunkSize && steps_encoded_ < total_steps_; i++) {
             uint16_t interval = scale_interval(intervals_[steps_encoded_]);
@@ -467,12 +446,15 @@ namespace sand_table {
         auto* self = static_cast<RmtStepSequencer*>(user_ctx);
         BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
-        // Check for stop request
-        // Using __atomic_* builtins instead of std::atomic methods for ISR safety.
-        // Only wake execute() - it owns the abort and clears executing_;
-        // clearing it here would let another execute() claim the sequencer
-        // while this one is still mid-abort.
-        if (__atomic_load_n(reinterpret_cast<bool*>(&self->stop_requested_), __ATOMIC_ACQUIRE)) {
+        // std::atomic on 32-bit-or-narrower types is lock-free and inlined
+        // on Xtensa, so its methods are ISR-safe here; the old
+        // reinterpret_cast<bool*>(&atomic) + __atomic_* pattern was
+        // undefined behaviour dressed up as a precaution.
+        //
+        // Check for stop request. Only wake execute() - it owns the abort
+        // and clears executing_; clearing it here would let another
+        // execute() claim the sequencer while this one is still mid-abort.
+        if (self->stop_requested_.load(std::memory_order_acquire)) {
             xSemaphoreGiveFromISR(self->completion_sem_, &xHigherPriorityTaskWoken);
             return xHigherPriorityTaskWoken == pdTRUE;
         }
@@ -481,33 +463,38 @@ namespace sand_table {
         // fetch_add returns the value BEFORE increment, so:
         // - First callback sees 0, increments to 1, returns early
         // - Second callback sees 1, increments to 2, proceeds
-        int prev_count = __atomic_fetch_add(reinterpret_cast<int*>(&self->channels_done_), 1, __ATOMIC_ACQ_REL);
+        const int prev_count = self->channels_done_.fetch_add(1, std::memory_order_acq_rel);
         if (prev_count < 1) {
             // First channel done, wait for the other
             return false;
         }
 
         // Both channels done - reset counter for next round
-        __atomic_store_n(reinterpret_cast<int*>(&self->channels_done_), 0, __ATOMIC_RELEASE);
+        self->channels_done_.store(0, std::memory_order_release);
 
         // Decrement pending counter - this transmission pair just completed
-        __atomic_fetch_sub(reinterpret_cast<int32_t*>(&self->pending_tx_), 1, __ATOMIC_ACQ_REL);
+        self->pending_tx_.fetch_sub(1, std::memory_order_acq_rel);
 
         // Buffers transmit in strict 0,1,0,1... order, so the pair that just
         // completed is completed_pairs_ & 1. Credit its steps to the position
         // counters NOW (transmission finished => the motors physically moved),
         // before encode_chunk below overwrites the buffer's deltas.
-        // __atomic_* builtins keep this inlined and ISR-safe.
-        const uint8_t done_buffer = static_cast<uint8_t>(self->completed_pairs_ & 1);
-        self->completed_pairs_++;
+        const uint32_t pairs = self->completed_pairs_.load(std::memory_order_relaxed);
+        const uint8_t done_buffer = static_cast<uint8_t>(pairs & 1);
+        self->completed_pairs_.store(pairs + 1, std::memory_order_relaxed);
         if (self->theta_pos_ && self->buf_theta_delta_[done_buffer] != 0) {
-            __atomic_fetch_add(reinterpret_cast<int32_t*>(self->theta_pos_),
-                self->buf_theta_delta_[done_buffer], __ATOMIC_RELEASE);
+            self->theta_pos_->fetch_add(self->buf_theta_delta_[done_buffer],
+                std::memory_order_release);
         }
         if (self->rho_pos_ && self->buf_rho_delta_[done_buffer] != 0) {
-            __atomic_fetch_add(reinterpret_cast<int32_t*>(self->rho_pos_),
-                self->buf_rho_delta_[done_buffer], __ATOMIC_RELEASE);
+            self->rho_pos_->fetch_add(self->buf_rho_delta_[done_buffer],
+                std::memory_order_release);
         }
+
+        // The queued pair (if any) starts transmitting as soon as the driver
+        // ISR returns: stamp its start for the abort path's partial credit.
+        self->chunk_start_us_.store(static_cast<uint32_t>(esp_timer_get_time()),
+            std::memory_order_relaxed);
 
         // Wake execute()'s refill loop: it re-encodes the freed buffer and
         // queues the next transmission from task context. rmt_transmit()
@@ -559,7 +546,7 @@ namespace sand_table {
         rho_pos_ = &rho_pos;
         steps_encoded_ = 0;
         encoded_chunks_ = 0;
-        completed_pairs_ = 0;
+        completed_pairs_.store(0, std::memory_order_relaxed);
         buf_theta_delta_[0] = buf_theta_delta_[1] = 0;
         buf_rho_delta_[0] = buf_rho_delta_[1] = 0;
         pending_tx_.store(0, std::memory_order_release);
@@ -602,26 +589,16 @@ namespace sand_table {
             },
         };
 
-        esp_err_t err = rmt_transmit(theta_channel_, copy_encoder_,
-            theta_symbols_[0],
-            symbol_counts_[0] * sizeof(rmt_symbol_word_t),
-            &tx_config);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to start theta transmission: %d", err);
+        // The first pair starts (sync manager) once both channels are
+        // queued; stamp just before so the abort path can credit a chunk
+        // killed mid-flight.
+        chunk_start_us_.store(static_cast<uint32_t>(esp_timer_get_time()),
+            std::memory_order_relaxed);
+        if (!queue_pair(0, tx_config)) {
+            // A half-queued pair (theta accepted, rho refused) is flushed by
+            // the channel reset; nothing has been credited.
             pending_tx_.store(0, std::memory_order_release);
-            executing_.store(false, std::memory_order_release);
-            return Result<void>::err(MotionError::HardwareFault);
-        }
-
-        err = rmt_transmit(rho_channel_, copy_encoder_,
-            rho_symbols_[0],
-            symbol_counts_[0] * sizeof(rmt_symbol_word_t),
-            &tx_config);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to start rho transmission: %d", err);
-            pending_tx_.store(0, std::memory_order_release);
-            rmt_tx_wait_all_done(theta_channel_, 100);
-            executing_.store(false, std::memory_order_release);
+            abort_channels_and_credit();
             return Result<void>::err(MotionError::HardwareFault);
         }
 
@@ -629,14 +606,12 @@ namespace sand_table {
         if (symbol_counts_[1] > 0) {
             pending_tx_.fetch_add(1, std::memory_order_release);
             tx_config.flags.queue_nonblocking = true;
-            rmt_transmit(theta_channel_, copy_encoder_,
-                theta_symbols_[1],
-                symbol_counts_[1] * sizeof(rmt_symbol_word_t),
-                &tx_config);
-            rmt_transmit(rho_channel_, copy_encoder_,
-                rho_symbols_[1],
-                symbol_counts_[1] * sizeof(rmt_symbol_word_t),
-                &tx_config);
+            if (!queue_pair(1, tx_config)) {
+                pending_tx_.fetch_sub(1, std::memory_order_acq_rel);
+                stop_requested_.store(true, std::memory_order_release);
+                abort_channels_and_credit();
+                return Result<void>::err(MotionError::HardwareFault);
+            }
         }
 
         ESP_LOGD(TAG, "RMT transmission started: %lu total steps", total_steps);
@@ -658,7 +633,7 @@ namespace sand_table {
             if (xSemaphoreTake(completion_sem_, kPairTimeout) != pdTRUE) {
                 ESP_LOGE(TAG, "RMT stalled: no chunk completion within 6s");
                 stop_requested_.store(true, std::memory_order_release);
-                hard_abort_channels();
+                abort_channels_and_credit();
                 return Result<void>::err(MotionError::Timeout);
             }
 
@@ -669,7 +644,7 @@ namespace sand_table {
             // raced across tasks). Without this, motors kept stepping up to
             // two chunks (~128 steps) after an "emergency stop" returned.
             if (stop_requested_.load(std::memory_order_acquire)) {
-                hard_abort_channels();
+                abort_channels_and_credit();
                 return Result<void>::err(MotionError::EmergencyStop);
             }
 
@@ -682,21 +657,23 @@ namespace sand_table {
                     encoded_chunks_++;
                     pending_tx_.fetch_add(1, std::memory_order_release);
 
-                    rmt_transmit_config_t refill_config = {
+                    const rmt_transmit_config_t refill_config = {
                         .loop_count = 0,
                         .flags = {
                             .eot_level = 0,
                             .queue_nonblocking = true,
                         },
                     };
-                    rmt_transmit(theta_channel_, copy_encoder_,
-                        theta_symbols_[buf],
-                        symbol_counts_[buf] * sizeof(rmt_symbol_word_t),
-                        &refill_config);
-                    rmt_transmit(rho_channel_, copy_encoder_,
-                        rho_symbols_[buf],
-                        symbol_counts_[buf] * sizeof(rmt_symbol_word_t),
-                        &refill_config);
+                    if (!queue_pair(buf, refill_config)) {
+                        // Unwind the pending count for the pair that never
+                        // queued, then abort what is in flight: continuing
+                        // would wait forever for a completion that cannot
+                        // come.
+                        pending_tx_.fetch_sub(1, std::memory_order_acq_rel);
+                        stop_requested_.store(true, std::memory_order_release);
+                        abort_channels_and_credit();
+                        return Result<void>::err(MotionError::HardwareFault);
+                    }
                 }
             }
 
@@ -711,23 +688,99 @@ namespace sand_table {
         return Result<void>::ok();
     }
 
-    void RmtStepSequencer::hard_abort_channels() {
+    bool RmtStepSequencer::queue_pair(uint8_t buffer_idx, const rmt_transmit_config_t& cfg) {
+        const size_t bytes = symbol_counts_[buffer_idx] * sizeof(rmt_symbol_word_t);
+        esp_err_t err = rmt_transmit(theta_channel_, copy_encoder_,
+            theta_symbols_[buffer_idx], bytes, &cfg);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "theta rmt_transmit failed: %s", esp_err_to_name(err));
+            return false;
+        }
+        err = rmt_transmit(rho_channel_, copy_encoder_,
+            rho_symbols_[buffer_idx], bytes, &cfg);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "rho rmt_transmit failed: %s", esp_err_to_name(err));
+            return false;
+        }
+        return true;
+    }
+
+    void RmtStepSequencer::credit_partial_chunk(uint8_t buffer_idx, uint32_t elapsed_us) {
+        // Walk the killed chunk's symbols in transmit order. Each symbol is
+        // one step slot: a step symbol's rising edge is at ITS START, so
+        // every symbol that had started by the abort was a step the motor
+        // took. Durations are in RMT ticks at 1 MHz = microseconds.
+        int32_t theta_steps = 0;
+        int32_t rho_steps = 0;
+        uint32_t t = 0;
+        const size_t n = symbol_counts_[buffer_idx];
+        for (size_t i = 0; i < n; i++) {
+            if (t >= elapsed_us) {
+                break;  // this symbol had not started
+            }
+            const rmt_symbol_word_t& ts = theta_symbols_[buffer_idx][i];
+            if (ts.level0) theta_steps++;
+            if (rho_symbols_[buffer_idx][i].level0) rho_steps++;
+            t += static_cast<uint32_t>(ts.duration0) + ts.duration1;
+        }
+        if (bresenham_) {
+            if (theta_pos_ && theta_steps) {
+                theta_pos_->fetch_add(theta_steps * bresenham_->theta_dir,
+                    std::memory_order_release);
+            }
+            if (rho_pos_ && rho_steps) {
+                rho_pos_->fetch_add(rho_steps * bresenham_->rho_dir,
+                    std::memory_order_release);
+            }
+        }
+        ESP_LOGD(TAG, "Abort: credited %ld theta / %ld rho steps of the in-flight chunk (%lu us elapsed)",
+            static_cast<long>(theta_steps), static_cast<long>(rho_steps),
+            static_cast<unsigned long>(elapsed_us));
+    }
+
+    void RmtStepSequencer::abort_channels_and_credit() {
+        // Step credit is completion-based (TX-done ISR), so the chunk cut
+        // short here had emitted steps the counters had not seen: up to a
+        // whole chunk (63 steps) of position error per abort, which every
+        // hall/stall stop and every drain then carried forward. The RMT
+        // driver exposes no "symbols transmitted" count for a driver-owned
+        // channel, so reconstruct it: the chunk's start time (stamped when
+        // its transmission began) and its own symbol durations give the
+        // number of symbols that had started by the moment of the disable,
+        // to within one symbol. rmt_disable stops the hardware immediately,
+        // so the PHYSICAL stop stays as prompt as before — homing precision
+        // relies on that; only the bookkeeping changes.
+        const uint32_t pairs_before = completed_pairs_.load(std::memory_order_acquire);
+        const uint32_t start_us = chunk_start_us_.load(std::memory_order_relaxed);
+        const bool in_flight = pending_tx_.load(std::memory_order_acquire) > 0;
+
         // disable/enable resets the channel: aborts the in-flight
         // transmission and flushes the queue. Task context only.
         if (theta_channel_) {
             rmt_disable(theta_channel_);
-            rmt_enable(theta_channel_);
         }
         if (rho_channel_) {
             rmt_disable(rho_channel_);
+        }
+        const uint32_t now_us = static_cast<uint32_t>(esp_timer_get_time());
+
+        if (in_flight && completed_pairs_.load(std::memory_order_acquire) == pairs_before) {
+            // The pair that was in flight is the next one to complete.
+            credit_partial_chunk(static_cast<uint8_t>(pairs_before & 1), now_us - start_us);
+        }
+        // else: the ISR completed (and credited) that pair between the
+        // snapshot and the disable, and whatever started after it ran for
+        // microseconds at most — nothing worth crediting.
+
+        if (theta_channel_) {
+            rmt_enable(theta_channel_);
+        }
+        if (rho_channel_) {
             rmt_enable(rho_channel_);
         }
         pending_tx_.store(0, std::memory_order_release);
+        channels_done_.store(0, std::memory_order_release);
         executing_.store(false, std::memory_order_release);
-        // Position note: steps from the partially-transmitted chunk were
-        // emitted but not credited (crediting is completion-based), so the
-        // logical position may lag the physical by < kChunkSize steps after
-        // an abort. This is the bounded residual error of an abort.
     }
 
     void RmtStepSequencer::stop() {
@@ -775,10 +828,12 @@ namespace sand_table {
     }
 
     Result<void> CoordinatedStepperController::init() {
-        // Allocate interval table from INTERNAL RAM. The RMT TX-done ISR
-        // reads this table (encode_chunk); SPIRAM access from an IRAM ISR
-        // crashes whenever the flash cache is disabled (NVS commits, OTA).
-        // At MAX_SEGMENT_STEPS=8192 this is 16KB.
+        // Allocate the interval table from INTERNAL RAM. It is read from
+        // task context only (encode_chunk runs in execute()'s refill loop,
+        // never in the TX-done ISR), so this is about latency, not safety:
+        // the priority-24 stepper task must not stall on a PSRAM access
+        // while the flash cache is off (NVS commit, OTA). At
+        // MAX_SEGMENT_STEPS=8192 this is 16KB.
         interval_table_.intervals = static_cast<uint16_t*>(
             heap_caps_calloc(kMaxIntervalsPerSegment, sizeof(uint16_t),
                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
@@ -788,15 +843,17 @@ namespace sand_table {
             return Result<void>::err(MotionError::HardwareFault);
         }
 
-        // Allocate RMT sequencer in internal RAM (required for ISR callback safety)
-        void* mem = malloc(sizeof(RmtStepSequencer));
-        if (!mem) {
+        // The RMT sequencer MUST be in internal RAM: the TX-done ISR reads
+        // and writes it (stop flag, pending/completed counters, per-buffer
+        // step credits, semaphore handle). Explicit caps rather than
+        // malloc(), which may return PSRAM under CONFIG_SPIRAM_USE_MALLOC.
+        rmt_sequencer_ = make_internal<RmtStepSequencer>();
+        if (!rmt_sequencer_) {
             ESP_LOGE(TAG, "Failed to allocate RMT sequencer in internal RAM");
             heap_caps_free(interval_table_.intervals);
             interval_table_.intervals = nullptr;
             return Result<void>::err(MotionError::HardwareFault);
         }
-        rmt_sequencer_.reset(new (mem) RmtStepSequencer());
 
         auto result = rmt_sequencer_->init(theta_.step_pin(), rho_.step_pin());
         if (result.is_err()) {
@@ -853,9 +910,9 @@ namespace sand_table {
             return profile;
         }
 
-        // Hardware limits
+        // Hardware limits (see HardwareConfig for the derivation)
         const float max_step_rate = static_cast<float>(HardwareConfig::MAX_STEP_RATE_HZ);
-        const float min_step_rate = 31.0f;  // Limited by RMT symbol duration at 1 MHz
+        const float min_step_rate = static_cast<float>(HardwareConfig::MIN_STEP_RATE_HZ);
 
         // One entry/exit pair in path units: both motors share this one
         // time base (the interval table drives the major axis, Bresenham
@@ -867,22 +924,17 @@ namespace sand_table {
         float exit_rpm = segment.exit_velocity;
 
         // Safety cap applied AFTER feedrate: bound the physical theta spin
-        // rate regardless of what path speed was requested. Path speed v
-        // (units/min) over `distance` turns |delta_theta| in distance/v
-        // minutes, so the rotation rate is v * rotations / distance — clamp
-        // v so it never exceeds THETA_MAX_ROT_PER_MIN. Exact for either
-        // major axis (the ratio theta_steps/distance is fixed per segment).
+        // rate regardless of what path speed was requested
+        // (MotionConfig::theta_path_speed_cap — the same formula the
+        // velocity planner caps nominal with). Exact for either major axis
+        // (the ratio theta_steps/distance is fixed per segment).
         float nominal_rpm = segment.nominal_velocity;
-        if (theta_moves && segment.distance > 0.0f) {
-            const float rotations = std::fabs(static_cast<float>(segment.delta_theta_rad)) /
-                (2.0f * static_cast<float>(M_PI));
-            if (rotations > 1e-6f) {
-                const float v_cap = MotionConfig::theta_max_rot_per_min() *
-                    segment.distance / rotations;
-                entry_rpm = std::min(entry_rpm, v_cap);
-                exit_rpm = std::min(exit_rpm, v_cap);
-                nominal_rpm = std::min(nominal_rpm, v_cap);
-            }
+        if (theta_moves) {
+            const float v_cap = MotionConfig::theta_path_speed_cap(
+                segment.delta_theta_rad, segment.distance);
+            entry_rpm = std::min(entry_rpm, v_cap);
+            exit_rpm = std::min(exit_rpm, v_cap);
+            nominal_rpm = std::min(nominal_rpm, v_cap);
         }
 
         // Convert RPM to steps/s using the relationship:
@@ -977,9 +1029,16 @@ namespace sand_table {
     Result<void> CoordinatedStepperController::execute_segment(
         const MotionSegment& segment)
     {
-        if (rmt_sequencer_->is_executing()) {
+        // Claim the shared execution state (bresenham_, interval_table_,
+        // the sequencer) BEFORE touching any of it — see busy_.
+        bool expected = false;
+        if (!busy_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
             return Result<void>::err(MotionError::InvalidState);
         }
+        struct Release {
+            std::atomic<bool>& b;
+            ~Release() { b.store(false, std::memory_order_release); }
+        } release{ busy_ };
 
         // Calculate total steps for Bresenham (major axis)
         const uint32_t total_steps = static_cast<uint32_t>(
@@ -1027,10 +1086,10 @@ namespace sand_table {
         prepare_interval_table(profile, total_steps);
 
         // Debug: Validate first interval (for first move speed issue)
-        constexpr uint32_t min_interval_us = 1000000 / HardwareConfig::MAX_STEP_RATE_HZ;  // 20us
-        if (interval_table_.intervals[0] < min_interval_us) {
+        if (interval_table_.intervals[0] < HardwareConfig::MIN_STEP_INTERVAL_US) {
             ESP_LOGW(TAG, "First interval too fast: %u us (min: %lu us)",
-                interval_table_.intervals[0], min_interval_us);
+                interval_table_.intervals[0],
+                static_cast<unsigned long>(HardwareConfig::MIN_STEP_INTERVAL_US));
         }
 
         ESP_LOGD(TAG, "RMT segment: theta=%ld, rho=%ld, total=%lu, cruise_v=%.1f, interval[0]=%u us",
@@ -1045,13 +1104,10 @@ namespace sand_table {
         // planned_nominal x scale, so scale may grow only up to v_cap /
         // planned_nominal; 1.0 when the cap already binds the plan).
         float scale_ceiling = 20.0f;  // matches update_speed_scale's sanity clamp
-        if (segment.delta_theta_steps != 0 && segment.distance > 0.0f &&
-            segment.nominal_velocity > 0.0f) {
-            const float rotations = std::fabs(static_cast<float>(segment.delta_theta_rad)) /
-                (2.0f * static_cast<float>(M_PI));
-            if (rotations > 1e-6f) {
-                const float v_cap = MotionConfig::theta_max_rot_per_min() *
-                    segment.distance / rotations;
+        if (segment.delta_theta_steps != 0 && segment.nominal_velocity > 0.0f) {
+            const float v_cap = MotionConfig::theta_path_speed_cap(
+                segment.delta_theta_rad, segment.distance);
+            if (std::isfinite(v_cap)) {
                 scale_ceiling = std::max(1.0f,
                     v_cap / std::min(segment.nominal_velocity, v_cap));
             }
@@ -1081,9 +1137,17 @@ namespace sand_table {
         int32_t rho_steps,
         uint32_t interval_us)
     {
-        if (rmt_sequencer_->is_executing()) {
+        // Claim the shared execution state for the whole chunked seek —
+        // the stepper task's execute_segment() must find us busy, not race
+        // us on bresenham_/interval_table_ (see busy_).
+        bool expected = false;
+        if (!busy_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
             return Result<void>::err(MotionError::InvalidState);
         }
+        struct Release {
+            std::atomic<bool>& b;
+            ~Release() { b.store(false, std::memory_order_release); }
+        } release{ busy_ };
 
         // Calculate total steps for Bresenham (major axis)
         const uint32_t total_steps = static_cast<uint32_t>(
@@ -1110,12 +1174,10 @@ namespace sand_table {
         const int32_t major = std::max(bresenham_.theta_total, bresenham_.rho_total);
         bresenham_.error = major / 2;
 
-        // Clamp interval to valid range for RMT
-        constexpr uint32_t min_interval_us = 1000000 / HardwareConfig::MAX_STEP_RATE_HZ;  // 20µs
-        constexpr uint32_t max_interval_us = 32000;  // ~31 steps/s at 1 MHz RMT clock
+        // Clamp interval to the RMT-representable range (HardwareConfig)
         uint32_t clamped_interval = interval_us;
-        if (clamped_interval < min_interval_us) clamped_interval = min_interval_us;
-        if (clamped_interval > max_interval_us) clamped_interval = max_interval_us;
+        if (clamped_interval < HardwareConfig::MIN_STEP_INTERVAL_US) clamped_interval = HardwareConfig::MIN_STEP_INTERVAL_US;
+        if (clamped_interval > HardwareConfig::MAX_STEP_INTERVAL_US) clamped_interval = HardwareConfig::MAX_STEP_INTERVAL_US;
 
         ESP_LOGI(TAG, "Constant-speed: theta=%ld, rho=%ld, interval=%lu us (%lu steps/s)",
             theta_steps, rho_steps, clamped_interval, 1000000UL / clamped_interval);
@@ -1176,10 +1238,8 @@ namespace sand_table {
         interval_table_.clear();
         interval_table_.total_steps = std::min(total_steps, static_cast<uint32_t>(kMaxIntervalsPerSegment));
 
-        // RMT symbol max duration: 32767 ticks @ 1MHz = 32767µs
-        // Minimum velocity = 1,000,000 / 32767 ≈ 30.5 steps/s
-        // Use 31 steps/s for margin
-        const float min_velocity = 31.0f;  // steps/s (limited by RMT symbol max duration at 1 MHz)
+        // Representable rate range (see HardwareConfig for the derivation)
+        const float min_velocity = static_cast<float>(HardwareConfig::MIN_STEP_RATE_HZ);
         const float max_velocity = static_cast<float>(HardwareConfig::MAX_STEP_RATE_HZ);
 
         for (uint32_t step = 0; step < interval_table_.total_steps; ++step) {
@@ -1215,16 +1275,12 @@ namespace sand_table {
             // interval_us = 1,000,000 / velocity
             uint32_t interval_us = static_cast<uint32_t>(1000000.0f / velocity);
 
-            // Clamp interval to safe range
-            // Minimum: 20µs (50kHz max step rate)
-            // Maximum: 32000µs (~31 steps/s, fits in RMT symbol at 1 MHz)
-            constexpr uint32_t min_interval_us = 1000000 / HardwareConfig::MAX_STEP_RATE_HZ;
-            constexpr uint32_t max_interval_us = 32000;  // ~31 steps/s, fits in single RMT symbol at 1 MHz
-            if (interval_us < min_interval_us) {
-                interval_us = min_interval_us;
+            // Clamp interval to the RMT-representable range (HardwareConfig)
+            if (interval_us < HardwareConfig::MIN_STEP_INTERVAL_US) {
+                interval_us = HardwareConfig::MIN_STEP_INTERVAL_US;
             }
-            if (interval_us > max_interval_us) {
-                interval_us = max_interval_us;
+            if (interval_us > HardwareConfig::MAX_STEP_INTERVAL_US) {
+                interval_us = HardwareConfig::MAX_STEP_INTERVAL_US;
             }
 
             interval_table_.intervals[step] = static_cast<uint16_t>(interval_us);

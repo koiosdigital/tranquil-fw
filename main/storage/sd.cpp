@@ -9,9 +9,17 @@ void init_sd() {
     ESP_LOGI(TAG, "Initializing SD card");
     esp_err_t ret;
 
+    // NEVER auto-format: a transient mount failure (card glitch, corrupt
+    // FAT, brown-out mid-write) would silently wipe the whole pattern
+    // library, licenses and receipts. A card that truly needs formatting is
+    // handled explicitly via format_sd() from the factory-reset path.
+    // max_files: the player holds a pattern open, the manifest snapshots
+    // three tables, two job workers each hold input+output, the thumbnail
+    // renderer a PNG, receipts/license reads, plus HTTP uploads — 10 was
+    // hit in practice and surfaced as spurious ENFILE opens.
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
-        .format_if_mount_failed = true,
-        .max_files = 10,
+        .format_if_mount_failed = false,
+        .max_files = 20,
         .allocation_unit_size = 16 * 1024
     };
 

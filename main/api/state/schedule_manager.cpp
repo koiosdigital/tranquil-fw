@@ -2,6 +2,8 @@
 #include "schedule_manager.h"
 #include "led_state.h"
 #include "library_notifier.h"
+#include "download_progress.h"
+#include "download_tracker.h"
 #include <freertos/task.h>
 #include "SandTablePlayer.h"
 
@@ -29,20 +31,15 @@ constexpr auto kTypeLedState    = KD__V1__SCHEDULE_ACTION__SCHEDULE_ACTION_TYPE_
 constexpr auto kTypeSpeed       = KD__V1__SCHEDULE_ACTION__SCHEDULE_ACTION_TYPE__SCHEDULE_ACTION_TYPE_SET_SPEED;
 constexpr auto kTypeStop        = KD__V1__SCHEDULE_ACTION__SCHEDULE_ACTION_TYPE__SCHEDULE_ACTION_TYPE_STOP;
 
+// Blocking by default; the esp_timer tick passes a short timeout and checks
+// operator bool.
 struct Lock {
     SemaphoreHandle_t m;
-    explicit Lock(SemaphoreHandle_t mutex) : m(mutex) { if (m) xSemaphoreTake(m, portMAX_DELAY); }
-    ~Lock() { if (m) xSemaphoreGive(m); }
-};
-
-// Reaches HandlerBase::serialize() (protected) for the packed Schedule push.
-struct Packer : HandlerBase {
-    HandleResult handle(const Kd__V1__TranquilMessage*, const MessageContext&, ResponseMessage&) override {
-        return HandleResult::notHandled();
-    }
-    bool canHandle(Kd__V1__TranquilMessage__MessageCase) const override { return false; }
-    std::vector<Kd__V1__TranquilMessage__MessageCase> supportedMessages() const override { return {}; }
-    static ResponseMessage pack(const Kd__V1__TranquilMessage* msg) { return serialize(msg); }
+    bool held;
+    explicit Lock(SemaphoreHandle_t mutex, TickType_t timeout = portMAX_DELAY)
+        : m(mutex), held(mutex != nullptr && xSemaphoreTake(mutex, timeout) == pdTRUE) {}
+    ~Lock() { if (held) xSemaphoreGive(m); }
+    explicit operator bool() const { return held; }
 };
 
 // ---------------------------------------------------------------------------
@@ -277,7 +274,9 @@ void ScheduleManager::sanitize(QuietHours& quiet) {
 }
 
 esp_err_t ScheduleManager::setSchedule(std::vector<ScheduleItem> items,
-                                       const std::optional<QuietHours>& quiet) {
+                                       const std::optional<QuietHours>& quiet,
+                                       int exclude_local_fd,
+                                       bool exclude_cloud) {
     if (items.size() > kMaxItems) return ESP_ERR_INVALID_SIZE;
     if (quiet && quiet->windows.size() > kMaxQuietWindows) return ESP_ERR_INVALID_SIZE;
 
@@ -297,6 +296,7 @@ esp_err_t ScheduleManager::setSchedule(std::vector<ScheduleItem> items,
         });
 
     esp_err_t ret;
+    size_t n_items, n_windows;
     {
         Lock lock(mutex_);
         schedule_ = std::move(items);
@@ -311,11 +311,13 @@ esp_err_t ScheduleManager::setSchedule(std::vector<ScheduleItem> items,
             it = present ? std::next(it) : last_fired_.erase(it);
         }
         ret = saveLocked();
+        n_items = schedule_.size();
+        n_windows = quiet_.windows.size();
     }
 
     ESP_LOGI(TAG, "Schedule set: %zu items, quiet windows=%zu (%s)",
-        schedule_.size(), quiet_.windows.size(), esp_err_to_name(ret));
-    if (ret == ESP_OK) library_notifier::schedule_changed();
+        n_items, n_windows, esp_err_to_name(ret));
+    if (ret == ESP_OK) library_notifier::schedule_changed(exclude_local_fd, exclude_cloud);
     return ret;
 }
 
@@ -553,10 +555,10 @@ void ScheduleManager::onQuietEdge(bool entering) {
         }
         if (quiet.lights_off) {
             std::vector<uint32_t> dimmed;
-            for (size_t i = 0; i < led_state::channel_count(); i++) {
-                auto id = led_state::channel_id(static_cast<uint32_t>(i));
-                const PixelChannel* ch = id ? PixelDriver::getChannel(*id) : nullptr;
-                if (!ch || !ch->getEffectConfig().enabled) continue;
+            const size_t n = led_state::channel_count();
+            for (size_t i = 0; i < n; i++) {
+                led_state::ChannelSnapshot snap;
+                if (!led_state::snapshot_channel(static_cast<uint32_t>(i), snap) || !snap.effect.enabled) continue;
                 led_state::ChannelPatch patch;
                 patch.enabled = false;
                 if (led_state::apply_channel_patch(static_cast<uint32_t>(i), patch)) {
@@ -583,6 +585,11 @@ void ScheduleManager::onQuietEdge(bool entering) {
 }
 
 void ScheduleManager::checkAndExecute() {
+    // Housekeeping that rides on the 30 s tick: age out downloads that never
+    // finished. Both give up (and retry next tick) if their lock is busy.
+    DownloadProgressBroadcaster::instance().expireStale();
+    DownloadTracker::instance().cleanupExpired();
+
     int day_of_week;
     uint32_t current_time;
     time_t now;
@@ -590,15 +597,17 @@ void ScheduleManager::checkAndExecute() {
         return;  // Time not set
     }
 
-    // Snapshot: the live vectors are replaced from httpd / cloudlink tasks.
-    std::vector<ScheduleItem> schedule;
-    bool quiet;
-    {
-        Lock lock(mutex_);
-        schedule = schedule_;
-        quiet = quietNowLocked(day_of_week, current_time);
+    // esp_timer task: a blocking take here would stall every other timer
+    // behind an httpd / cloudlink writer holding the lock. Try briefly and
+    // skip the tick instead; the fire window is 30 s wide, so the next tick
+    // still catches anything due.
+    Lock lock(mutex_, TICK_LOCK_WAIT);
+    if (!lock) {
+        ESP_LOGW(TAG, "Schedule tick skipped: lock busy");
+        return;
     }
 
+    const bool quiet = quietNowLocked(day_of_week, current_time);
     if (quiet != quiet_active_) {
         quiet_active_ = quiet;
         if (xTaskCreate(quietEdgeTask, "sched_quiet", 6144,
@@ -607,9 +616,9 @@ void ScheduleManager::checkAndExecute() {
         }
     }
 
-    if (schedule.empty()) return;
+    if (schedule_.empty()) return;
 
-    for (const auto& item : schedule) {
+    for (const auto& item : schedule_) {
         if (!item.enabled) continue;
         if (!item.matches_day(day_of_week)) continue;
 
@@ -618,12 +627,9 @@ void ScheduleManager::checkAndExecute() {
         if (diff < 0 || diff > FIRE_WINDOW_S) continue;
 
         // Never twice for the same window (per item, so items sharing a time all fire).
-        {
-            Lock lock(mutex_);
-            auto fired = last_fired_.find(item.id);
-            if (fired != last_fired_.end() && now - fired->second < REFIRE_GUARD_S) continue;
-            last_fired_[item.id] = now;
-        }
+        auto fired = last_fired_.find(item.id);
+        if (fired != last_fired_.end() && now - fired->second < REFIRE_GUARD_S) continue;
+        last_fired_[item.id] = now;
 
         if (quiet && item.obey_quiet_hours) {
             ESP_LOGI(TAG, "Skipping item %lu '%s' (quiet hours)",
@@ -874,12 +880,12 @@ void ScheduleManager::toProto(ScheduleProtoScratch& s) const {
     s.schedule.quiet_hours = &s.quiet;
 }
 
-ResponseMessage ScheduleManager::buildScheduleMessage() const {
+ResponseMessage ScheduleManager::buildScheduleMessage(const char* request_id) const {
     ScheduleProtoScratch scratch;
     toProto(scratch);
 
     Kd__V1__TranquilMessage msg = KD__V1__TRANQUIL_MESSAGE__INIT;
     msg.message_case = KD__V1__TRANQUIL_MESSAGE__MESSAGE_SCHEDULE;
     msg.schedule = &scratch.schedule;
-    return Packer::pack(&msg);
+    return pack_tranquil_message(&msg, request_id);
 }

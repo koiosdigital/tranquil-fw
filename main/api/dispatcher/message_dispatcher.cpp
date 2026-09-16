@@ -19,6 +19,11 @@ ProtobufCAllocator g_spiram_allocator = {
     .free = pb_spiram_free,
     .allocator_data = nullptr,
 };
+
+// The request's correlation id, or nullptr when the sender set none.
+const char* request_id_of(const Kd__V1__TranquilMessage* msg) {
+    return (msg->request_id && msg->request_id[0]) ? msg->request_id : nullptr;
+}
 }  // namespace
 
 MessageDispatcher& MessageDispatcher::instance() {
@@ -68,7 +73,8 @@ esp_err_t MessageDispatcher::dispatch(
         if (!response.valid()) {
             ESP_LOGE(TAG, "Handler for type %d produced no payload (response too large?)",
                 msg->message_case);
-            response = HandlerBase::makeCommandResult(false, "Response too large");
+            response = HandlerBase::makeCommandResult(false, "Response too large", request_id_of(msg),
+                ESP_ERR_INVALID_SIZE);
             result.broadcast = false;
             result.send_to_cloud = false;
         }
@@ -81,7 +87,7 @@ esp_err_t MessageDispatcher::dispatch(
 
 esp_err_t MessageDispatcher::dispatch(
     Kd__V1__TranquilMessage* msg,
-    const MessageContext& ctx,
+    const MessageContext& ctx_in,
     ResponseMessage* response_out,
     HandleResult* result_out
 ) {
@@ -90,11 +96,17 @@ esp_err_t MessageDispatcher::dispatch(
         return ESP_ERR_INVALID_ARG;
     }
 
+    // Correlation id lives on the request envelope; carry it in the context
+    // so every reply (handler-built or dispatcher-built) echoes it. The
+    // cloud path hands us an already-parsed message, so this is done here
+    // rather than in the raw-bytes overload.
+    MessageContext ctx = ctx_in;
+    if (!ctx.request_id) ctx.request_id = request_id_of(msg);
+
     ESP_LOGD(TAG, "Dispatching message type %d from %s",
         msg->message_case,
         ctx.source == MessageSource::LOCAL_WEBSOCKET ? "local" :
-        ctx.source == MessageSource::CLOUD_WEBSOCKET ? "cloud" :
-        ctx.source == MessageSource::REST_API ? "rest" : "internal");
+        ctx.source == MessageSource::CLOUD_WEBSOCKET ? "cloud" : "internal");
 
     // Check if message type is allowed from this source
     if (!isAllowedFrom(msg->message_case, ctx.source)) {
@@ -103,7 +115,8 @@ esp_err_t MessageDispatcher::dispatch(
 
         // Return error response
         if (response_out) {
-            *response_out = HandlerBase::makeCommandResult(false, "Not allowed from this source");
+            *response_out = HandlerBase::makeCommandResult(false, "Not allowed from this source",
+                ctx.request_id, ESP_ERR_NOT_ALLOWED);
         }
         if (result_out) {
             *result_out = HandleResult::error();
@@ -121,7 +134,8 @@ esp_err_t MessageDispatcher::dispatch(
         // reach here; anything else from the cloud is simply ignored.
         if (ctx.source == MessageSource::LOCAL_WEBSOCKET) {
             if (response_out) {
-                *response_out = HandlerBase::makeCommandResult(false, "Unsupported message");
+                *response_out = HandlerBase::makeCommandResult(false, "Unsupported message",
+                    ctx.request_id, ESP_ERR_NOT_SUPPORTED);
             }
             if (result_out) {
                 *result_out = HandleResult::error();
@@ -225,8 +239,7 @@ public:
 // The local request/response surface lives on the REST API; the dispatcher
 // keeps only what the sockets still need: cloud sync (patterns, playlists,
 // schedule, player control, system) and real-time push to local clients.
-// Config, preset, and license store-token messages were local-only and are
-// now served by /api/config, /api/presets, and /api/license/store-token.
+// Both transports are thin codecs over the same ops core (main/api/ops).
 void dispatcher_register_standard_handlers() {
     auto& dispatcher = MessageDispatcher::instance();
 

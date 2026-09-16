@@ -1,6 +1,6 @@
 // Player state broadcaster implementation
 #include "player_state_broadcaster.h"
-#include "player_handler.h"
+#include "ops/player_ops.h"
 #include "response_router.h"
 #include "SandTablePlayer.h"
 
@@ -21,7 +21,9 @@ void PlayerStateBroadcaster::init() {
     // Initialize cached state
     memset(&cached_state_, 0, sizeof(cached_state_));
 
-    // Create periodic timer for state checking
+    // Create periodic timer for state checking. The tick takes no mutex:
+    // SandTablePlayer::getStatus() is a non-blocking snapshot and the send
+    // path drops at the source when the socket queue is saturated.
     esp_timer_create_args_t timer_args = {
         .callback = timerCallback,
         .arg = this,
@@ -159,7 +161,7 @@ void PlayerStateBroadcaster::checkAndBroadcast() {
 }
 
 void PlayerStateBroadcaster::broadcastToLocal() {
-    ResponseMessage response = PlayerHandler::instance().buildPlayerStateResponse();
+    ResponseMessage response = player_ops::build_state_message();
     if (response.valid()) {
         ResponseRouter::instance().broadcastToLocal(response);
         ESP_LOGD(TAG, "Broadcast PlayerState to local clients");
@@ -167,7 +169,7 @@ void PlayerStateBroadcaster::broadcastToLocal() {
 }
 
 void PlayerStateBroadcaster::sendToCloud() {
-    ResponseMessage response = PlayerHandler::instance().buildPlayerStateResponse();
+    ResponseMessage response = player_ops::build_state_message();
     if (response.valid()) {
         // forwardToCloud is a no-op while the cloud session is down; the
         // reconnect handshake pushes a fresh snapshot instead of replaying

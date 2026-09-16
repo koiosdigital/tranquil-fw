@@ -9,6 +9,9 @@
 
 #include <kd/v1/tranquil.pb-c.h>
 
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -97,8 +100,119 @@ static bool verify_device_binding(const char* for_device) {
     return match;
 }
 
+// -----------------------------------------------------------------------------
+// Verified-receipt cache
+//
+// drm_purchase_is_valid() sits on the playback hot path (every pattern open,
+// playlist advance and random pick) and an uncached check costs a FATFS
+// directory lookup, fopen, an RSA signature verify and an x509 parse of the
+// device cert. Cache the verdict per pattern uuid instead. A verdict is
+// dropped when that pattern's receipt file changes (drm_purchase_save /
+// drm_purchase_delete) and the whole cache is cleared on license reload and
+// factory reset. Negative verdicts are cached too: "no receipt" is the common
+// case for subscription patterns and the directory lookup is not free.
+// -----------------------------------------------------------------------------
+namespace {
+
+constexpr size_t kCacheEntries = 64;
+
+struct CacheEntry {
+    char uuid[40];   // empty = free slot
+    bool valid;      // verified verdict
+    uint32_t stamp;  // LRU clock at last touch
+};
+
+CacheEntry s_cache[kCacheEntries] = {};
+uint32_t s_cache_clock = 0;
+
+SemaphoreHandle_t cache_mutex() {
+    // Thread-safe magic static; nullptr (allocation failure) just bypasses
+    // the cache.
+    static SemaphoreHandle_t mutex = xSemaphoreCreateMutex();
+    return mutex;
+}
+
+bool cacheable(const char* uuid) {
+    return uuid != nullptr && uuid[0] != '\0' && strlen(uuid) < sizeof(CacheEntry::uuid);
+}
+
+// -1 = miss, 0 = cached invalid, 1 = cached valid
+int cache_lookup(const char* uuid) {
+    SemaphoreHandle_t mutex = cache_mutex();
+    if (!mutex || !cacheable(uuid)) return -1;
+
+    int result = -1;
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    for (auto& e : s_cache) {
+        if (e.uuid[0] && strcmp(e.uuid, uuid) == 0) {
+            e.stamp = ++s_cache_clock;
+            result = e.valid ? 1 : 0;
+            break;
+        }
+    }
+    xSemaphoreGive(mutex);
+    return result;
+}
+
+void cache_store(const char* uuid, bool valid) {
+    SemaphoreHandle_t mutex = cache_mutex();
+    if (!mutex || !cacheable(uuid)) return;
+
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    // Reuse the pattern's own slot, else a free slot, else evict the LRU.
+    CacheEntry* slot = nullptr;
+    for (auto& e : s_cache) {
+        if (e.uuid[0] && strcmp(e.uuid, uuid) == 0) { slot = &e; break; }
+    }
+    if (!slot) {
+        for (auto& e : s_cache) {
+            if (!e.uuid[0]) { slot = &e; break; }
+        }
+    }
+    if (!slot) {
+        slot = &s_cache[0];
+        for (auto& e : s_cache) {
+            if ((int32_t)(e.stamp - slot->stamp) < 0) slot = &e;
+        }
+    }
+    strcpy(slot->uuid, uuid);  // length checked by cacheable()
+    slot->valid = valid;
+    slot->stamp = ++s_cache_clock;
+    xSemaphoreGive(mutex);
+}
+
+void cache_invalidate(const char* uuid) {
+    SemaphoreHandle_t mutex = cache_mutex();
+    if (!mutex || !cacheable(uuid)) return;
+
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    for (auto& e : s_cache) {
+        if (e.uuid[0] && strcmp(e.uuid, uuid) == 0) {
+            e.uuid[0] = '\0';
+            break;
+        }
+    }
+    xSemaphoreGive(mutex);
+}
+
+}  // namespace
+
+void drm_purchase_cache_clear(void) {
+    SemaphoreHandle_t mutex = cache_mutex();
+    if (!mutex) return;
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    memset(s_cache, 0, sizeof(s_cache));
+    xSemaphoreGive(mutex);
+}
+
 bool drm_purchase_is_valid(const char* pattern_uuid) {
-    return drm_purchase_verify(pattern_uuid, nullptr) == ESP_OK;
+    const int cached = cache_lookup(pattern_uuid);
+    if (cached >= 0) {
+        return cached == 1;
+    }
+    const bool valid = (drm_purchase_verify(pattern_uuid, nullptr) == ESP_OK);
+    cache_store(pattern_uuid, valid);
+    return valid;
 }
 
 esp_err_t drm_purchase_verify(const char* pattern_uuid, drm_purchase_info_t* info) {
@@ -280,6 +394,10 @@ esp_err_t drm_purchase_save(const char* pattern_uuid,
 
     fclose(f);
 
+    // The file changed either way (written, or removed below on failure):
+    // any cached verdict for this pattern is stale.
+    cache_invalidate(pattern_uuid);
+
     if (!success) {
         ESP_LOGE(TAG, "Failed to write receipt file");
         remove(path);
@@ -369,6 +487,8 @@ esp_err_t drm_purchase_delete(const char* pattern_uuid) {
 
     char path[128];
     get_receipt_path(pattern_uuid, path, sizeof(path));
+
+    cache_invalidate(pattern_uuid);
 
     if (remove(path) != 0) {
         return ESP_ERR_NOT_FOUND;

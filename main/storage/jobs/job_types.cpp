@@ -40,17 +40,33 @@ JobStatus jobStatusFromString(const char* str) {
     return JobStatus::Pending;
 }
 
+namespace {
+
+// Serialize and free the tree. cJSON_PrintUnformatted returns NULL under
+// OOM; constructing std::string from that is undefined behaviour, so the
+// caller gets an empty blob (the job then fails at fromJson with a clear
+// "missing field" instead of crashing here).
+std::string print_and_delete(cJSON* root) {
+    std::string result;
+    if (!root) return result;
+    char* str = cJSON_PrintUnformatted(root);
+    if (str) {
+        result = str;
+        cJSON_free(str);
+    }
+    cJSON_Delete(root);
+    return result;
+}
+
+}  // namespace
+
 std::string ConversionJobData::toJson() const {
     cJSON* root = cJSON_CreateObject();
+    if (!root) return "";
     cJSON_AddStringToObject(root, "temp_path", temp_path.c_str());
     cJSON_AddStringToObject(root, "name", name.c_str());
     cJSON_AddBoolToObject(root, "encrypted", encrypted);
-
-    char* str = cJSON_PrintUnformatted(root);
-    std::string result(str);
-    free(str);
-    cJSON_Delete(root);
-    return result;
+    return print_and_delete(root);
 }
 
 ConversionJobData ConversionJobData::fromJson(const std::string& json) {
@@ -79,14 +95,10 @@ ConversionJobData ConversionJobData::fromJson(const std::string& json) {
 
 std::string ThumbnailJobData::toJson() const {
     cJSON* root = cJSON_CreateObject();
+    if (!root) return "";
     cJSON_AddBoolToObject(root, "encrypted", encrypted);
     cJSON_AddStringToObject(root, "output_path", output_path.c_str());
-
-    char* str = cJSON_PrintUnformatted(root);
-    std::string result(str);
-    free(str);
-    cJSON_Delete(root);
-    return result;
+    return print_and_delete(root);
 }
 
 ThumbnailJobData ThumbnailJobData::fromJson(const std::string& json) {
@@ -110,6 +122,7 @@ ThumbnailJobData ThumbnailJobData::fromJson(const std::string& json) {
 
 std::string DownloadJobData::toJson() const {
     cJSON* root = cJSON_CreateObject();
+    if (!root) return "";
     cJSON_AddStringToObject(root, "download_url", download_url.c_str());
     cJSON_AddStringToObject(root, "pattern_name", pattern_name.c_str());
     cJSON_AddStringToObject(root, "pattern_creator", pattern_creator.c_str());
@@ -126,12 +139,7 @@ std::string DownloadJobData::toJson() const {
     if (!receipt_signature_b64.empty()) {
         cJSON_AddStringToObject(root, "receipt_signature_b64", receipt_signature_b64.c_str());
     }
-
-    char* str = cJSON_PrintUnformatted(root);
-    std::string result(str);
-    free(str);
-    cJSON_Delete(root);
-    return result;
+    return print_and_delete(root);
 }
 
 DownloadJobData DownloadJobData::fromJson(const std::string& json) {

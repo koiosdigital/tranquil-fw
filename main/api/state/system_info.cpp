@@ -21,16 +21,6 @@ namespace system_info {
 
 namespace {
 
-// A tiny concrete subclass just to reach HandlerBase::serialize() (protected).
-struct Packer : HandlerBase {
-    HandleResult handle(const Kd__V1__TranquilMessage*, const MessageContext&, ResponseMessage&) override {
-        return HandleResult::notHandled();
-    }
-    bool canHandle(Kd__V1__TranquilMessage__MessageCase) const override { return false; }
-    std::vector<Kd__V1__TranquilMessage__MessageCase> supportedMessages() const override { return {}; }
-    static ResponseMessage pack(const Kd__V1__TranquilMessage* msg) { return serialize(msg); }
-};
-
 void fill_ip(char* out, size_t out_len) {
     out[0] = '\0';
     esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
@@ -74,7 +64,7 @@ void snapshot(Snapshot& out) {
     out.timezone = tz ? tz : "";
 }
 
-ResponseMessage build_message() {
+ResponseMessage build_message(const char* request_id) {
     Snapshot s;
     snapshot(s);
 
@@ -96,7 +86,7 @@ ResponseMessage build_message() {
     Kd__V1__TranquilMessage msg = KD__V1__TRANQUIL_MESSAGE__INIT;
     msg.message_case = KD__V1__TRANQUIL_MESSAGE__MESSAGE_SYSTEM_INFO;
     msg.system_info = &info;
-    return Packer::pack(&msg);
+    return pack_tranquil_message(&msg, request_id);
 }
 
 }  // namespace system_info

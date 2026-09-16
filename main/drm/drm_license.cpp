@@ -22,6 +22,7 @@
 
 #include "ManifestDatabase.h"
 #include "storage/EncryptedPatternReader.h"
+#include "drm_purchase.h"
 
 static const char* TAG = "drm_license";
 
@@ -360,8 +361,10 @@ esp_err_t drm_license_reload(void) {
     }
 
     // Drop the cached pattern AES key so key material recovered under the
-    // old license doesn't outlive it
+    // old license doesn't outlive it, and the cached receipt verdicts (the
+    // device binding they were checked against may have changed).
     EncryptedPatternReader::invalidateKeyCache();
+    drm_purchase_cache_clear();
 
     ESP_LOGI(TAG, "License reloaded, status: %d", license_state.status);
     return ret;

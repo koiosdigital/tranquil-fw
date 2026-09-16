@@ -1,5 +1,7 @@
 // Download tracker implementation
 #include "download_tracker.h"
+#include "raii_utils.hpp"
+
 #include <esp_timer.h>
 #include <esp_log.h>
 
@@ -10,58 +12,27 @@ DownloadTracker& DownloadTracker::instance() {
     return instance;
 }
 
-void DownloadTracker::trackDownload(const std::string& pattern_uuid, int origin_socket_fd) {
+DownloadTracker::DownloadTracker() : mutex_(xSemaphoreCreateMutex()) {
+    if (!mutex_) {
+        ESP_LOGE(TAG, "Failed to create mutex");
+    }
+}
+
+void DownloadTracker::trackDownload(const std::string& pattern_uuid) {
     if (pattern_uuid.empty()) return;
 
-    PendingDownload download = {
-        .origin_socket_fd = origin_socket_fd,
-        .request_time_us = esp_timer_get_time(),
-        .pattern_uuid = pattern_uuid
-    };
+    raii::MutexGuard guard(mutex_, portMAX_DELAY);
+    if (!guard) return;
 
-    pending_downloads_[pattern_uuid] = download;
+    pending_downloads_[pattern_uuid] = PendingDownload{ esp_timer_get_time() };
 
-    ESP_LOGI(TAG, "Tracking download for %s from socket %d",
-        pattern_uuid.c_str(), origin_socket_fd);
-}
-
-int DownloadTracker::getOriginSocket(const std::string& pattern_uuid) {
-    auto it = pending_downloads_.find(pattern_uuid);
-    if (it == pending_downloads_.end()) {
-        return -1;
-    }
-
-    int64_t now = esp_timer_get_time();
-    if (now - it->second.request_time_us > PENDING_TIMEOUT_US) {
-        ESP_LOGW(TAG, "Download %s expired", pattern_uuid.c_str());
-        pending_downloads_.erase(it);
-        return -1;
-    }
-
-    int socket_fd = it->second.origin_socket_fd;
-    pending_downloads_.erase(it);
-
-    ESP_LOGD(TAG, "Retrieved origin socket %d for download %s",
-        socket_fd, pattern_uuid.c_str());
-
-    return socket_fd;
-}
-
-int DownloadTracker::peekOriginSocket(const std::string& pattern_uuid) const {
-    auto it = pending_downloads_.find(pattern_uuid);
-    if (it == pending_downloads_.end()) {
-        return -1;
-    }
-
-    int64_t now = esp_timer_get_time();
-    if (now - it->second.request_time_us > PENDING_TIMEOUT_US) {
-        return -1;
-    }
-
-    return it->second.origin_socket_fd;
+    ESP_LOGI(TAG, "Tracking download for %s", pattern_uuid.c_str());
 }
 
 void DownloadTracker::removeDownload(const std::string& pattern_uuid) {
+    raii::MutexGuard guard(mutex_, portMAX_DELAY);
+    if (!guard) return;
+
     auto it = pending_downloads_.find(pattern_uuid);
     if (it != pending_downloads_.end()) {
         ESP_LOGD(TAG, "Removed tracking for %s", pattern_uuid.c_str());
@@ -70,6 +41,9 @@ void DownloadTracker::removeDownload(const std::string& pattern_uuid) {
 }
 
 void DownloadTracker::cleanupExpired() {
+    raii::MutexGuard guard(mutex_, pdMS_TO_TICKS(50));
+    if (!guard) return;
+
     int64_t now = esp_timer_get_time();
 
     for (auto it = pending_downloads_.begin(); it != pending_downloads_.end(); ) {
@@ -83,5 +57,7 @@ void DownloadTracker::cleanupExpired() {
 }
 
 bool DownloadTracker::isTracked(const std::string& pattern_uuid) const {
+    raii::MutexGuard guard(mutex_, portMAX_DELAY);
+    if (!guard) return false;
     return pending_downloads_.find(pattern_uuid) != pending_downloads_.end();
 }

@@ -16,11 +16,39 @@ namespace {
 
 std::atomic<bool> s_running{ false };
 
+// How long the homing task waits for the player to reach STOPPED after
+// asking it to stop (the service task drains the motion queue first).
+constexpr TickType_t kStopWaitTicks = pdMS_TO_TICKS(5000);
+constexpr TickType_t kStopPollTicks = pdMS_TO_TICKS(20);
+
+// MotionController::home() refuses to run while playback is active. Stop
+// the player here (on the homing task, so the request path never blocks)
+// and wait until it reports STOPPED before seeking.
+bool stop_player_and_wait() {
+    if (SandTablePlayer::getPlaybackState() == PlaybackState::STOPPED) return true;
+
+    ESP_LOGI(TAG, "Stopping playback before homing");
+    SandTablePlayer::stop();
+
+    const TickType_t deadline = xTaskGetTickCount() + kStopWaitTicks;
+    while (SandTablePlayer::getPlaybackState() != PlaybackState::STOPPED) {
+        if (static_cast<int32_t>(xTaskGetTickCount() - deadline) >= 0) return false;
+        vTaskDelay(kStopPollTicks);
+    }
+    return true;
+}
+
 void homing_task(void* arg) {
     const bool force_full = reinterpret_cast<intptr_t>(arg) != 0;
 
     auto* mc = SandTablePlayer::getMotionController();
-    if (mc) {
+    if (!mc) {
+        ESP_LOGE(TAG, "Motion controller not initialized");
+    }
+    else if (!stop_player_and_wait()) {
+        ESP_LOGE(TAG, "Player did not stop; homing aborted");
+    }
+    else {
         auto result = mc->home(force_full);
         if (result.is_ok()) {
             ESP_LOGI(TAG, "Homing complete (force_full=%d)", force_full);
@@ -28,9 +56,6 @@ void homing_task(void* arg) {
         else {
             ESP_LOGE(TAG, "Homing failed (error=%d)", static_cast<int>(result.error()));
         }
-    }
-    else {
-        ESP_LOGE(TAG, "Motion controller not initialized");
     }
 
     s_running.store(false, std::memory_order_release);
@@ -50,7 +75,7 @@ esp_err_t start(bool force_full_calibration) {
     }
     if (!SandTablePlayer::getMotionController()) {
         s_running.store(false);
-        return ESP_ERR_INVALID_STATE;
+        return ESP_FAIL;
     }
 
     // 6 KB: home_all() logs with floats and runs the seek loops.

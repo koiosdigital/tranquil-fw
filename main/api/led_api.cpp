@@ -1,14 +1,16 @@
-// LED REST API implementation
+// LED REST API: a thin JSON codec over led_ops / led_state. Channel state
+// is only ever read from led_state snapshots (taken under the driver lock).
 #include "led_api.h"
 #include "api_common.h"
 #include "led_state.h"
+#include "ops/led_ops.h"
 #include "config_manager.h"
-#include "kd_pixdriver.h"
-#include "pixel_effects.h"
 
 #include <esp_log.h>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 
 static const char* TAG = "led_api";
 
@@ -34,17 +36,10 @@ int channel_index_from_uri(const char* uri) {
     return atoi(p);
 }
 
-void write_channel_state(ChunkBuf* cb, uint32_t index) {
-    auto id = led_state::channel_id(index);
-    const PixelChannel* ch = id ? PixelDriver::getChannel(*id) : nullptr;
-    if (!ch) {
-        chunk_buf_write_str(cb, "null");
-        return;
-    }
-    const EffectConfig& eff = ch->getEffectConfig();
-    const PixelFormat fmt = ch->getConfig().format;
+void write_channel_state(ChunkBuf* cb, const led_state::ChannelSnapshot& s) {
+    const EffectConfig& eff = s.effect;
 
-    chunk_buf_printf(cb, "{\"index\":%lu,\"effect_id\":", static_cast<unsigned long>(index));
+    chunk_buf_printf(cb, "{\"index\":%lu,\"effect_id\":", static_cast<unsigned long>(s.index));
     chunk_buf_write_json_string(cb, eff.effect.c_str());
     // Hex string per the documented LEDChannelState schema. On RGBW the
     // white channel is auto-derived, so 6-digit RGB is the full public state;
@@ -52,41 +47,41 @@ void write_channel_state(ChunkBuf* cb, uint32_t index) {
     chunk_buf_printf(cb, ",\"brightness\":%u,\"speed\":%u,\"on\":%s,\"color\":\"#%02x%02x%02x\"",
         eff.brightness, eff.speed, eff.enabled ? "true" : "false",
         eff.color.r, eff.color.g, eff.color.b);
-    if (fmt == PixelFormat::RGBCCT) {
+    if (s.format == PixelFormat::RGBCCT) {
         chunk_buf_printf(cb, ",\"w\":%u,\"cw\":%u", eff.color.w, eff.color.cw);
     }
     chunk_buf_write(cb, "}", 1);
 }
 
+esp_err_t send_channel(httpd_req_t* req, uint32_t index) {
+    led_state::ChannelSnapshot snap;
+    if (!led_state::snapshot_channel(index, snap)) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Channel not found");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    ChunkBuf cb;
+    chunk_buf_init(&cb, req);
+    write_channel_state(&cb, snap);
+    chunk_buf_finish(&cb);
+    return ESP_OK;
+}
+
 // GET /api/led/effects
 esp_err_t effects_handler(httpd_req_t* req) {
-    PixelEffectEngine* engine = PixelDriver::getEffectEngine();
     httpd_resp_set_type(req, "application/json");
     // Static list: let the app cache it.
     httpd_resp_set_hdr(req, "Cache-Control", "max-age=3600");
     ChunkBuf cb;
     chunk_buf_init(&cb, req);
-    chunk_buf_write(&cb, "[", 1);
-    if (engine) {
-        bool first = true;
-        for (const auto& eff : engine->getAllEffects()) {
-            if (!first) chunk_buf_write(&cb, ",", 1);
-            chunk_buf_write_str(&cb, "{\"id\":");
-            chunk_buf_write_json_string(&cb, eff.id.c_str());
-            chunk_buf_write_str(&cb, ",\"name\":");
-            chunk_buf_write_json_string(&cb, eff.display_name.c_str());
-            chunk_buf_write(&cb, "}", 1);
-            first = false;
-        }
-    }
-    chunk_buf_write(&cb, "]", 1);
+    led_ops::effects_to_json(&cb);
     chunk_buf_finish(&cb);
     return ESP_OK;
 }
 
 // GET /api/led/config - strip hardware + live state of every channel
 esp_err_t config_handler(httpd_req_t* req) {
-    std::vector<int32_t> ids = PixelDriver::getChannelIds();
+    std::vector<led_state::ChannelSnapshot> snaps = led_state::snapshot_channels();
     const auto& hw = sand_table::ConfigManager::instance().led_config();
 
     httpd_resp_set_type(req, "application/json");
@@ -94,15 +89,14 @@ esp_err_t config_handler(httpd_req_t* req) {
     chunk_buf_init(&cb, req);
     chunk_buf_write_str(&cb, "{\"version\":");
     chunk_buf_write_json_string(&cb, getPixelDriverVersion());
-    chunk_buf_printf(&cb, ",\"has_leds\":%s,\"channels\":[", ids.empty() ? "false" : "true");
-    for (size_t i = 0; i < ids.size(); i++) {
-        const PixelChannel* ch = PixelDriver::getChannel(ids[i]);
-        if (!ch) continue;
-        if (i) chunk_buf_write(&cb, ",", 1);
-        const ChannelConfig& cfg = ch->getConfig();
-        chunk_buf_printf(&cb, "{\"index\":%zu,\"num_leds\":%u,\"type\":\"%s\",\"state\":",
-            i, cfg.pixel_count, format_name(cfg.format));
-        write_channel_state(&cb, static_cast<uint32_t>(i));
+    chunk_buf_printf(&cb, ",\"has_leds\":%s,\"channels\":[", snaps.empty() ? "false" : "true");
+    bool first = true;
+    for (const auto& s : snaps) {
+        if (!first) chunk_buf_write(&cb, ",", 1);
+        first = false;
+        chunk_buf_printf(&cb, "{\"index\":%lu,\"num_leds\":%u,\"type\":\"%s\",\"state\":",
+            static_cast<unsigned long>(s.index), s.pixel_count, format_name(s.format));
+        write_channel_state(&cb, s);
         chunk_buf_write(&cb, "}", 1);
     }
     // Configured (NVS) hardware, even when the strip is currently disabled,
@@ -115,15 +109,6 @@ esp_err_t config_handler(httpd_req_t* req) {
     return ESP_OK;
 }
 
-esp_err_t send_channel(httpd_req_t* req, uint32_t index) {
-    httpd_resp_set_type(req, "application/json");
-    ChunkBuf cb;
-    chunk_buf_init(&cb, req);
-    write_channel_state(&cb, index);
-    chunk_buf_finish(&cb);
-    return ESP_OK;
-}
-
 // GET /api/led/channel/{index}
 esp_err_t channel_get_handler(httpd_req_t* req) {
     int index = channel_index_from_uri(req->uri);
@@ -131,31 +116,7 @@ esp_err_t channel_get_handler(httpd_req_t* req) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid channel index");
         return ESP_FAIL;
     }
-    if (!led_state::channel_id(static_cast<uint32_t>(index))) {
-        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Channel not found");
-        return ESP_FAIL;
-    }
     return send_channel(req, static_cast<uint32_t>(index));
-}
-
-bool parse_hex_color(const char* s, PixelColor& out) {
-    if (*s == '#') s++;
-    unsigned r = 0, g = 0, b = 0, w = 0;
-    const size_t len = strlen(s);
-    if (len == 6 && sscanf(s, "%02x%02x%02x", &r, &g, &b) == 3) {
-        out.r = static_cast<uint8_t>(r);
-        out.g = static_cast<uint8_t>(g);
-        out.b = static_cast<uint8_t>(b);
-        return true;
-    }
-    if (len == 8 && sscanf(s, "%02x%02x%02x%02x", &r, &g, &b, &w) == 4) {
-        out.r = static_cast<uint8_t>(r);
-        out.g = static_cast<uint8_t>(g);
-        out.b = static_cast<uint8_t>(b);
-        out.w = static_cast<uint8_t>(w);
-        return true;
-    }
-    return false;
 }
 
 // POST /api/led/channel/{index} - partial update
@@ -165,9 +126,8 @@ esp_err_t channel_post_handler(httpd_req_t* req) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid channel index");
         return ESP_FAIL;
     }
-    auto id = led_state::channel_id(static_cast<uint32_t>(index));
-    const PixelChannel* ch = id ? PixelDriver::getChannel(*id) : nullptr;
-    if (!ch) {
+    led_state::ChannelSnapshot current;
+    if (!led_state::snapshot_channel(static_cast<uint32_t>(index), current)) {
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Channel not found");
         return ESP_FAIL;
     }
@@ -175,24 +135,18 @@ esp_err_t channel_post_handler(httpd_req_t* req) {
     cJSON* json = parse_json_body(req, 1024);
     if (!json) return ESP_FAIL;
 
+    // Range clamping (brightness 0-255, speed 1-10) happens in led_state.
     led_state::ChannelPatch patch;
-    PixelColor color = ch->getEffectConfig().color;
+    PixelColor color = current.effect.color;
     bool color_changed = false;
+    double v;
 
     cJSON* effect_id = cJSON_GetObjectItem(json, "effect_id");
     if (effect_id && cJSON_IsString(effect_id) && effect_id->valuestring[0]) {
         patch.effect_id = std::string(effect_id->valuestring);
     }
-    cJSON* brightness = cJSON_GetObjectItem(json, "brightness");
-    if (brightness && cJSON_IsNumber(brightness)) {
-        int v = brightness->valueint;
-        patch.brightness = static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
-    }
-    cJSON* speed = cJSON_GetObjectItem(json, "speed");
-    if (speed && cJSON_IsNumber(speed)) {
-        int v = speed->valueint;
-        patch.speed = static_cast<uint8_t>(v < 1 ? 1 : (v > 10 ? 10 : v));
-    }
+    if (json_number(json, "brightness", v)) patch.brightness = static_cast<int>(v < 0 ? 0 : (v > 255 ? 255 : v));
+    if (json_number(json, "speed", v)) patch.speed = static_cast<int>(v < 0 ? 0 : (v > 10 ? 10 : v));
     cJSON* on = cJSON_GetObjectItem(json, "on");
     if (on && cJSON_IsBool(on)) patch.enabled = cJSON_IsTrue(on);
 
@@ -202,28 +156,20 @@ esp_err_t channel_post_handler(httpd_req_t* req) {
     }
     else if (c && cJSON_IsObject(c)) {
         // Legacy object form {r,g,b,w}
-        cJSON* r = cJSON_GetObjectItem(c, "r");
-        cJSON* g = cJSON_GetObjectItem(c, "g");
-        cJSON* b = cJSON_GetObjectItem(c, "b");
-        cJSON* w = cJSON_GetObjectItem(c, "w");
-        if (cJSON_IsNumber(r)) { color.r = static_cast<uint8_t>(r->valueint); color_changed = true; }
-        if (cJSON_IsNumber(g)) { color.g = static_cast<uint8_t>(g->valueint); color_changed = true; }
-        if (cJSON_IsNumber(b)) { color.b = static_cast<uint8_t>(b->valueint); color_changed = true; }
-        if (cJSON_IsNumber(w)) { color.w = static_cast<uint8_t>(w->valueint); color_changed = true; }
+        if (json_number(c, "r", v)) { color.r = static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v)); color_changed = true; }
+        if (json_number(c, "g", v)) { color.g = static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v)); color_changed = true; }
+        if (json_number(c, "b", v)) { color.b = static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v)); color_changed = true; }
+        if (json_number(c, "w", v)) { color.w = static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v)); color_changed = true; }
     }
     // RGBCCT white channels: top-level "w" (warm) / "cw" (cool), 0-255.
-    cJSON* w_top = cJSON_GetObjectItem(json, "w");
-    if (w_top && cJSON_IsNumber(w_top)) { color.w = static_cast<uint8_t>(w_top->valueint); color_changed = true; }
-    cJSON* cw_top = cJSON_GetObjectItem(json, "cw");
-    if (cw_top && cJSON_IsNumber(cw_top)) { color.cw = static_cast<uint8_t>(cw_top->valueint); color_changed = true; }
+    if (json_number(json, "w", v)) { color.w = static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v)); color_changed = true; }
+    if (json_number(json, "cw", v)) { color.cw = static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v)); color_changed = true; }
     if (color_changed) patch.color = color;
 
     cJSON_Delete(json);
 
-    if (!led_state::apply_channel_patch(static_cast<uint32_t>(index), patch)) {
-        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Channel not found");
-        return ESP_FAIL;
-    }
+    OpResult r = led_ops::set_channel(static_cast<uint32_t>(index), patch);
+    if (!r.ok()) return send_op_error(req, r);
     ESP_LOGD(TAG, "Channel %d updated", index);
     return send_channel(req, static_cast<uint32_t>(index));
 }

@@ -98,9 +98,10 @@ namespace sand_table {
                 static_cast<double>(steps_per_theta_rot_);
             // Rho motor moves for the commanded rho delta plus coupling counteraction
             // (one rho motor rev dragged per theta drum rev, so per theta motor
-            // step: effective_steps_per_rev / steps_per_theta_rot).
+            // step: steps_per_motor_rev / steps_per_theta_rot — the boot-applied
+            // snapshot, same as the transformer uses).
             const double rho_steps = std::fabs(delta_rho_norm) * static_cast<double>(rho_max_steps_) +
-                theta_steps * static_cast<double>(MechanicalConfig::effective_steps_per_rev()) /
+                theta_steps * static_cast<double>(MechanicalConfig::applied_effective_steps_per_rev()) /
                     static_cast<double>(steps_per_theta_rot_);
             const double major = std::fmax(theta_steps, rho_steps);
             return static_cast<uint32_t>(std::ceil(major));

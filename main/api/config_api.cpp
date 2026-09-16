@@ -14,6 +14,7 @@
 #include <esp_log.h>
 #include <strings.h>
 #include <cmath>
+#include <cstdio>
 
 static const char* TAG = "config_api";
 
@@ -105,12 +106,11 @@ static esp_err_t config_get_handler(httpd_req_t* req) {
 
 // Read a numeric field if present. Presence (not "> 0") decides whether a
 // field is applied, so 0 is a legal value where it means something
-// (motor_idle_timeout_s = 0 -> never de-energize; stallguard 0).
+// (motor_idle_timeout_s = 0 -> never de-energize; stallguard 0). NaN / inf
+// are treated as absent by json_number, so every cast below is on a finite
+// value that already passed its range check.
 static bool get_num(cJSON* obj, const char* key, double& out) {
-    cJSON* item = cJSON_GetObjectItem(obj, key);
-    if (!item || !cJSON_IsNumber(item)) return false;
-    out = item->valuedouble;
-    return true;
+    return json_number(obj, key, out);
 }
 
 // PATCH /api/config - partial update: {"motion":{...}, "led":{...}}
@@ -137,7 +137,7 @@ static esp_err_t config_patch_handler(httpd_req_t* req) {
             if (v < 1 || v > 10000) bad_field = "steps_per_rev"; else motion.steps_per_rev = (uint32_t)v;
         }
         if (get_num(motion_json, "microsteps", v)) {
-            const int m = (int)v;
+            const int m = (v >= 1 && v <= 256) ? (int)v : 0;
             if (m != 1 && m != 2 && m != 4 && m != 8 && m != 16 && m != 32 && m != 64 && m != 128 && m != 256) {
                 bad_field = "microsteps";
             } else {
@@ -199,11 +199,11 @@ static esp_err_t config_patch_handler(httpd_req_t* req) {
     if (led_json && cJSON_IsObject(led_json)) {
         sand_table::RuntimeLEDConfig led = cfg.led_config();
 
+        double v;
         cJSON* has_leds = cJSON_GetObjectItem(led_json, "has_leds");
         if (has_leds && cJSON_IsBool(has_leds)) led.has_leds = cJSON_IsTrue(has_leds);
-        cJSON* led_count = cJSON_GetObjectItem(led_json, "led_count");
-        if (led_count && cJSON_IsNumber(led_count) && led_count->valueint > 0 && led_count->valueint <= 2000) {
-            led.led_count = (uint16_t)led_count->valueint;
+        if (get_num(led_json, "led_count", v)) {
+            if (v < 1 || v > 2000) bad_field = "led_count"; else led.led_count = (uint16_t)v;
         }
         // Legacy is_rgbw first so an explicit `format` below always wins.
         cJSON* is_rgbw = cJSON_GetObjectItem(led_json, "is_rgbw");
@@ -212,17 +212,26 @@ static esp_err_t config_patch_handler(httpd_req_t* req) {
         // Strip type/layout by NAME ("fw1906", "rgbcct", "grb"). Numeric
         // codes are accepted only in the firmware's own numbering (format
         // 3/4/5), never the proto LEDFormat enum (1/2/3) - use strings.
+        // Numeric codes are range-checked before the cast.
         cJSON* ic = cJSON_GetObjectItem(led_json, "ic_type");
-        if (ic && cJSON_IsString(ic)) { int v = led_ic_code(ic->valuestring); if (v >= 0) led.ic_type = (uint8_t)v; }
-        else if (ic && cJSON_IsNumber(ic) && ic->valueint >= 0 && ic->valueint <= 2) led.ic_type = (uint8_t)ic->valueint;
+        if (ic && cJSON_IsString(ic)) { int c = led_ic_code(ic->valuestring); if (c >= 0) led.ic_type = (uint8_t)c; else bad_field = "ic_type"; }
+        else if (get_num(led_json, "ic_type", v)) { if (v < 0 || v > 2) bad_field = "ic_type"; else led.ic_type = (uint8_t)v; }
 
         cJSON* fmt = cJSON_GetObjectItem(led_json, "format");
-        if (fmt && cJSON_IsString(fmt)) { int v = led_format_code(fmt->valuestring); if (v >= 0) led.format = (uint8_t)v; }
-        else if (fmt && cJSON_IsNumber(fmt) && fmt->valueint >= 3 && fmt->valueint <= 5) led.format = (uint8_t)fmt->valueint;
+        if (fmt && cJSON_IsString(fmt)) { int c = led_format_code(fmt->valuestring); if (c >= 0) led.format = (uint8_t)c; else bad_field = "format"; }
+        else if (get_num(led_json, "format", v)) { if (v < 3 || v > 5) bad_field = "format"; else led.format = (uint8_t)v; }
 
         cJSON* order = cJSON_GetObjectItem(led_json, "color_order");
-        if (order && cJSON_IsString(order)) { int v = led_order_code(order->valuestring); if (v >= 0) led.color_order = (uint8_t)v; }
-        else if (order && cJSON_IsNumber(order) && order->valueint >= 0 && order->valueint <= 5) led.color_order = (uint8_t)order->valueint;
+        if (order && cJSON_IsString(order)) { int c = led_order_code(order->valuestring); if (c >= 0) led.color_order = (uint8_t)c; else bad_field = "color_order"; }
+        else if (get_num(led_json, "color_order", v)) { if (v < 0 || v > 5) bad_field = "color_order"; else led.color_order = (uint8_t)v; }
+
+        if (bad_field) {
+            cJSON_Delete(json);
+            char msg[64];
+            snprintf(msg, sizeof(msg), "Out of range: %s", bad_field);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, msg);
+            return ESP_FAIL;
+        }
 
         cJSON* wswap = cJSON_GetObjectItem(led_json, "white_swap");
         if (wswap && cJSON_IsBool(wswap)) led.white_swap = cJSON_IsTrue(wswap);

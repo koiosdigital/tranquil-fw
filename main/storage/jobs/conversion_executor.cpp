@@ -2,11 +2,13 @@
 #include "job_queue.h"
 #include "ManifestDatabase.h"
 #include "PatternReader.h"
+#include "SandTablePlayer.h"
 #include "download_progress.h"
 #include "pipeline_progress.h"
 #include "esp_log.h"
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <cmath>
 #include <algorithm>
 #include <sys/stat.h>
@@ -83,7 +85,16 @@ JobResult ConversionExecutor::execute(const Job& job) {
         return JobResult::fail("Conversion failed");
     }
 
-    // Atomic rename to final path
+    // Atomic rename to final path. FATFS rename() refuses an existing
+    // target (a re-run of the job after a reboot, or a re-upload under the
+    // same uuid), so drop it first — after stopping the player if it is
+    // streaming that very file (no FATFS file locking; see download path).
+    if (SandTablePlayer::isPlayingPattern(pattern_uuid.c_str())) {
+        ESP_LOGW(TAG, "Pattern %s is playing; stopping playback to replace its file",
+            pattern_uuid.c_str());
+        SandTablePlayer::stop();
+    }
+    unlink(final_path);
     if (rename(binary_path, final_path) != 0) {
         unlink(binary_path);
         return JobResult::fail("Failed to rename to final path");
@@ -177,8 +188,23 @@ esp_err_t ConversionExecutor::convertToBinary(const char* input_path,
             progress_uuid, static_cast<uint8_t>(80 + conv_pct / 10));
     };
 
-    char line[256];
+    // 512: a .thr line is "theta rho" (two decimals, ~40 chars), but files
+    // authored with trailing comments / Windows line endings / generous
+    // precision have been seen past 256. A line that STILL does not fit is
+    // one we cannot parse whole: fgets would hand back its tail as a fresh
+    // "line" and strtod would turn a digit run mid-number into a bogus
+    // point. Consume the remainder and skip the line instead.
+    char line[512];
     while (fgets(line, sizeof(line), in)) {
+        const size_t len = strlen(line);
+        if (len == sizeof(line) - 1 && line[len - 1] != '\n') {
+            int c;
+            while ((c = fgetc(in)) != EOF && c != '\n') {}
+            ESP_LOGW(TAG, "Skipping over-long line (>%zu chars) in %s",
+                sizeof(line) - 1, input_path);
+            continue;
+        }
+
         // Skip leading whitespace
         char* p = line;
         while (*p == ' ' || *p == '\t') p++;

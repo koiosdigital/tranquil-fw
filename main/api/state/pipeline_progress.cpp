@@ -21,9 +21,11 @@ namespace {
 
 // Per-uuid throttle. The converter reports every whole percent (two frames
 // per percent once the download bar is included); each frame costs a
-// per-client copy plus an httpd work-queue slot (12 deep, drops when full),
-// and the frames most likely to be dropped were the terminal ones. Only let
-// a non-terminal update through every >=5 points or >=250 ms.
+// per-client copy plus one of the WebSocket layer's 24 in-flight send slots
+// (httpd's mailbox is 32 deep; websocket_send drops at the source when the
+// slots are exhausted), and the frames most likely to be dropped were the
+// terminal ones. Only let a non-terminal update through every >=5 points or
+// >=250 ms.
 struct Last {
     uint8_t pct;
     int64_t at_us;

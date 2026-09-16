@@ -100,7 +100,7 @@ esp_err_t ManifestDatabase::addPattern(Pattern& pattern) {
         return ESP_ERR_NO_MEM;
     }
     pattern.id = id;
-    if (!impl_->patterns.save()) return ESP_FAIL;
+    if (!impl_->save(impl_->patterns)) return ESP_FAIL;
 
     ESP_LOGI(TAG, "Pattern added: id=%lu, uuid=%s", (unsigned long)pattern.id,
         pattern.external_uuid.c_str());
@@ -130,7 +130,7 @@ esp_err_t ManifestDatabase::updatePattern(uint32_t id, const Pattern& pattern) {
         ESP_LOGE(TAG, "Failed to update pattern %lu", (unsigned long)id);
         return ESP_FAIL;
     }
-    return impl_->patterns.save() ? ESP_OK : ESP_FAIL;
+    return impl_->save(impl_->patterns) ? ESP_OK : ESP_FAIL;
 }
 
 esp_err_t ManifestDatabase::deletePattern(uint32_t id) {
@@ -171,8 +171,8 @@ esp_err_t ManifestDatabase::deletePattern(uint32_t id) {
         return ESP_FAIL;
     }
 
-    bool saved = impl_->patterns.save();
-    saved = impl_->playlists.save() && saved;
+    bool saved = impl_->save(impl_->patterns);
+    saved = impl_->save(impl_->playlists) && saved;
 
     // Delete pattern files
     if (!p->external_uuid.empty()) {
@@ -255,6 +255,15 @@ std::optional<Pattern> ManifestDatabase::getPattern(uint32_t id) {
     Pattern p = pattern_from_storage(obj);
     cJSON_Delete(obj);
     return p;
+}
+
+std::optional<std::string> ManifestDatabase::getPatternUuid(uint32_t id) {
+    ManifestLock lock(impl_->mutex);
+    if (!impl_->initialized) return std::nullopt;
+
+    std::string uuid;
+    if (!impl_->patterns.uuidOf(id, uuid)) return std::nullopt;
+    return uuid;
 }
 
 bool ManifestDatabase::patternExists(uint32_t id) {

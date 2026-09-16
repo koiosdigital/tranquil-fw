@@ -1,12 +1,28 @@
 // Unified playlist handler implementation
 #include "playlist_handler.h"
-#include "ManifestDatabase.h"
-#include "library_notifier.h"
+#include "ops/library_ops.h"
 
 #include <esp_log.h>
 #include <cstring>
+#include <string>
+#include <vector>
 
 static const char* TAG = "playlist_handler";
+
+namespace {
+
+bool has(const char* s) { return s && s[0] != '\0'; }
+
+std::vector<std::string> string_list(char** items, size_t n) {
+    std::vector<std::string> out;
+    out.reserve(n);
+    for (size_t i = 0; i < n; i++) {
+        if (items[i] && items[i][0]) out.emplace_back(items[i]);
+    }
+    return out;
+}
+
+}  // namespace
 
 PlaylistHandler& PlaylistHandler::instance() {
     static PlaylistHandler instance;
@@ -18,20 +34,75 @@ HandleResult PlaylistHandler::handle(
     const MessageContext& ctx,
     ResponseMessage& response
 ) {
-    (void)ctx;
+    const char* rid = ctx.request_id;
 
     switch (msg->message_case) {
         case KD__V1__TRANQUIL_MESSAGE__MESSAGE_PLAYLISTS_REQUEST:
-            return handlePlaylistsRequest(response);
+            response = library_ops::build_playlist_list_message(rid);
+            return HandleResult::ok();
 
-        case KD__V1__TRANQUIL_MESSAGE__MESSAGE_CREATE_PLAYLIST:
-            return handleCreatePlaylist(msg->create_playlist, response);
+        case KD__V1__TRANQUIL_MESSAGE__MESSAGE_CREATE_PLAYLIST: {
+            const auto* m = msg->create_playlist;
+            if (!m || !has(m->name)) {
+                ESP_LOGW(TAG, "CreatePlaylist: missing name");
+                response = makeCommandResult(false, "Missing playlist name", rid, ESP_ERR_INVALID_ARG);
+                return HandleResult::ok();
+            }
+            library_ops::PlaylistDraft draft;
+            if (has(m->uuid)) draft.uuid = m->uuid;   // client-chosen id (matches REST)
+            draft.name = m->name;
+            if (m->description) draft.description = m->description;
+            draft.pattern_uuids = string_list(m->pattern_uuids, m->n_pattern_uuids);
 
-        case KD__V1__TRANQUIL_MESSAGE__MESSAGE_UPDATE_PLAYLIST:
-            return handleUpdatePlaylist(msg->update_playlist, response);
+            Playlist created;
+            // Requester gets the CommandResult; the list push to LAN + cloud
+            // is posted by library_ops.
+            response = makeCommandResult(library_ops::create_playlist(draft, created), rid);
+            return HandleResult::ok();
+        }
 
-        case KD__V1__TRANQUIL_MESSAGE__MESSAGE_DELETE_PLAYLIST:
-            return handleDeletePlaylist(msg->delete_playlist, response);
+        case KD__V1__TRANQUIL_MESSAGE__MESSAGE_UPDATE_PLAYLIST: {
+            const auto* m = msg->update_playlist;
+            if (!m || !has(m->uuid)) {
+                ESP_LOGW(TAG, "UpdatePlaylist: missing uuid");
+                response = makeCommandResult(false, "Missing playlist UUID", rid, ESP_ERR_INVALID_ARG);
+                return HandleResult::ok();
+            }
+
+            // proto3 `optional` fields carry presence (protobuf-c exposes it
+            // as the synthetic *_case). protobuf-c hands us "" (never NULL)
+            // for an absent plain string, so presence is the only reliable
+            // "was this field sent" signal. The pattern list is replaced only
+            // when replace_patterns is set (an empty list is then allowed).
+            library_ops::PlaylistPatch patch;
+            if (m->_name_case == KD__V1__UPDATE_PLAYLIST___NAME_NAME) {
+                patch.name = std::string(m->name ? m->name : "");
+            }
+            if (m->_description_case == KD__V1__UPDATE_PLAYLIST___DESCRIPTION_DESCRIPTION) {
+                patch.description = std::string(m->description ? m->description : "");
+            }
+            if (m->_featured_pattern_case == KD__V1__UPDATE_PLAYLIST___FEATURED_PATTERN_FEATURED_PATTERN) {
+                patch.featured_pattern = std::string(m->featured_pattern ? m->featured_pattern : "");
+            }
+            if (m->replace_patterns) {
+                patch.pattern_uuids = string_list(m->pattern_uuids, m->n_pattern_uuids);
+            }
+
+            Playlist updated;
+            response = makeCommandResult(library_ops::update_playlist(m->uuid, patch, updated), rid);
+            return HandleResult::ok();
+        }
+
+        case KD__V1__TRANQUIL_MESSAGE__MESSAGE_DELETE_PLAYLIST: {
+            const auto* m = msg->delete_playlist;
+            if (!m || !has(m->uuid)) {
+                ESP_LOGW(TAG, "DeletePlaylist: missing uuid");
+                response = makeCommandResult(false, "Missing playlist UUID", rid, ESP_ERR_INVALID_ARG);
+                return HandleResult::ok();
+            }
+            response = makeCommandResult(library_ops::delete_playlist(m->uuid), rid);
+            return HandleResult::ok();
+        }
 
         default:
             return HandleResult::notHandled();
@@ -57,211 +128,4 @@ std::vector<Kd__V1__TranquilMessage__MessageCase> PlaylistHandler::supportedMess
         KD__V1__TRANQUIL_MESSAGE__MESSAGE_UPDATE_PLAYLIST,
         KD__V1__TRANQUIL_MESSAGE__MESSAGE_DELETE_PLAYLIST
     };
-}
-
-HandleResult PlaylistHandler::handlePlaylistsRequest(ResponseMessage& response) {
-    response = buildPlaylistListMessage();
-    return HandleResult::ok();
-}
-
-ResponseMessage PlaylistHandler::buildPlaylistListMessage() {
-    auto playlists = ManifestDatabase::instance().getAllPlaylists();
-
-    ESP_LOGD(TAG, "Playlists: %zu playlists", playlists.size());
-
-    // Build response. Locals, not statics: httpd and the cloudlink task can
-    // run this concurrently; two tasks resizing the same static vectors
-    // double-free their backing stores.
-    Kd__V1__Playlists playlists_msg = KD__V1__PLAYLISTS__INIT;
-    std::vector<Kd__V1__PlaylistInfo*> playlist_ptrs;
-    std::vector<Kd__V1__PlaylistInfo> playlist_infos;
-    std::vector<std::vector<char*>> pattern_uuid_ptrs;
-    std::vector<std::vector<std::string>> pattern_uuid_strs;  // Storage for converted UUIDs
-    std::vector<std::string> featured_pattern_strs;  // Storage for featured pattern UUIDs
-
-    playlist_infos.resize(playlists.size());
-    pattern_uuid_ptrs.resize(playlists.size());
-    pattern_uuid_strs.resize(playlists.size());
-    featured_pattern_strs.resize(playlists.size());
-
-    for (size_t i = 0; i < playlists.size(); i++) {
-        playlist_infos[i] = KD__V1__PLAYLIST_INFO__INIT;
-        // Use external_uuid as "uuid" for API compatibility
-        playlist_infos[i].uuid = const_cast<char*>(playlists[i].external_uuid.c_str());
-        playlist_infos[i].name = const_cast<char*>(playlists[i].name.c_str());
-        playlist_infos[i].description = const_cast<char*>(playlists[i].description.c_str());
-
-        // Convert featured_pattern_id to external UUID
-        if (playlists[i].featured_pattern_id != 0) {
-            auto featured = ManifestDatabase::instance().getPattern(playlists[i].featured_pattern_id);
-            if (featured) {
-                featured_pattern_strs[i] = featured->external_uuid;
-            }
-        }
-        playlist_infos[i].featured_pattern = const_cast<char*>(featured_pattern_strs[i].c_str());
-        playlist_infos[i].created_at = const_cast<char*>(playlists[i].created_at.c_str());
-        playlist_infos[i].updated_at = const_cast<char*>(playlists[i].updated_at.c_str());
-
-        // Convert pattern IDs to external UUIDs
-        pattern_uuid_ptrs[i].clear();
-        pattern_uuid_strs[i].clear();
-        for (uint32_t pattern_id : playlists[i].pattern_ids) {
-            auto pattern = ManifestDatabase::instance().getPattern(pattern_id);
-            if (pattern) {
-                pattern_uuid_strs[i].push_back(pattern->external_uuid);
-            }
-        }
-        for (auto& uuid : pattern_uuid_strs[i]) {
-            pattern_uuid_ptrs[i].push_back(const_cast<char*>(uuid.c_str()));
-        }
-        playlist_infos[i].n_pattern_uuids = pattern_uuid_ptrs[i].size();
-        playlist_infos[i].pattern_uuids = pattern_uuid_ptrs[i].data();
-
-        playlist_ptrs.push_back(&playlist_infos[i]);
-    }
-
-    playlists_msg.n_playlists = playlist_ptrs.size();
-    playlists_msg.playlists = playlist_ptrs.data();
-
-    Kd__V1__TranquilMessage resp = KD__V1__TRANQUIL_MESSAGE__INIT;
-    resp.message_case = KD__V1__TRANQUIL_MESSAGE__MESSAGE_PLAYLISTS;
-    resp.playlists = &playlists_msg;
-
-    return serialize(&resp);
-}
-
-HandleResult PlaylistHandler::handleCreatePlaylist(
-    const Kd__V1__CreatePlaylist* msg,
-    ResponseMessage& response
-) {
-    if (!msg || !msg->name) {
-        ESP_LOGW(TAG, "CreatePlaylist: missing name");
-        response = makeCommandResult(false, "Missing playlist name");
-        return HandleResult::ok();
-    }
-
-    Playlist playlist;
-    playlist.id = 0;  // Assigned by ManifestDatabase
-    playlist.external_uuid = ManifestDatabase::generateUUID();
-    playlist.name = msg->name;
-    playlist.description = msg->description ? msg->description : "";
-    playlist.created_at = ManifestDatabase::currentTimestamp();
-    playlist.updated_at = playlist.created_at;
-
-    // Convert pattern UUIDs to internal IDs
-    for (size_t i = 0; i < msg->n_pattern_uuids; i++) {
-        if (msg->pattern_uuids[i]) {
-            auto pattern_id = ManifestDatabase::instance().findPatternIdByExternalUuid(msg->pattern_uuids[i]);
-            if (pattern_id) {
-                playlist.pattern_ids.push_back(*pattern_id);
-            } else {
-                ESP_LOGW(TAG, "CreatePlaylist: pattern not found: %s", msg->pattern_uuids[i]);
-            }
-        }
-    }
-
-    esp_err_t ret = ManifestDatabase::instance().addPlaylist(playlist);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "CreatePlaylist failed: %s", esp_err_to_name(ret));
-        response = makeCommandResult(false, "Failed to create playlist");
-        return HandleResult::ok();
-    }
-
-    ESP_LOGI(TAG, "Created playlist: %s (%s)", playlist.name.c_str(), playlist.external_uuid.c_str());
-    response = makeCommandResult(true);
-    library_notifier::playlists_changed();  // list push to LAN + cloud
-    return HandleResult::ok();
-}
-
-HandleResult PlaylistHandler::handleUpdatePlaylist(
-    const Kd__V1__UpdatePlaylist* msg,
-    ResponseMessage& response
-) {
-    if (!msg || !msg->uuid) {
-        ESP_LOGW(TAG, "UpdatePlaylist: missing uuid");
-        response = makeCommandResult(false, "Missing playlist UUID");
-        return HandleResult::ok();
-    }
-
-    // Lookup by external UUID
-    auto existing = ManifestDatabase::instance().getPlaylistByExternalUuid(msg->uuid);
-    if (!existing) {
-        ESP_LOGW(TAG, "UpdatePlaylist: playlist not found: %s", msg->uuid);
-        response = makeCommandResult(false, "Playlist not found");
-        return HandleResult::ok();
-    }
-
-    Playlist updated = *existing;
-    if (msg->name) updated.name = msg->name;
-    if (msg->description) updated.description = msg->description;
-
-    // Convert featured_pattern UUID to internal ID
-    if (msg->featured_pattern) {
-        auto pattern_id = ManifestDatabase::instance().findPatternIdByExternalUuid(msg->featured_pattern);
-        if (pattern_id) {
-            updated.featured_pattern_id = *pattern_id;
-        } else {
-            ESP_LOGW(TAG, "UpdatePlaylist: featured pattern not found: %s", msg->featured_pattern);
-        }
-    }
-    updated.updated_at = ManifestDatabase::currentTimestamp();
-
-    // Update pattern list if provided - convert UUIDs to internal IDs
-    if (msg->n_pattern_uuids > 0) {
-        updated.pattern_ids.clear();
-        for (size_t i = 0; i < msg->n_pattern_uuids; i++) {
-            if (msg->pattern_uuids[i]) {
-                auto pattern_id = ManifestDatabase::instance().findPatternIdByExternalUuid(msg->pattern_uuids[i]);
-                if (pattern_id) {
-                    updated.pattern_ids.push_back(*pattern_id);
-                } else {
-                    ESP_LOGW(TAG, "UpdatePlaylist: pattern not found: %s", msg->pattern_uuids[i]);
-                }
-            }
-        }
-    }
-
-    // Update by internal ID
-    esp_err_t ret = ManifestDatabase::instance().updatePlaylist(existing->id, updated);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "UpdatePlaylist failed: %s", esp_err_to_name(ret));
-        response = makeCommandResult(false, "Failed to update playlist");
-        return HandleResult::ok();
-    }
-
-    ESP_LOGI(TAG, "Updated playlist: %s", msg->uuid);
-    response = makeCommandResult(true);
-    library_notifier::playlists_changed();
-    return HandleResult::ok();
-}
-
-HandleResult PlaylistHandler::handleDeletePlaylist(
-    const Kd__V1__DeletePlaylist* msg,
-    ResponseMessage& response
-) {
-    if (!msg || !msg->uuid) {
-        ESP_LOGW(TAG, "DeletePlaylist: missing uuid");
-        response = makeCommandResult(false, "Missing playlist UUID");
-        return HandleResult::ok();
-    }
-
-    // Lookup by external UUID to get internal ID
-    auto playlist = ManifestDatabase::instance().getPlaylistByExternalUuid(msg->uuid);
-    if (!playlist) {
-        ESP_LOGW(TAG, "DeletePlaylist: not found: %s", msg->uuid);
-        response = makeCommandResult(false, "Playlist not found");
-        return HandleResult::ok();
-    }
-
-    esp_err_t ret = ManifestDatabase::instance().deletePlaylist(playlist->id);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "DeletePlaylist: failed: %s", msg->uuid);
-        response = makeCommandResult(false, "Failed to delete playlist");
-        return HandleResult::ok();
-    }
-
-    ESP_LOGI(TAG, "Deleted playlist: %s", msg->uuid);
-    response = makeCommandResult(true);
-    library_notifier::playlists_changed();
-    return HandleResult::ok();
 }

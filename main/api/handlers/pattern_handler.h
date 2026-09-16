@@ -1,9 +1,10 @@
-// Unified pattern handler
-// Handles pattern-related protobuf messages
-// Supports local pattern management and cloud download forwarding
+// Unified pattern handler: a thin protobuf codec over library_ops, plus the
+// cloud download forwarding.
 #pragma once
 
 #include "handler_base.h"
+
+#include <string>
 
 class PatternHandler : public HandlerBase {
 public:
@@ -20,25 +21,10 @@ public:
     std::vector<Kd__V1__TranquilMessage__MessageCase> supportedMessages() const override;
 
     // Called from the job-completion hook when a cloud download job finishes.
-    // Clears the origin-socket tracking and, on success, schedules a push of
-    // the updated pattern list to LAN clients and the cloud.
+    // Clears the download tracking and, on success, schedules a push of the
+    // updated pattern list to LAN clients and the cloud.
     void notifyPatternDownloadComplete(const std::string& pattern_uuid, bool success);
-
-    // Builds a DownloadedPatterns message from the manifest. Public so the
-    // library notifier can push it on change / on cloud (re)connect.
-    ResponseMessage buildPatternListMessage();
 
 private:
     PatternHandler() = default;
-
-    // Individual message handlers
-    HandleResult handleDownloadedPatternsRequest(ResponseMessage& response);
-    HandleResult handleDeletePattern(const Kd__V1__DeletePattern* msg, ResponseMessage& response);
-    HandleResult handleModifyPattern(const Kd__V1__ModifyPattern* msg, ResponseMessage& response);
-    HandleResult handleGetPatternRequest(const Kd__V1__GetPatternRequest* msg, ResponseMessage& response);
-    HandleResult handleRequestPatternDownload(
-        const Kd__V1__RequestPatternDownload* msg,
-        const MessageContext& ctx,
-        ResponseMessage& response
-    );
 };

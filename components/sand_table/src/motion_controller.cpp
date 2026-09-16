@@ -20,6 +20,23 @@ namespace sand_table {
         // previous IHOLD = IRUN/2 intent).
         constexpr uint8_t kHoldCurrentPercent = 50;
 
+        // RAII increment of the abort-planning depth: while held,
+        // enqueue_segment() refuses segments so a task blocked mid-plan
+        // unwinds (see MotionController::abort_planning_depth_).
+        class AbortPlanningScope {
+        public:
+            explicit AbortPlanningScope(std::atomic<int>& depth) : depth_(depth) {
+                depth_.fetch_add(1, std::memory_order_acq_rel);
+            }
+            ~AbortPlanningScope() {
+                depth_.fetch_sub(1, std::memory_order_acq_rel);
+            }
+            AbortPlanningScope(const AbortPlanningScope&) = delete;
+            AbortPlanningScope& operator=(const AbortPlanningScope&) = delete;
+        private:
+            std::atomic<int>& depth_;
+        };
+
         // Map a configured microstep count to the TMC2209 MRES setting.
         tmc::MicrostepResolution microsteps_to_mres(uint32_t microsteps) {
             switch (microsteps) {
@@ -47,6 +64,7 @@ namespace sand_table {
     {
         planner_mutex_ = xSemaphoreCreateMutex();
         motor_power_mutex_ = xSemaphoreCreateMutex();
+        plan_mutex_ = xSemaphoreCreateMutex();
 
         // Set up PathPlanner callback to enqueue segments via VelocityPlanner
         path_planner_->set_segment_callback([this](MotionSegment& seg) {
@@ -68,6 +86,10 @@ namespace sand_table {
             vSemaphoreDelete(motor_power_mutex_);
             motor_power_mutex_ = nullptr;
         }
+        if (plan_mutex_) {
+            vSemaphoreDelete(plan_mutex_);
+            plan_mutex_ = nullptr;
+        }
     }
 
     Result<void> MotionController::init() {
@@ -80,7 +102,8 @@ namespace sand_table {
         // Create stepper drivers. invert_dir applies the Kconfig
         // ROBOT_*_INVERT_DIRECTION flags at the DIR-pin level so all motion
         // code stays in logical directions (positive rho = outward).
-        theta_stepper_ = std::make_unique<StepperDriver>(
+        // Internal RAM: the RMT TX-done ISR credits their position counters.
+        theta_stepper_ = make_internal<StepperDriver>(
             StepperDriver::Pins{
                 PinConfig::THETA_STEP,
                 PinConfig::THETA_DIR,
@@ -90,7 +113,7 @@ namespace sand_table {
             "Theta"
         );
 
-        rho_stepper_ = std::make_unique<StepperDriver>(
+        rho_stepper_ = make_internal<StepperDriver>(
             StepperDriver::Pins{
                 PinConfig::RHO_STEP,
                 PinConfig::RHO_DIR,
@@ -99,6 +122,11 @@ namespace sand_table {
             },
             "Rho"
         );
+
+        if (!theta_stepper_ || !rho_stepper_) {
+            ESP_LOGE(TAG, "Failed to allocate stepper drivers in internal RAM");
+            return Result<void>::err(MotionError::HardwareFault);
+        }
 
         ESP_LOGI(TAG, "Direction inversion: theta=%d, rho=%d",
             PinConfig::THETA_INVERT_DIR ? 1 : 0, PinConfig::RHO_INVERT_DIR ? 1 : 0);
@@ -159,6 +187,12 @@ namespace sand_table {
             return Result<void>::err(MotionError::HardwareFault);
         }
 
+        // Apply the NVS motion tunables now that the timer they program
+        // exists. Calling this from init_tmc() (before the timer) was a
+        // silent no-op, so the persisted idle timeout never applied at boot
+        // and the compile-time default ran until the first settings save.
+        apply_motion_tunables();
+
         return Result<void>::ok();
     }
 
@@ -210,12 +244,22 @@ namespace sand_table {
         (void)theta_tmc_->set_microstep_resolution(mres);
         (void)rho_tmc_->set_microstep_resolution(mres);
 
-        // Motor run/hold current from runtime config.
-        apply_motor_config();
-        apply_motion_tunables();
+        // Snapshot the step scale the drivers now run at. The transformer,
+        // path planner and homing controller read THIS until reboot (see
+        // MechanicalConfig::applied_effective_steps_per_rev): a runtime
+        // PATCH of steps_per_rev/microsteps changes the NVS value but not
+        // the resolution programmed above, so using the live value would
+        // desync the coupling compensation from the physical drive.
+        applied_steps_per_rev_ = MechanicalConfig::effective_steps_per_rev();
+        MechanicalConfig::set_applied_effective_steps_per_rev(applied_steps_per_rev_);
 
-        ESP_LOGI(TAG, "TMC2209 drivers initialized (microsteps=%lu)",
-            static_cast<unsigned long>(MechanicalConfig::microsteps()));
+        // Motor run/hold current from runtime config. (The motion tunables
+        // are applied from init() once the inactivity timer exists.)
+        apply_motor_config();
+
+        ESP_LOGI(TAG, "TMC2209 drivers initialized (microsteps=%lu, %lu steps/motor rev applied)",
+            static_cast<unsigned long>(MechanicalConfig::microsteps()),
+            static_cast<unsigned long>(applied_steps_per_rev_));
         return Result<void>::ok();
     }
 
@@ -325,15 +369,29 @@ namespace sand_table {
     }
 
     void MotionController::stop() {
-        running_.store(false, std::memory_order_release);
+        const bool was_running = running_.exchange(false, std::memory_order_acq_rel);
 
-        if (stepper_task_) {
-            // Wait for task to exit
-            vTaskDelay(pdMS_TO_TICKS(100));
+        if (was_running && stepper_task_) {
+            // Join the stepper task: it may be inside a blocking segment
+            // execute() and it uses planner_mutex_/plan_mutex_ — the
+            // destructor deletes those, so wait for its exit acknowledgement
+            // rather than a fixed delay. Wake it out of the sequencer first so
+            // the join is bounded by one chunk, not a whole segment.
+            if (stepper_controller_) {
+                stepper_controller_->emergency_stop();
+            }
+            for (int i = 0; i < 1000 && !stepper_task_exited_.load(std::memory_order_acquire); ++i) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+            if (!stepper_task_exited_.load(std::memory_order_acquire)) {
+                ESP_LOGE(TAG, "Stepper task did not exit within 10s");
+            }
             stepper_task_ = nullptr;
         }
 
-        disable_motors();
+        if (stepper_controller_) {
+            disable_motors();
+        }
         state_.store(SystemState::Idle, std::memory_order_release);
     }
 
@@ -342,21 +400,55 @@ namespace sand_table {
         self->stepper_task_loop();
     }
 
+    void MotionController::discard_queued_motion() {
+        segment_queue_.clear();
+        if (xSemaphoreTake(planner_mutex_, pdMS_TO_TICKS(100)) == pdTRUE) {
+            velocity_planner_->clear();
+            xSemaphoreGive(planner_mutex_);
+        }
+        else {
+            ESP_LOGW(TAG, "discard: planner mutex busy, planner not cleared");
+        }
+    }
+
+    void MotionController::resync_planner_from_physical() {
+        // Lock order: plan_mutex_ only (planner_mutex_ must NOT be held by
+        // the caller). Bounded wait: a plan_*_move blocked on backpressure
+        // returns as soon as abort_planning_depth_ > 0 (callers hold an
+        // AbortPlanningScope across this), so this normally succeeds at
+        // once; the fallback resyncs anyway rather than leaving the planner
+        // on a position the discarded segments never reached.
+        const bool locked = (xSemaphoreTake(plan_mutex_, pdMS_TO_TICKS(500)) == pdTRUE);
+        if (!locked) {
+            ESP_LOGW(TAG, "resync: a planning call did not unwind in time, resyncing anyway");
+        }
+        path_planner_->set_current_position(get_position());
+        // The fractional step remainders belong to the plan just discarded.
+        transformer_->reset_accumulators();
+        if (locked) {
+            xSemaphoreGive(plan_mutex_);
+        }
+    }
+
     void MotionController::stepper_task_loop() {
+        // Raise the sequencer stop ONCE per e-stop latch. The stop flag
+        // persists until the next motion op consumes it (clear_stop), and
+        // nothing can start one while the latch is held, so re-raising
+        // every 100 ms only spammed the completion semaphore.
+        bool estop_raised = false;
+
         while (running_.load(std::memory_order_acquire)) {
             // Drain request (normal stop): this task owns the queue's
             // consumer side, so IT clears everything and acknowledges by
             // clearing the flag (see halt_and_drain()).
             if (drain_requested_.load(std::memory_order_acquire)) {
-                segment_queue_.clear();
-                if (xSemaphoreTake(planner_mutex_, pdMS_TO_TICKS(100)) == pdTRUE) {
-                    velocity_planner_->clear();
-                    xSemaphoreGive(planner_mutex_);
-                }
+                discard_queued_motion();
                 stepper_controller_->emergency_stop();
                 // Discarded segments will never execute — replan from where
-                // the motors actually are.
-                path_planner_->set_current_position(get_position());
+                // the motors actually are (halt_and_drain holds the
+                // abort-planning scope, so a mid-plan producer has unwound).
+                resync_planner_from_physical();
+                last_error_.store(MotionError::None, std::memory_order_release);
                 state_.store(SystemState::Idle, std::memory_order_release);
                 reset_inactivity_timer();
                 drain_requested_.store(false, std::memory_order_release);
@@ -365,20 +457,35 @@ namespace sand_table {
 
             // Check for emergency stop
             if (emergency_stop_.load(std::memory_order_acquire)) {
-                segment_queue_.clear();
-                if (xSemaphoreTake(planner_mutex_, pdMS_TO_TICKS(100)) == pdTRUE) {
-                    velocity_planner_->clear();
-                    xSemaphoreGive(planner_mutex_);
+                if (!estop_raised) {
+                    discard_queued_motion();
+                    stepper_controller_->emergency_stop();
+                    estop_raised = true;
+                    ESP_LOGW(TAG, "E-stop latched: queued motion discarded");
                 }
-                stepper_controller_->emergency_stop();
                 state_.store(SystemState::EStop, std::memory_order_release);
                 vTaskDelay(pdMS_TO_TICKS(100));
                 continue;
+            }
+            estop_raised = false;
+            // The latch was released (clear_emergency_stop) — leave EStop
+            // even if that call raced our store above.
+            if (state_.load(std::memory_order_acquire) == SystemState::EStop) {
+                state_.store(SystemState::Idle, std::memory_order_release);
             }
 
             // Check for pause
             if (paused_.load(std::memory_order_acquire)) {
                 state_.store(SystemState::Paused, std::memory_order_release);
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+
+            // Error hold: a segment failed (below). Everything queued was
+            // discarded; do NOT pop more until a drain (the player's stop()
+            // -> halt_and_drain, or clear_emergency_stop) resets the state.
+            // The player sees state == Error / last_error via get_status().
+            if (state_.load(std::memory_order_acquire) == SystemState::Error) {
                 vTaskDelay(pdMS_TO_TICKS(10));
                 continue;
             }
@@ -410,8 +517,30 @@ namespace sand_table {
                 taskYIELD();
 
                 if (result.is_err()) {
-                    ESP_LOGE(TAG, "Segment execution failed");
+                    if (result.error() == MotionError::EmergencyStop &&
+                        (drain_requested_.load(std::memory_order_acquire) ||
+                         emergency_stop_.load(std::memory_order_acquire))) {
+                        // Interrupted by a stop we were asked for; the drain /
+                        // e-stop branch at the top of the loop takes it from
+                        // here.
+                        continue;
+                    }
+                    // A real failure (RMT timeout, hardware fault, rejected
+                    // segment). Discard everything queued in ONE place —
+                    // the old loop popped every remaining segment and
+                    // failed each with its own log line — resync the
+                    // planner from where the motors stopped, and park in
+                    // Error so the player stops the pattern cleanly.
+                    ESP_LOGE(TAG, "Segment execution failed (error %d): discarding %zu queued segments",
+                        static_cast<int>(result.error()), segment_queue_.size());
+                    last_error_.store(result.error(), std::memory_order_release);
+                    {
+                        AbortPlanningScope abort(abort_planning_depth_);
+                        discard_queued_motion();
+                        resync_planner_from_physical();
+                    }
                     state_.store(SystemState::Error, std::memory_order_release);
+                    reset_inactivity_timer();
                     continue;
                 }
 
@@ -459,6 +588,9 @@ namespace sand_table {
             }
         }
 
+        // Exit acknowledgement for stop() (it waits on this before the
+        // destructor deletes the mutexes used above).
+        stepper_task_exited_.store(true, std::memory_order_release);
         vTaskDelete(nullptr);
     }
 
@@ -529,26 +661,36 @@ namespace sand_table {
         if (!inactivity_timer_) return;
         if (MotionConfig::motor_idle_timeout_s() == 0) {
             // "Never de-energize": keep the motors powered.
-            xTimerStop(inactivity_timer_, 0);
+            if (xTimerStop(inactivity_timer_, 0) != pdPASS) {
+                ESP_LOGW(TAG, "Inactivity timer stop not queued (timer queue full)");
+            }
             return;
         }
         armed_epoch_.store(enable_epoch_.load(std::memory_order_acquire),
             std::memory_order_release);
-        xTimerReset(inactivity_timer_, 0);
+        // A failed reset just means the motors stay powered until the next
+        // idle transition re-arms it — log it, don't block the stepper task.
+        if (xTimerReset(inactivity_timer_, 0) != pdPASS) {
+            ESP_LOGW(TAG, "Inactivity timer reset not queued (timer queue full)");
+        }
     }
 
     void MotionController::apply_motion_tunables() {
         if (!inactivity_timer_) return;
         const uint32_t timeout_s = MotionConfig::motor_idle_timeout_s();
         if (timeout_s == 0) {
-            xTimerStop(inactivity_timer_, 0);
+            if (xTimerStop(inactivity_timer_, 0) != pdPASS) {
+                ESP_LOGW(TAG, "Inactivity timer stop not queued (timer queue full)");
+            }
             ESP_LOGI(TAG, "Motor idle timeout disabled");
             return;
         }
         // xTimerChangePeriod also (re)starts the timer; that is the desired
         // behaviour when the motors are idle, and harmless otherwise since
         // enable_motors() stops it and the epoch check guards the callback.
-        xTimerChangePeriod(inactivity_timer_, pdMS_TO_TICKS(timeout_s * 1000), 0);
+        if (xTimerChangePeriod(inactivity_timer_, pdMS_TO_TICKS(timeout_s * 1000), 0) != pdPASS) {
+            ESP_LOGW(TAG, "Inactivity timer period change not queued (timer queue full)");
+        }
         ESP_LOGI(TAG, "Motor idle timeout: %lus, accel=%lu steps/s2, junction dv=%lu steps/s, theta cap=%.1f rot/min",
             static_cast<unsigned long>(timeout_s),
             static_cast<unsigned long>(MotionConfig::accel_steps_s2()),
@@ -557,7 +699,10 @@ namespace sand_table {
     }
 
     void MotionController::enable_motors() {
-        xTimerStop(inactivity_timer_, 0);
+        if (inactivity_timer_ && xTimerStop(inactivity_timer_, 0) != pdPASS) {
+            // Harmless: the epoch check below makes a late expiry a no-op.
+            ESP_LOGW(TAG, "Inactivity timer stop not queued (timer queue full)");
+        }
         if (xSemaphoreTake(motor_power_mutex_, portMAX_DELAY) == pdTRUE) {
             // Invalidate any in-flight inactivity expiry before energizing;
             // the callback compares against armed_epoch_ under this mutex.
@@ -577,8 +722,39 @@ namespace sand_table {
     }
 
     Result<void> MotionController::home(bool force_full) {
+        // The single homing slot. Console, REST (homing_service) and boot
+        // homing all land here, so the claim lives here — before the drain,
+        // so two callers cannot both drain and then run seeks concurrently.
+        bool expected = false;
+        if (!homing_claim_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            ESP_LOGW(TAG, "home(): homing already in progress");
+            return Result<void>::err(MotionError::InvalidState);
+        }
+        struct ClaimRelease {
+            std::atomic<bool>& claim;
+            ~ClaimRelease() { claim.store(false, std::memory_order_release); }
+        } release_claim{ homing_claim_ };
+
         if (homing_controller_->is_homing()) {
             return Result<void>::err(MotionError::InvalidState);
+        }
+
+        // A latched e-stop must be cleared explicitly (console clear_estop /
+        // API) before the table moves again — including for homing.
+        if (emergency_stop_.load(std::memory_order_acquire)) {
+            ESP_LOGW(TAG, "home(): refused, emergency stop is latched");
+            return Result<void>::err(MotionError::EmergencyStop);
+        }
+
+        // The drivers keep the microstep resolution programmed at boot; a
+        // calibration taken now would be in steps that no longer match the
+        // configured scale. Refuse until the reboot that applies the change.
+        const uint32_t live_steps = MechanicalConfig::effective_steps_per_rev();
+        if (applied_steps_per_rev_ != 0 && live_steps != applied_steps_per_rev_) {
+            ESP_LOGE(TAG, "home(): motion config changed (steps/motor rev %lu -> %lu) - reboot required",
+                static_cast<unsigned long>(applied_steps_per_rev_),
+                static_cast<unsigned long>(live_steps));
+            return Result<void>::err(MotionError::RebootRequired);
         }
 
         // Homing runs in the CALLER's task while the stepper task keeps
@@ -586,7 +762,7 @@ namespace sand_table {
         // segments first, or a queued move executes concurrently with the
         // homing seeks on the same sequencer. move_to()/move_linear() reject
         // new moves while state is Homing (below), so nothing refills the
-        // queue mid-homing.
+        // queue mid-homing. (Cannot be refused here: state is not Homing yet.)
         halt_and_drain();
 
         state_.store(SystemState::Homing, std::memory_order_release);
@@ -616,17 +792,43 @@ namespace sand_table {
             // Reset fractional accumulators
             transformer_->reset_accumulators();
 
-            // Reset path planner position
-            path_planner_->set_current_position({ 0.0, 0.0 });
+            // Reset path planner position (nothing can be planning: moves
+            // are refused while Homing, and the drain above unwound any
+            // in-flight plan).
+            if (xSemaphoreTake(plan_mutex_, pdMS_TO_TICKS(100)) == pdTRUE) {
+                path_planner_->set_current_position({ 0.0, 0.0 });
+                xSemaphoreGive(plan_mutex_);
+            }
+            else {
+                path_planner_->set_current_position({ 0.0, 0.0 });
+            }
 
+            last_error_.store(MotionError::None, std::memory_order_release);
             state_.store(SystemState::Idle, std::memory_order_release);
         }
         else {
-            state_.store(SystemState::Error, std::memory_order_release);
-            ESP_LOGE(TAG, "Homing failed");
+            // A failed or aborted home leaves the motors wherever the seek
+            // stopped and the transformer on the OLD calibration. Mark not
+            // homed (moves are refused with NotHomed instead of executing
+            // against a stale frame), re-seat the planner on the physical
+            // counters, and go back to Idle so the next home() is accepted —
+            // parking in Error left the controller wedged until reboot.
+            is_homed_.store(false, std::memory_order_release);
+            resync_planner_from_physical();
+            state_.store(emergency_stop_.load(std::memory_order_acquire)
+                ? SystemState::EStop : SystemState::Idle,
+                std::memory_order_release);
+            ESP_LOGE(TAG, "Homing failed (error %d) - not homed", static_cast<int>(result.error()));
         }
 
         return result;
+    }
+
+    void MotionController::abort_homing() {
+        if (homing_controller_ && homing_controller_->is_homing()) {
+            ESP_LOGW(TAG, "Aborting homing");
+            homing_controller_->abort();
+        }
     }
 
     void MotionController::_set_homed(int32_t theta_steps_per_rot, int32_t rho_max) {
@@ -639,7 +841,13 @@ namespace sand_table {
 
         // Reset fractional accumulators
         transformer_->reset_accumulators();
-        path_planner_->set_current_position({ 0.0, 0.0 });
+        if (xSemaphoreTake(plan_mutex_, pdMS_TO_TICKS(100)) == pdTRUE) {
+            path_planner_->set_current_position({ 0.0, 0.0 });
+            xSemaphoreGive(plan_mutex_);
+        }
+        else {
+            path_planner_->set_current_position({ 0.0, 0.0 });
+        }
 
         // Mark as homed
         is_homed_.store(true, std::memory_order_release);
@@ -667,17 +875,11 @@ namespace sand_table {
             return Result<void>::err(MotionError::OutOfBounds);
         }
 
-        // Get current planning position from PathPlanner
-        const PolarPosition& current = path_planner_->current_position();
-
         // Set default feedrate if not specified
         float actual_feedrate = feedrate;
         if (actual_feedrate <= 0) {
             actual_feedrate = static_cast<float>(MotionConfig::rho_max_rpm());
         }
-
-        ESP_LOGD(TAG, "Queueing polar move: (%.4f, %.4f) -> (%.4f, %.4f) @ %.1f RPM",
-            current.theta, current.rho, target.theta, target.rho, actual_feedrate);
 
         // Enable motors BEFORE planning: plan_polar_move blocks on planner
         // backpressure for long moves, and execution starts consuming
@@ -686,9 +888,23 @@ namespace sand_table {
         // stepper_task_loop.)
         enable_motors();
 
+        // The whole plan runs under plan_mutex_: the planner position is read
+        // and advanced inside it, and a drain/e-stop resync must not
+        // overwrite it midway (the resync waits for us to unwind, which the
+        // abort-planning depth guarantees). Lock order: plan_mutex_ before
+        // planner_mutex_ (taken inside enqueue_segment).
+        if (xSemaphoreTake(plan_mutex_, portMAX_DELAY) != pdTRUE) {
+            return Result<void>::err(MotionError::InvalidState);
+        }
+        const PolarPosition current = path_planner_->current_position();
+        ESP_LOGD(TAG, "Queueing polar move: (%.4f, %.4f) -> (%.4f, %.4f) @ %.1f RPM",
+            current.theta, current.rho, target.theta, target.rho, actual_feedrate);
+
         // Plan direct polar move (arcs in XY space)
-        return path_planner_->plan_polar_move(current, target, actual_feedrate,
+        auto result = path_planner_->plan_polar_move(current, target, actual_feedrate,
             (base_feedrate > 0) ? base_feedrate : actual_feedrate);
+        xSemaphoreGive(plan_mutex_);
+        return result;
     }
 
     Result<void> MotionController::move_linear(const PolarPosition& target, float feedrate,
@@ -712,25 +928,29 @@ namespace sand_table {
             return Result<void>::err(MotionError::OutOfBounds);
         }
 
-        // Get current planning position from PathPlanner
-        const PolarPosition& current = path_planner_->current_position();
-
         // Set default feedrate if not specified
         float actual_feedrate = feedrate;
         if (actual_feedrate <= 0) {
             actual_feedrate = static_cast<float>(MotionConfig::rho_max_rpm());
         }
 
-        ESP_LOGD(TAG, "Queueing linear move: (%.4f, %.4f) -> (%.4f, %.4f) @ %.1f RPM",
-            current.theta, current.rho, target.theta, target.rho, actual_feedrate);
-
         // Enable motors before planning; Running is set by the stepper task
         // on actual execution (see move_to / stepper_task_loop).
         enable_motors();
 
+        // Under plan_mutex_ for the whole plan — see move_to().
+        if (xSemaphoreTake(plan_mutex_, portMAX_DELAY) != pdTRUE) {
+            return Result<void>::err(MotionError::InvalidState);
+        }
+        const PolarPosition current = path_planner_->current_position();
+        ESP_LOGD(TAG, "Queueing linear move: (%.4f, %.4f) -> (%.4f, %.4f) @ %.1f RPM",
+            current.theta, current.rho, target.theta, target.rho, actual_feedrate);
+
         // Plan Cartesian-interpolated move (straight lines in XY space)
-        return path_planner_->plan_linear_move(current, target, actual_feedrate,
+        auto result = path_planner_->plan_linear_move(current, target, actual_feedrate,
             (base_feedrate > 0) ? base_feedrate : actual_feedrate);
+        xSemaphoreGive(plan_mutex_);
+        return result;
     }
 
     void MotionController::pause() {
@@ -743,15 +963,27 @@ namespace sand_table {
         ESP_LOGI(TAG, "Motion resumed");
     }
 
-    void MotionController::halt_and_drain() {
+    bool MotionController::halt_and_drain() {
         // No stepper task -> nothing queued, nothing to acknowledge the
         // drain flag (it would just stall the 5s wait below).
         if (!running_.load(std::memory_order_acquire)) {
-            return;
+            return true;
         }
 
-        // Refuse new segments so a task blocked mid-plan unwinds
-        abort_planning_.store(true, std::memory_order_release);
+        // Homing owns the sequencer. Raising the sequencer stop here would
+        // kill the seek in flight and surface as a homing failure ("edge
+        // not found"). The player's stop() lands here while a home runs
+        // (it was drained by home() itself before the seeks started), so
+        // refuse instead; abort_homing() is the explicit way to stop one.
+        if (state_.load(std::memory_order_acquire) == SystemState::Homing) {
+            ESP_LOGW(TAG, "halt_and_drain: refused, homing in progress (use abort_homing)");
+            return false;
+        }
+
+        // Refuse new segments so a task blocked mid-plan unwinds; held
+        // through the acknowledgement so the stepper task's resync sees the
+        // planner position at rest.
+        AbortPlanningScope abort(abort_planning_depth_);
 
         // Ask the stepper task to drain, and interrupt the blocking
         // execute() so it gets there promptly. The sequencer only raises a
@@ -770,13 +1002,17 @@ namespace sand_table {
             drain_requested_.store(false, std::memory_order_release);
         }
 
-        abort_planning_.store(false, std::memory_order_release);
         ESP_LOGI(TAG, "Motion halted and queues drained");
+        return true;
     }
 
     void MotionController::emergency_stop() {
         emergency_stop_.store(true, std::memory_order_release);
+        // One raise; the stepper task's e-stop branch does not re-raise.
         stepper_controller_->emergency_stop();
+        // A homing run in progress is aborted too (its seek returns
+        // EmergencyStop and home() reports it).
+        abort_homing();
         state_.store(SystemState::EStop, std::memory_order_release);
         ESP_LOGW(TAG, "Emergency stop activated");
     }
@@ -784,7 +1020,12 @@ namespace sand_table {
     void MotionController::clear_emergency_stop() {
         emergency_stop_.store(false, std::memory_order_release);
         // Queued segments were discarded — replan from the physical position
-        path_planner_->set_current_position(get_position());
+        // (and drop the accumulators that belonged to them).
+        {
+            AbortPlanningScope abort(abort_planning_depth_);
+            resync_planner_from_physical();
+        }
+        last_error_.store(MotionError::None, std::memory_order_release);
         state_.store(SystemState::Idle, std::memory_order_release);
         ESP_LOGI(TAG, "Emergency stop cleared");
     }
@@ -798,6 +1039,13 @@ namespace sand_table {
     }
 
     PolarPosition MotionController::get_planning_position() const {
+        // Short bounded take: a torn read of the two doubles mid-plan is the
+        // only risk, and callers are status/rebase paths, never real time.
+        if (plan_mutex_ && xSemaphoreTake(plan_mutex_, pdMS_TO_TICKS(50)) == pdTRUE) {
+            const PolarPosition pos = path_planner_->current_position();
+            xSemaphoreGive(plan_mutex_);
+            return pos;
+        }
         return path_planner_->current_position();
     }
 
@@ -828,7 +1076,7 @@ namespace sand_table {
         // is in progress — refilling a planner that is being drained would
         // deadlock the busy-wait (the drain empties it, we refill it).
         for (;;) {
-            if (abort_planning_.load(std::memory_order_acquire) ||
+            if (abort_planning_depth_.load(std::memory_order_acquire) > 0 ||
                 emergency_stop_.load(std::memory_order_acquire)) {
                 return false;
             }
@@ -905,6 +1153,7 @@ namespace sand_table {
 
         status.position = get_position();
         status.state = get_state();
+        status.last_error = last_error_.load(std::memory_order_acquire);
         status.is_homed = is_homed_.load(std::memory_order_acquire);
         status.queue_depth = segment_queue_.size();
         status.queue_capacity = kSegmentQueueSize - 1;  // One slot reserved

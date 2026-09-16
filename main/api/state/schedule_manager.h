@@ -135,16 +135,21 @@ public:
     bool isQuietNow() const;
 
     // Packed TranquilMessage{schedule} with the current items + quiet hours.
-    ResponseMessage buildScheduleMessage() const;
+    // `request_id` is echoed on the envelope when replying to a request.
+    ResponseMessage buildScheduleMessage(const char* request_id = nullptr) const;
 
     // Fill a TranquilSchedule from the live state into caller-owned scratch.
     void toProto(ScheduleProtoScratch& scratch) const;
 
     // Replace the item list (validates, clamps, assigns missing ids) and,
     // when given, the quiet-hours config. Persists and notifies listeners.
-    // ESP_ERR_INVALID_SIZE when over the caps.
+    // The requester (already answered with the stored schedule) can be left
+    // out of the push: its local socket fd, or exclude_cloud when it was the
+    // cloud. ESP_ERR_INVALID_SIZE when over the caps.
     esp_err_t setSchedule(std::vector<ScheduleItem> items,
-                          const std::optional<QuietHours>& quiet = std::nullopt);
+                          const std::optional<QuietHours>& quiet = std::nullopt,
+                          int exclude_local_fd = -1,
+                          bool exclude_cloud = false);
     esp_err_t clearSchedule();
 
     // Execute an action now. Honours quiet hours unless `force`. Safe to
@@ -198,6 +203,9 @@ private:
     static constexpr int64_t CHECK_INTERVAL_US = 30 * 1000 * 1000LL;
     static constexpr int32_t FIRE_WINDOW_S = 30;
     static constexpr time_t REFIRE_GUARD_S = 120;
+    // The tick runs on the esp_timer task: never block behind an httpd /
+    // cloudlink writer, skip the tick instead (the fire window is 30 s).
+    static constexpr TickType_t TICK_LOCK_WAIT = pdMS_TO_TICKS(50);
 
     static constexpr const char* kNamespace = "tranquil_sched";
     static constexpr const char* kKeyLegacy = "schedule";   // v1 blob (pre-ids)

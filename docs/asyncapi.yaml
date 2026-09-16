@@ -28,10 +28,19 @@ info:
       own snapshot: `PlayerState` on playback change, `LEDConfig` (with per-channel
       state) on any LED change, `DownloadedPatterns` / `Playlists` on any library
       change (including changes made over REST or by another client), `Schedule`
-      on schedule change, `SystemInfo` when homing starts/ends.
+      on schedule change (the requester, which already received the stored
+      schedule as its reply, is skipped), `SystemInfo` when homing starts/ends.
     - Progress-only `PlayerState` updates are throttled to 1 s locally.
     - Unknown / retired message types get `CommandResult{success:false}` so a
       client never waits forever.
+    - Correlation: a sender may set `TranquilMessage.request_id` (string) on any
+      command. The device echoes it on the reply's envelope and in
+      `CommandResult.request_id`, so a client (or the cloud) can match a reply to
+      its own command. `CommandResult.error_code` is the ESP-IDF `esp_err_t`
+      value (0 on success).
+    - On every cloud (re)connect the device pushes its snapshots (`SystemInfo`,
+      `DownloadedPatterns`, `Playlists`, `Schedule`, `LEDConfig`) and the static
+      `LEDEffectsList` once, so the cloud never has to ask.
 
     ## Protobuf Definitions
     See `components/protobufs/proto/kd/v1/tranquil.proto` for full message definitions.
@@ -194,7 +203,7 @@ components:
     PlaylistNavigate:
       name: PlaylistNavigateCommand
       title: Playlist Navigate
-      summary: Skip to next or previous pattern in playlist
+      summary: Skip to next or previous pattern in playlist (REST equivalents are POST /api/player/skip and /api/player/previous)
       payload:
         $ref: '#/components/schemas/PlaylistNavigateCommand'
 
@@ -364,7 +373,7 @@ components:
     LEDEffectsList:
       name: LEDEffectsList
       title: LED Effects List
-      summary: List of available LED effects
+      summary: List of available LED effects (static per firmware). Reply to GetLEDEffects; also pushed to the cloud once per connect.
       payload:
         $ref: '#/components/schemas/LEDEffectsList'
 
@@ -488,7 +497,10 @@ components:
     StopPlayback:
       type: object
       description: "Protobuf: kd.v1.StopPlayback"
-      properties: {}
+      properties:
+        emergency:
+          type: boolean
+          description: Immediate halt without deceleration or state cleanup (same as REST emergency_stop)
 
     PlayRandom:
       type: object
@@ -768,7 +780,7 @@ components:
 
     CreatePlaylist:
       type: object
-      description: "Protobuf: kd.v1.CreatePlaylist"
+      description: "Protobuf: kd.v1.CreatePlaylist. name is required. Responds with CommandResult; the new list is pushed as Playlists."
       properties:
         name:
           type: string
@@ -778,23 +790,41 @@ components:
           type: array
           items:
             type: string
+            description: Unknown uuids are skipped
+        uuid:
+          type: string
+          maxLength: 63
+          description: Optional client-chosen id (matches the REST surface); empty = device assigns. Rejected when malformed or already in use.
 
     UpdatePlaylist:
       type: object
-      description: "Protobuf: kd.v1.UpdatePlaylist"
+      description: >-
+        Protobuf: kd.v1.UpdatePlaylist. PARTIAL update: name, description and
+        featured_pattern are proto3 `optional` and only applied when present
+        (an empty name is ignored; an empty featured_pattern clears it). The
+        pattern list is replaced only when replace_patterns is true - then
+        pattern_uuids becomes the whole ordered list, and an empty list is
+        allowed. With replace_patterns false the list is left unchanged.
+        Responds with CommandResult; the result is pushed as Playlists.
       properties:
         uuid:
           type: string
         name:
           type: string
+          description: (optional)
         description:
           type: string
+          description: (optional)
         pattern_uuids:
           type: array
           items:
             type: string
+        replace_patterns:
+          type: boolean
+          description: true = pattern_uuids replaces the list (empty allowed); false = list unchanged
         featured_pattern:
           type: string
+          description: (optional) pattern uuid; "" clears
 
     DeletePlaylist:
       type: object
@@ -1154,5 +1184,10 @@ components:
           type: boolean
         error_code:
           type: integer
+          description: ESP-IDF esp_err_t value of the failure; 0 on success
         detail:
           type: string
+          description: Human-readable reason (empty on success)
+        request_id:
+          type: string
+          description: Echo of the request's TranquilMessage.request_id when the sender set one (also echoed on the reply envelope)

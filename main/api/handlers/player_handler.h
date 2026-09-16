@@ -1,5 +1,4 @@
-// Unified player control handler
-// Handles all player-related protobuf messages from local and cloud
+// Unified player control handler: a thin protobuf codec over player_ops.
 #pragma once
 
 #include "handler_base.h"
@@ -18,22 +17,6 @@ public:
 
     std::vector<Kd__V1__TranquilMessage__MessageCase> supportedMessages() const override;
 
-    // Build PlayerState response (public for broadcaster access)
-    ResponseMessage buildPlayerStateResponse();
-
 private:
     PlayerHandler() = default;
-
-    // Individual message handlers
-    HandleResult handlePlayPattern(const Kd__V1__PlayPattern* msg, ResponseMessage& response);
-    HandleResult handleSetPaused(const Kd__V1__SetPaused* msg, ResponseMessage& response);
-    HandleResult handleStopPlayback(ResponseMessage& response);
-    HandleResult handlePlaylistPlay(const Kd__V1__PlaylistPlay* msg, ResponseMessage& response);
-    HandleResult handleSetShuffle(const Kd__V1__PlaylistSetShuffle* msg, ResponseMessage& response);
-    HandleResult handleSetLoop(const Kd__V1__SetLoop* msg, ResponseMessage& response);
-    HandleResult handlePlayRandom(const Kd__V1__PlayRandom* msg, ResponseMessage& response);
-    HandleResult handleSetRandomLoop(const Kd__V1__SetRandomLoop* msg, ResponseMessage& response);
-    HandleResult handleSetFeedRate(const Kd__V1__SetFeedRate* msg, ResponseMessage& response);
-    HandleResult handlePlaylistNavigate(const Kd__V1__PlaylistNavigateCommand* msg, ResponseMessage& response);
-    HandleResult handleGetPlayerState(const Kd__V1__GetPlayerState* msg, const MessageContext& ctx, ResponseMessage& response);
 };

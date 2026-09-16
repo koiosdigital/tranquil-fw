@@ -87,6 +87,10 @@ public:
     std::vector<Pattern> getAllPatterns();
     PaginatedResult<Pattern> getPatterns(int page = 0, int per_page = 20);
     std::optional<Pattern> getPattern(uint32_t id);
+    // External uuid of a pattern by internal id, from the record's cached
+    // uuid — no JSON parse. Prefer this over getPattern() when the uuid is
+    // all you need (playlist expansion, progress routing).
+    std::optional<std::string> getPatternUuid(uint32_t id);
     bool patternExists(uint32_t id);
     size_t getPatternCount();
     size_t getSubscriptionPatternCount();  // Count patterns where purchased=false
@@ -142,6 +146,12 @@ public:
     // Job queue operations (using internal IDs)
     esp_err_t enqueueJob(jobs::Job& job);  // ID assigned on success
     std::optional<jobs::Job> claimNextPendingJob();
+    // Same, but only jobs for which `eligible(job, ctx)` returns true are
+    // considered (the processor uses it to skip jobs still in retry
+    // backoff, so they are never claimed and immediately released — two
+    // full table writes per poll). nullptr = every pending job.
+    std::optional<jobs::Job> claimNextPendingJob(bool (*eligible)(const jobs::Job&, void* ctx),
+                                                  void* ctx);
     // Re-queue jobs left InProgress by a reboot mid-execution and purge
     // finished (Completed/Failed) rows so the table doesn't grow forever.
     // Returns the number recovered. Call once at startup before processing
@@ -164,6 +174,22 @@ public:
     esp_err_t cancelJobsForExternalUuid(const std::string& external_uuid);
     size_t getPendingJobCount();
     size_t getInProgressJobCount();
+
+    // Deferred persistence for bulk mutations. Every mutating call normally
+    // rewrites (and fsyncs) its table's snapshot; inside a BatchScope the
+    // writes are deferred and each dirty table is saved ONCE when the
+    // outermost scope ends. The scope holds the database lock for its whole
+    // lifetime — keep the work inside it to manifest calls only (no crypto,
+    // no network). Nestable.
+    class BatchScope {
+    public:
+        explicit BatchScope(ManifestDatabase& db = ManifestDatabase::instance());
+        ~BatchScope();
+        BatchScope(const BatchScope&) = delete;
+        BatchScope& operator=(const BatchScope&) = delete;
+    private:
+        ManifestDatabase& db_;
+    };
 
 private:
     ManifestDatabase();

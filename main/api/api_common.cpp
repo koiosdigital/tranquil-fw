@@ -2,10 +2,13 @@
 #include <esp_heap_caps.h>
 
 #include <esp_log.h>
+#include <cmath>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+static const char* TAG = "api_common";
 
 namespace api_common {
 
@@ -24,7 +27,10 @@ bool recv_body(httpd_req_t* req, char** out, size_t* out_len, size_t max_len) {
         return false;
     }
 
-    char* buf = static_cast<char*>(malloc(total + 1));
+    // Bodies (up to 16 KB) are only parsed, never DMA'd: keep them out of
+    // internal RAM. free() is valid on either pointer.
+    char* buf = static_cast<char*>(heap_caps_malloc(total + 1, MALLOC_CAP_SPIRAM));
+    if (!buf) buf = static_cast<char*>(malloc(total + 1));
     if (!buf) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
         return false;
@@ -89,6 +95,46 @@ esp_err_t send_ok(httpd_req_t* req) {
     return httpd_resp_send(req, OK_BODY, sizeof(OK_BODY) - 1);
 }
 
+esp_err_t send_error_status(httpd_req_t* req, const char* status, const char* message) {
+    httpd_resp_set_status(req, status);
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_sendstr(req, message ? message : "");
+    return ESP_FAIL;
+}
+
+esp_err_t send_op_error(httpd_req_t* req, const OpResult& r) {
+    const char* msg = (r.detail && r.detail[0]) ? r.detail : esp_err_to_name(r.err);
+    switch (r.err) {
+        case ESP_ERR_NOT_FOUND:
+            httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, msg);
+            break;
+        case ESP_ERR_INVALID_ARG:
+        case ESP_ERR_INVALID_SIZE:
+        case ESP_ERR_INVALID_STATE:
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, msg);
+            break;
+        case ESP_ERR_NOT_ALLOWED:
+        case ESP_ERR_NOT_SUPPORTED:
+            httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, msg);
+            break;
+        case ESP_ERR_TIMEOUT:
+            send_error_status(req, "503 Service Unavailable", msg);
+            break;
+        default:
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, msg);
+            break;
+    }
+    return ESP_FAIL;
+}
+
+bool reject_browser_origin(httpd_req_t* req) {
+    // Length is 0 both when the header is absent and when it is empty.
+    if (httpd_req_get_hdr_value_len(req, "Origin") == 0) return false;
+    ESP_LOGW(TAG, "Refusing %s: request carries an Origin header", req->uri);
+    httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Not available to browser origins");
+    return true;
+}
+
 std::string extract_uuid(const char* uri, const char* base) {
     if (strncmp(uri, base, strlen(base)) != 0) {
         return "";
@@ -99,7 +145,7 @@ std::string extract_uuid(const char* uri, const char* base) {
     // Strip query string if present
     const char* quest = static_cast<const char*>(memchr(uuid_start, '?', uuid_len));
     if (quest) uuid_len = quest - uuid_start;
-    if (uuid_len == 0 || uuid_len > 64) {
+    if (uuid_len == 0 || uuid_len > kMaxUuidChars) {
         return "";
     }
     return std::string(uuid_start, uuid_len);
@@ -122,6 +168,35 @@ void parse_pagination(httpd_req_t* req, int& page, int& per_page) {
             if (per_page > 100) per_page = 100;
         }
     }
+}
+
+bool json_number(const cJSON* obj, const char* key, double& out) {
+    const cJSON* item = cJSON_GetObjectItem(obj, key);
+    if (!item || !cJSON_IsNumber(item)) return false;
+    if (!std::isfinite(item->valuedouble)) return false;
+    out = item->valuedouble;
+    return true;
+}
+
+bool parse_hex_color(const char* s, PixelColor& out) {
+    if (!s) return false;
+    if (*s == '#') s++;
+    unsigned r = 0, g = 0, b = 0, w = 0;
+    const size_t len = strlen(s);
+    if (len == 6 && sscanf(s, "%02x%02x%02x", &r, &g, &b) == 3) {
+        out.r = static_cast<uint8_t>(r);
+        out.g = static_cast<uint8_t>(g);
+        out.b = static_cast<uint8_t>(b);
+        return true;
+    }
+    if (len == 8 && sscanf(s, "%02x%02x%02x%02x", &r, &g, &b, &w) == 4) {
+        out.r = static_cast<uint8_t>(r);
+        out.g = static_cast<uint8_t>(g);
+        out.b = static_cast<uint8_t>(b);
+        out.w = static_cast<uint8_t>(w);
+        return true;
+    }
+    return false;
 }
 
 void chunk_buf_write(ChunkBuf* cb, const char* data, size_t len) {

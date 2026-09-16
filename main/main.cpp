@@ -113,8 +113,9 @@ extern "C" void app_main(void)
         if (!result.success) {
             std::string uuid = job.pattern_external_uuid;
             if (uuid.empty() && job.pattern_id != 0) {
-                auto pattern = ManifestDatabase::instance().getPattern(job.pattern_id);
-                if (pattern) uuid = pattern->external_uuid;
+                // Only the uuid is needed: skip parsing the whole record.
+                auto pattern_uuid = ManifestDatabase::instance().getPatternUuid(job.pattern_id);
+                if (pattern_uuid) uuid = *pattern_uuid;
             }
             if (!uuid.empty()) {
                 switch (job.type) {
@@ -177,4 +178,11 @@ extern "C" void app_main(void)
     if (homing_service::start(false) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start boot homing");
     }
+
+    // Main task stack is 8 KB (CONFIG_ESP_MAIN_TASK_STACK_SIZE); log how
+    // much of it init actually left so a future regression shows up in the
+    // boot log rather than as a stack-overflow panic. (StackType_t is one
+    // byte on this port, so the value is in bytes.)
+    ESP_LOGI(TAG, "app_main complete: main task stack high-water mark = %u bytes free",
+        static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t)));
 }

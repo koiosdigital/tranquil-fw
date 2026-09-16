@@ -10,8 +10,16 @@ Project-specific instructions for Claude Code when working on the Tranquil firmw
 |-------------|-----------------|
 | REST API endpoints (`main/api/*.cpp`) | `docs/swagger.json` |
 | WebSocket handlers (`main/api/handlers/*.cpp`) | `docs/asyncapi.yaml` |
+| Operations core (`main/api/ops/*.cpp`, behaviour shared by REST and WS) | `docs/swagger.json` and `docs/asyncapi.yaml` |
 | Protobuf definitions (`components/protobufs/proto/kd/v1/*.proto`) | `docs/asyncapi.yaml` |
 | Message dispatcher registration (`main/api/dispatcher/message_dispatcher.cpp`) | `docs/asyncapi.yaml` |
+
+### API layering
+
+- Side effects and validation live once, in `main/api/ops/` (`player_ops`, `led_ops`, `library_ops`, `schedule_ops`, `system_ops`). Every op returns an `OpResult { esp_err_t err; const char* detail; }` and posts the matching `library_notifier::*_changed()` itself.
+- REST handlers (`main/api/*_api.cpp`) and WebSocket handlers (`main/api/handlers/*.cpp`) are codecs only: parse the wire format, call the op, serialise the result. Do not put a side effect in a handler.
+- One error mapping per transport: `api_common::send_op_error()` (esp_err -> HTTP status) and `HandlerBase::makeCommandResult()` (esp_err -> CommandResult). Do not hand-map errors in handlers.
+- Shared serialisers (`pattern_to_json` / `build_pattern_info_message`, `playlist_to_json` / `build_playlist_list_message`, `player_ops::to_json` / `state_to_proto`, ...) live next to their ops; REST and WS must not grow separate copies.
 
 ### Checklist for API Changes
 
@@ -34,8 +42,8 @@ Project-specific instructions for Claude Code when working on the Tranquil firmw
 ## Hardware Constraints
 
 - Max WebSocket clients: 4
-- Max WebSocket frame size: 8KB
-- Max cloud message size: 8KB
+- Max inbound WebSocket frame size: 8KB (outbound frames and every handler response are capped at 32 KB by `HandlerBase::serialize`)
+- Max cloud message size: 32 KB (`MAX_MSG_SIZE` in `main/sockets/sockets.cpp`)
 - Pattern upload chunk size: 4KB
 
 ## Memory Considerations

@@ -30,6 +30,7 @@ struct Snapshot {
 void snapshot(Snapshot& out);
 
 // Packed TranquilMessage{system_info}. Invalid on allocation failure.
-ResponseMessage build_message();
+// `request_id` is echoed on the envelope when replying to a request.
+ResponseMessage build_message(const char* request_id = nullptr);
 
 }  // namespace system_info

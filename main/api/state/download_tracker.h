@@ -1,16 +1,20 @@
-// Download tracker - tracks pending pattern downloads for response routing
-// Routes download progress back to the client that initiated the request
+// Download tracker - remembers which cloud pattern downloads are pending so
+// a request that never gets a PatternDownloadResponse can be aged out.
+//
+// Touched from the httpd task (local RequestPatternDownload), the cloudlink
+// task (download response / decline) and the job worker (completion), so
+// every method takes the mutex.
 #pragma once
 
 #include <esp_err.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <map>
 #include <string>
 #include <cstdint>
 
 struct PendingDownload {
-    int origin_socket_fd;       // Socket FD of the client that requested the download
     int64_t request_time_us;    // Time when request was made (for timeout)
-    std::string pattern_uuid;
 };
 
 class DownloadTracker {
@@ -19,27 +23,23 @@ public:
 
     // Register a pending download request
     // Called when forwarding a RequestPatternDownload to cloud
-    void trackDownload(const std::string& pattern_uuid, int origin_socket_fd);
-
-    // Get the origin socket for a download (and remove from tracking)
-    // Called when receiving download progress from cloud
-    // Returns -1 if not found or expired
-    int getOriginSocket(const std::string& pattern_uuid);
-
-    // Peek the origin socket without removing
-    int peekOriginSocket(const std::string& pattern_uuid) const;
+    void trackDownload(const std::string& pattern_uuid);
 
     // Remove a tracked download (e.g., download complete or cancelled)
     void removeDownload(const std::string& pattern_uuid);
 
-    // Clean up expired entries (called periodically)
+    // Drop entries older than the pending timeout. Called from the 30 s
+    // schedule tick (esp_timer task): gives up and retries next tick when
+    // the lock is busy rather than blocking the timer task.
     void cleanupExpired();
 
     // Check if a download is being tracked
     bool isTracked(const std::string& pattern_uuid) const;
 
 private:
-    DownloadTracker() = default;
+    DownloadTracker();
+
+    mutable SemaphoreHandle_t mutex_ = nullptr;
 
     // Map of pattern_uuid -> PendingDownload
     std::map<std::string, PendingDownload> pending_downloads_;

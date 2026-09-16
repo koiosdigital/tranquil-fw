@@ -12,11 +12,6 @@ namespace {
     constexpr float kRsense = 0.11f;     // Sense resistor
     constexpr float kRint = 0.02f;       // Internal resistance
     constexpr float kSqrt2 = 1.41421356f;
-
-    // Default register values
-    constexpr uint32_t kDefaultChopconf = 0x10000053;
-    constexpr uint32_t kDefaultPwmconf = 0xC40C001E;
-    constexpr uint32_t kDefaultIholdIrun = 0x00081010;
 } // namespace
 
 namespace tmc {
@@ -37,15 +32,51 @@ namespace tmc {
         return reset_to_defaults();
     }
 
+    std::optional<uint32_t> TMC2209Stepper::read_for_rmw(Register reg, uint32_t shadow) {
+        auto live = bus_.read_register(addr_, static_cast<uint8_t>(reg));
+        if (live) {
+            return live;
+        }
+        if (!initialized_) {
+            // No trustworthy shadow before reset_to_defaults has written the
+            // register: refuse rather than guess.
+            ESP_LOGE(TAG, "addr %u: reg 0x%02X read failed before init", addr_,
+                static_cast<unsigned>(reg));
+            return std::nullopt;
+        }
+        ESP_LOGW(TAG, "addr %u: reg 0x%02X read failed, using shadow 0x%08lX", addr_,
+            static_cast<unsigned>(reg), static_cast<unsigned long>(shadow));
+        return shadow;
+    }
+
+    esp_err_t TMC2209Stepper::write_gconf(uint32_t value) {
+        auto err = bus_.write_register(addr_, static_cast<uint8_t>(Register::GCONF), value);
+        if (err == ESP_OK) shadow_.gconf = value;
+        return err;
+    }
+
+    esp_err_t TMC2209Stepper::write_chopconf(uint32_t value) {
+        auto err = bus_.write_register(addr_, static_cast<uint8_t>(Register::CHOPCONF), value);
+        if (err == ESP_OK) shadow_.chopconf = value;
+        return err;
+    }
+
+    esp_err_t TMC2209Stepper::write_pwmconf(uint32_t value) {
+        auto err = bus_.write_register(addr_, static_cast<uint8_t>(Register::PWMCONF), value);
+        if (err == ESP_OK) shadow_.pwmconf = value;
+        return err;
+    }
+
     esp_err_t TMC2209Stepper::reset_to_defaults() {
+        // Reset shadow registers first: the GCONF write below records into
+        // them, and a failed initialize() must not leave a stale shadow.
+        shadow_ = ShadowRegisters{};
+
         // Configure GCONF: enable PDN_DISABLE and MSTEP_REG_SELECT
         constexpr uint32_t gconf = (1U << 6) | (1U << 7);
-        if (auto err = bus_.write_register(addr_, static_cast<uint8_t>(Register::GCONF), gconf); err != ESP_OK) {
+        if (auto err = write_gconf(gconf); err != ESP_OK) {
             return err;
         }
-
-        // Reset shadow registers and write defaults
-        shadow_ = ShadowRegisters{};
 
         if (auto err = bus_.write_register(addr_, static_cast<uint8_t>(Register::IHOLD_IRUN), shadow_.ihold_irun); err != ESP_OK) {
             return err;
@@ -102,8 +133,11 @@ namespace tmc {
     }
 
     esp_err_t TMC2209Stepper::set_direction(bool clockwise) {
-        auto gconf_opt = bus_.read_register(addr_, static_cast<uint8_t>(Register::GCONF));
-        uint32_t gconf = gconf_opt.value_or(0);
+        auto gconf_opt = read_for_rmw(Register::GCONF, shadow_.gconf);
+        if (!gconf_opt) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        uint32_t gconf = *gconf_opt;
 
         if (clockwise) {
             gconf &= ~(1U << 4);
@@ -112,7 +146,7 @@ namespace tmc {
             gconf |= (1U << 4);
         }
 
-        return bus_.write_register(addr_, static_cast<uint8_t>(Register::GCONF), gconf);
+        return write_gconf(gconf);
     }
 
     esp_err_t TMC2209Stepper::set_hold_current_percentage(uint8_t percent) {
@@ -129,18 +163,24 @@ namespace tmc {
     }
 
     esp_err_t TMC2209Stepper::set_microstep_resolution(MicrostepResolution resolution) {
-        auto chopconf_opt = bus_.read_register(addr_, static_cast<uint8_t>(Register::CHOPCONF));
-        uint32_t chopconf = chopconf_opt.value_or(kDefaultChopconf);
+        auto chopconf_opt = read_for_rmw(Register::CHOPCONF, shadow_.chopconf);
+        if (!chopconf_opt) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        uint32_t chopconf = *chopconf_opt;
 
         chopconf &= ~(0xFU << 24);
         chopconf |= (static_cast<uint32_t>(resolution) & 0xF) << 24;
 
-        return bus_.write_register(addr_, static_cast<uint8_t>(Register::CHOPCONF), chopconf);
+        return write_chopconf(chopconf);
     }
 
     esp_err_t TMC2209Stepper::set_interpolation_enable(bool enable) {
-        auto chopconf_opt = bus_.read_register(addr_, static_cast<uint8_t>(Register::CHOPCONF));
-        uint32_t chopconf = chopconf_opt.value_or(kDefaultChopconf);
+        auto chopconf_opt = read_for_rmw(Register::CHOPCONF, shadow_.chopconf);
+        if (!chopconf_opt) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        uint32_t chopconf = *chopconf_opt;
 
         if (enable) {
             chopconf |= (1U << 28);
@@ -149,12 +189,15 @@ namespace tmc {
             chopconf &= ~(1U << 28);
         }
 
-        return bus_.write_register(addr_, static_cast<uint8_t>(Register::CHOPCONF), chopconf);
+        return write_chopconf(chopconf);
     }
 
     esp_err_t TMC2209Stepper::set_stealthchop_enable(bool enable) {
-        auto gconf_opt = bus_.read_register(addr_, static_cast<uint8_t>(Register::GCONF));
-        uint32_t gconf = gconf_opt.value_or(0);
+        auto gconf_opt = read_for_rmw(Register::GCONF, shadow_.gconf);
+        if (!gconf_opt) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        uint32_t gconf = *gconf_opt;
 
         // Bit 2: en_spreadcycle. Clear to enable StealthChop, set to force SpreadCycle
         if (enable) {
@@ -164,7 +207,7 @@ namespace tmc {
             gconf |= (1U << 2);
         }
 
-        return bus_.write_register(addr_, static_cast<uint8_t>(Register::GCONF), gconf);
+        return write_gconf(gconf);
     }
 
     esp_err_t TMC2209Stepper::set_stealthchop_threshold(uint32_t threshold) {
@@ -173,28 +216,37 @@ namespace tmc {
     }
 
     esp_err_t TMC2209Stepper::set_stealthchop_pwm_gradient(uint8_t gradient) {
-        auto pwmconf_opt = bus_.read_register(addr_, static_cast<uint8_t>(Register::PWMCONF));
-        uint32_t pwmconf = pwmconf_opt.value_or(kDefaultPwmconf);
+        auto pwmconf_opt = read_for_rmw(Register::PWMCONF, shadow_.pwmconf);
+        if (!pwmconf_opt) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        uint32_t pwmconf = *pwmconf_opt;
 
         pwmconf &= ~(0xFFU << 16);
         pwmconf |= static_cast<uint32_t>(gradient) << 16;
 
-        return bus_.write_register(addr_, static_cast<uint8_t>(Register::PWMCONF), pwmconf);
+        return write_pwmconf(pwmconf);
     }
 
     esp_err_t TMC2209Stepper::set_stealthchop_pwm_amplitude(uint8_t amplitude) {
-        auto pwmconf_opt = bus_.read_register(addr_, static_cast<uint8_t>(Register::PWMCONF));
-        uint32_t pwmconf = pwmconf_opt.value_or(kDefaultPwmconf);
+        auto pwmconf_opt = read_for_rmw(Register::PWMCONF, shadow_.pwmconf);
+        if (!pwmconf_opt) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        uint32_t pwmconf = *pwmconf_opt;
 
         pwmconf &= ~(0xFFU << 8);
         pwmconf |= static_cast<uint32_t>(amplitude) << 8;
 
-        return bus_.write_register(addr_, static_cast<uint8_t>(Register::PWMCONF), pwmconf);
+        return write_pwmconf(pwmconf);
     }
 
     esp_err_t TMC2209Stepper::set_chopper_mode(bool constant_off_time) {
-        auto chopconf_opt = bus_.read_register(addr_, static_cast<uint8_t>(Register::CHOPCONF));
-        uint32_t chopconf = chopconf_opt.value_or(kDefaultChopconf);
+        auto chopconf_opt = read_for_rmw(Register::CHOPCONF, shadow_.chopconf);
+        if (!chopconf_opt) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        uint32_t chopconf = *chopconf_opt;
 
         if (constant_off_time) {
             chopconf |= (1U << 14);
@@ -203,7 +255,7 @@ namespace tmc {
             chopconf &= ~(1U << 14);
         }
 
-        return bus_.write_register(addr_, static_cast<uint8_t>(Register::CHOPCONF), chopconf);
+        return write_chopconf(chopconf);
     }
 
     esp_err_t TMC2209Stepper::set_chopper_off_time(uint8_t toff) {
@@ -211,11 +263,14 @@ namespace tmc {
             return ESP_ERR_INVALID_ARG;
         }
 
-        auto chopconf_opt = bus_.read_register(addr_, static_cast<uint8_t>(Register::CHOPCONF));
-        uint32_t chopconf = chopconf_opt.value_or(kDefaultChopconf);
+        auto chopconf_opt = read_for_rmw(Register::CHOPCONF, shadow_.chopconf);
+        if (!chopconf_opt) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        uint32_t chopconf = *chopconf_opt;
 
         chopconf = (chopconf & ~0xFU) | toff;
-        return bus_.write_register(addr_, static_cast<uint8_t>(Register::CHOPCONF), chopconf);
+        return write_chopconf(chopconf);
     }
 
     esp_err_t TMC2209Stepper::set_chopper_hysteresis_start(uint8_t hstrt) {
@@ -223,13 +278,16 @@ namespace tmc {
             return ESP_ERR_INVALID_ARG;
         }
 
-        auto chopconf_opt = bus_.read_register(addr_, static_cast<uint8_t>(Register::CHOPCONF));
-        uint32_t chopconf = chopconf_opt.value_or(kDefaultChopconf);
+        auto chopconf_opt = read_for_rmw(Register::CHOPCONF, shadow_.chopconf);
+        if (!chopconf_opt) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        uint32_t chopconf = *chopconf_opt;
 
         chopconf &= ~(0x7U << 4);
         chopconf |= static_cast<uint32_t>(hstrt) << 4;
 
-        return bus_.write_register(addr_, static_cast<uint8_t>(Register::CHOPCONF), chopconf);
+        return write_chopconf(chopconf);
     }
 
     esp_err_t TMC2209Stepper::set_chopper_hysteresis_end(int8_t hend) {
@@ -239,13 +297,16 @@ namespace tmc {
 
         const uint8_t hend_reg = static_cast<uint8_t>(hend + 3) & 0xF;
 
-        auto chopconf_opt = bus_.read_register(addr_, static_cast<uint8_t>(Register::CHOPCONF));
-        uint32_t chopconf = chopconf_opt.value_or(kDefaultChopconf);
+        auto chopconf_opt = read_for_rmw(Register::CHOPCONF, shadow_.chopconf);
+        if (!chopconf_opt) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        uint32_t chopconf = *chopconf_opt;
 
         chopconf &= ~(0xFU << 7);
         chopconf |= static_cast<uint32_t>(hend_reg) << 7;
 
-        return bus_.write_register(addr_, static_cast<uint8_t>(Register::CHOPCONF), chopconf);
+        return write_chopconf(chopconf);
     }
 
     esp_err_t TMC2209Stepper::set_chopper_blank_time(uint8_t tbl) {
@@ -253,13 +314,16 @@ namespace tmc {
             return ESP_ERR_INVALID_ARG;
         }
 
-        auto chopconf_opt = bus_.read_register(addr_, static_cast<uint8_t>(Register::CHOPCONF));
-        uint32_t chopconf = chopconf_opt.value_or(kDefaultChopconf);
+        auto chopconf_opt = read_for_rmw(Register::CHOPCONF, shadow_.chopconf);
+        if (!chopconf_opt) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        uint32_t chopconf = *chopconf_opt;
 
         chopconf &= ~(0x3U << 15);
         chopconf |= static_cast<uint32_t>(tbl) << 15;
 
-        return bus_.write_register(addr_, static_cast<uint8_t>(Register::CHOPCONF), chopconf);
+        return write_chopconf(chopconf);
     }
 
     esp_err_t TMC2209Stepper::set_stallguard_callback(gpio_num_t diag_pin, StallGuardCallback callback) {
@@ -282,7 +346,11 @@ namespace tmc {
             return err;
         }
 
-        if (auto err = gpio_install_isr_service(0); err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        // IRAM so the service keeps running while the flash cache is off
+        // (matches the sand_table homing controller, which installs it
+        // first in practice). ESP_ERR_INVALID_STATE = already installed.
+        if (auto err = gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
+            err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
             return err;
         }
 

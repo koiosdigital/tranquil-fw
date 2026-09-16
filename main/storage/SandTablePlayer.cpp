@@ -11,7 +11,6 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
-#include <random>
 
 // Static member definitions
 const char* SandTablePlayer::TAG = "SandTablePlayer";
@@ -24,8 +23,8 @@ SemaphoreHandle_t SandTablePlayer::file_mutex_ = nullptr;
 std::atomic<bool> SandTablePlayer::shutdown_requested_{ false };
 std::atomic<bool> SandTablePlayer::service_task_exited_{ false };
 
-PlaybackState SandTablePlayer::playback_state_ = PlaybackState::STOPPED;
-PlayMode SandTablePlayer::play_mode_ = PlayMode::SINGLE_PATTERN;
+std::atomic<PlaybackState> SandTablePlayer::playback_state_{ PlaybackState::STOPPED };
+std::atomic<PlayMode> SandTablePlayer::play_mode_{ PlayMode::SINGLE_PATTERN };
 
 char SandTablePlayer::current_pattern_uuid_[MAX_UUID_LEN] = { 0 };
 std::optional<Pattern> SandTablePlayer::current_pattern_ = std::nullopt;
@@ -47,8 +46,8 @@ char SandTablePlayer::current_playlist_uuid_[MAX_UUID_LEN] = { 0 };
 std::vector<std::string> SandTablePlayer::playlist_patterns_;
 std::vector<size_t> SandTablePlayer::playlist_order_;
 size_t SandTablePlayer::playlist_index_ = 0;
-bool SandTablePlayer::is_shuffle_ = false;
-bool SandTablePlayer::is_loop_ = false;
+std::atomic<bool> SandTablePlayer::is_shuffle_{ false };
+std::atomic<bool> SandTablePlayer::is_loop_{ false };
 
 PatternPosition SandTablePlayer::pattern_position_;
 std::atomic<double> SandTablePlayer::feed_rate_{ 5.0 };
@@ -66,6 +65,16 @@ namespace {
         const double arc = (t1 - t0) * 0.5 * (r0 + r1);
         const double radial = r1 - r0;
         return std::sqrt(arc * arc + radial * radial);
+    }
+
+    // In-place Fisher-Yates on the hardware RNG. std::random_device +
+    // std::mt19937 (the old code) put ~5 KB of generator state on the
+    // calling task's stack — enough to overflow the player task.
+    void shuffleIndices(std::vector<size_t>& v) {
+        for (size_t i = v.size(); i > 1; --i) {
+            const size_t j = esp_random() % i;
+            std::swap(v[i - 1], v[j]);
+        }
     }
 
     constexpr double kFeedRateMin = 1.0;
@@ -203,16 +212,31 @@ void SandTablePlayer::shutdown() {
 esp_err_t SandTablePlayer::playPattern(const char* pattern_uuid) {
     if (!initialized_) return ESP_ERR_INVALID_STATE;
     if (!motion_controller_->is_homed()) return ESP_ERR_INVALID_STATE;
+    if (!pattern_uuid || !pattern_uuid[0]) return ESP_ERR_INVALID_ARG;
 
-    // Check authorization for encrypted patterns before acquiring mutex
-    // pattern_uuid is the external_uuid, so use getPatternByExternalUuid
+    // Manifest lookup + authorization (pattern_uuid is the external_uuid).
+    // License first: it is a flag under a mutex; the receipt check is a
+    // (cached) file verification.
     auto pattern_info = ManifestDatabase::instance().getPatternByExternalUuid(pattern_uuid);
-    if (pattern_info.has_value() && pattern_info->encrypted) {
-        // Check purchase receipt OR subscription license
-        if (!drm_purchase_is_valid(pattern_uuid) && !drm_license_is_valid()) {
-            ESP_LOGW(TAG, "Cannot play encrypted pattern: no valid authorization");
-            return ESP_ERR_NOT_ALLOWED;
-        }
+    if (!pattern_info.has_value()) {
+        ESP_LOGE(TAG, "Pattern not found in manifest: %s", pattern_uuid);
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (pattern_info->encrypted &&
+        !drm_license_is_valid() && !drm_purchase_is_valid(pattern_uuid)) {
+        ESP_LOGW(TAG, "Cannot play encrypted pattern: no valid authorization");
+        return ESP_ERR_NOT_ALLOWED;
+    }
+
+    // Open + pre-scan the file BEFORE taking state_mutex_: an encrypted
+    // open is ~1.7 s of RSA and the progress pre-scan reads the whole
+    // file. Holding the state lock through that starved every status /
+    // control call for the duration. The prepared reader is swapped in
+    // under the locks below; on any early return its destructor closes it.
+    PreparedFile prepared;
+    esp_err_t ret = prepareFile(pattern_uuid, prepared);
+    if (ret != ESP_OK) {
+        return ret;  // Propagates ESP_ERR_NOT_ALLOWED for license issues
     }
 
     raii::MutexGuard guard(state_mutex_, pdMS_TO_TICKS(1000));
@@ -228,26 +252,18 @@ esp_err_t SandTablePlayer::playPattern(const char* pattern_uuid) {
         playback_state_ = PlaybackState::STOPPED;
         motion_controller_->halt_and_drain();
     }
+    // A single pattern supersedes whatever playlist was active.
+    clearPlaylistState();
 
-    // Load the pattern file
-    esp_err_t ret = loadPatternFile(pattern_uuid);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
-    // Get pattern info from ManifestDatabase (pattern_uuid is external_uuid)
-    current_pattern_ = ManifestDatabase::instance().getPatternByExternalUuid(pattern_uuid);
-    if (!current_pattern_.has_value()) {
-        ESP_LOGE(TAG, "Pattern not found in manifest: %s", pattern_uuid);
-        unloadPatternFile();
-        return ESP_ERR_NOT_FOUND;
-    }
+    installPreparedFile(std::move(prepared));
+    current_pattern_ = std::move(pattern_info);
 
     strncpy(current_pattern_uuid_, pattern_uuid, MAX_UUID_LEN - 1);
     current_pattern_uuid_[MAX_UUID_LEN - 1] = '\0';
 
     // Reset motion progress counters for accurate progress tracking
     motion_controller_->reset_progress_counters();
+    pattern_position_ = PatternPosition();
 
     play_mode_ = PlayMode::SINGLE_PATTERN;
     playback_state_ = PlaybackState::PLAYING;
@@ -277,7 +293,6 @@ bool SandTablePlayer::pickRandomPattern(std::string& out_uuid) {
     candidates.reserve(patterns.size());
     for (const auto& p : patterns) {
         if (p.external_uuid.empty()) continue;
-        if (p.encrypted && !drm_purchase_is_valid(p.external_uuid.c_str()) && !drm_license_is_valid()) continue;
         candidates.push_back(&p);
     }
     if (candidates.empty()) return false;
@@ -287,8 +302,24 @@ bool SandTablePlayer::pickRandomPattern(std::string& out_uuid) {
             candidates.end());
         if (candidates.empty()) return false;
     }
-    out_uuid = candidates[esp_random() % candidates.size()]->external_uuid;
-    return true;
+
+    // Authorize only the pick, not the whole library: checking every
+    // encrypted pattern up front cost a receipt verification per pattern
+    // (file + RSA on a cache miss) on every random advance. Draw, verify,
+    // and drop an unauthorized pick from the pool; bounded so a library
+    // with nothing playable cannot spin here. License first — it is a
+    // flag read; the receipt check touches the card on a miss.
+    for (int attempt = 0; attempt < kMaxRandomPickAttempts && !candidates.empty(); attempt++) {
+        const size_t idx = esp_random() % candidates.size();
+        const Pattern* p = candidates[idx];
+        if (!p->encrypted || drm_license_is_valid() ||
+            drm_purchase_is_valid(p->external_uuid.c_str())) {
+            out_uuid = p->external_uuid;
+            return true;
+        }
+        candidates.erase(candidates.begin() + static_cast<std::ptrdiff_t>(idx));
+    }
+    return false;
 }
 
 // Load and start the next random pattern (state_mutex_ held). A pattern
@@ -320,14 +351,32 @@ esp_err_t SandTablePlayer::playRandom(bool loop) {
     if (!initialized_) return ESP_ERR_INVALID_STATE;
     if (!motion_controller_->is_homed()) return ESP_ERR_INVALID_STATE;
 
+    // Pick under the lock (it reads current_pattern_uuid_), open the file
+    // WITHOUT it (see playPattern), then swap in under the lock.
+    std::string uuid;
+    {
+        raii::MutexGuard guard(state_mutex_, pdMS_TO_TICKS(1000));
+        if (!guard) {
+            return ESP_ERR_TIMEOUT;
+        }
+        if (!pickRandomPattern(uuid)) {
+            return ESP_ERR_NOT_FOUND;
+        }
+    }
+
+    PreparedFile prepared;
+    esp_err_t ret = prepareFile(uuid.c_str(), prepared);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    auto pattern_info = ManifestDatabase::instance().getPatternByExternalUuid(uuid);
+    if (!pattern_info.has_value()) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
     raii::MutexGuard guard(state_mutex_, pdMS_TO_TICKS(1000));
     if (!guard) {
         return ESP_ERR_TIMEOUT;
-    }
-
-    std::string uuid;
-    if (!pickRandomPattern(uuid)) {
-        return ESP_ERR_NOT_FOUND;
     }
 
     if (playback_state_ != PlaybackState::STOPPED) {
@@ -336,15 +385,8 @@ esp_err_t SandTablePlayer::playRandom(bool loop) {
     }
     clearPlaylistState();
 
-    esp_err_t ret = loadPatternFile(uuid.c_str());
-    if (ret != ESP_OK) {
-        return ret;
-    }
-    current_pattern_ = ManifestDatabase::instance().getPatternByExternalUuid(uuid);
-    if (!current_pattern_.has_value()) {
-        unloadPatternFile();
-        return ESP_ERR_NOT_FOUND;
-    }
+    installPreparedFile(std::move(prepared));
+    current_pattern_ = std::move(pattern_info);
     strncpy(current_pattern_uuid_, uuid.c_str(), MAX_UUID_LEN - 1);
     current_pattern_uuid_[MAX_UUID_LEN - 1] = '\0';
     motion_controller_->reset_progress_counters();
@@ -386,7 +428,7 @@ esp_err_t SandTablePlayer::setRandomLoop(bool enabled) {
 }
 
 bool SandTablePlayer::isRandomLoop() {
-    return play_mode_ == PlayMode::RANDOM_LOOP;
+    return play_mode_.load(std::memory_order_relaxed) == PlayMode::RANDOM_LOOP;
 }
 
 // =============================================================================
@@ -496,9 +538,7 @@ esp_err_t SandTablePlayer::playPlaylistFromPattern(const char* playlist_uuid, co
                 remaining.push_back(i);
             }
         }
-        std::random_device rd;
-        std::mt19937 g(rd());
-        std::shuffle(remaining.begin(), remaining.end(), g);
+        shuffleIndices(remaining);
         for (size_t idx : remaining) {
             playlist_order_.push_back(idx);
         }
@@ -736,7 +776,7 @@ esp_err_t SandTablePlayer::setShuffle(bool shuffle) {
 }
 
 bool SandTablePlayer::isShuffle() {
-    return is_shuffle_;
+    return is_shuffle_.load(std::memory_order_relaxed);
 }
 
 esp_err_t SandTablePlayer::setLoop(bool loop) {
@@ -759,7 +799,7 @@ esp_err_t SandTablePlayer::setLoop(bool loop) {
 }
 
 bool SandTablePlayer::isLoop() {
-    return is_loop_;
+    return is_loop_.load(std::memory_order_relaxed);
 }
 
 // =============================================================================
@@ -767,47 +807,78 @@ bool SandTablePlayer::isLoop() {
 // =============================================================================
 
 PlaybackState SandTablePlayer::getPlaybackState() {
-    return playback_state_;
+    return playback_state_.load(std::memory_order_relaxed);
 }
 
 PlayMode SandTablePlayer::getPlayMode() {
-    return play_mode_;
+    return play_mode_.load(std::memory_order_relaxed);
 }
 
 PlaybackStatus SandTablePlayer::getStatus() {
     // Last consistent snapshot, returned when the lock is busy so callers
     // (the 100 ms state broadcaster in particular) never see a half-filled
-    // status and broadcast a bogus "nothing playing".
-    static PlaybackStatus last_good;
+    // status and broadcast a bogus "nothing playing". Plain-old-data with
+    // fixed char arrays: the copy under the spinlock must never allocate
+    // (a std::string copy inside a critical section did).
+    struct LastGood {
+        PlaybackState state;
+        PlayMode mode;
+        char pattern_uuid[MAX_UUID_LEN];
+        char playlist_uuid[MAX_UUID_LEN];
+        int progress_percent;
+        size_t pattern_index;
+        size_t playlist_size;
+        double feed_rate;
+        bool is_shuffle;
+        bool is_loop;
+    };
+    static LastGood last_good = {};
     static portMUX_TYPE last_good_lock = portMUX_INITIALIZER_UNLOCKED;
 
-    PlaybackStatus status;
+    auto to_status = [](const LastGood& g, bool valid) {
+        PlaybackStatus s;
+        s.state = g.state;
+        s.mode = g.mode;
+        s.current_pattern_uuid = g.pattern_uuid;
+        s.current_playlist_uuid = g.playlist_uuid;
+        s.progress_percent = g.progress_percent;
+        s.pattern_index = g.pattern_index;
+        s.playlist_size = g.playlist_size;
+        s.feed_rate = g.feed_rate;
+        s.is_shuffle = g.is_shuffle;
+        s.is_loop = g.is_loop;
+        s.valid = valid;
+        return s;
+    };
+
     // Reading the uuid buffers / playlist vector while another task mutates
     // them under state_mutex_ is a data race — snapshot under the mutex.
     raii::MutexGuard guard(state_mutex_, pdMS_TO_TICKS(100));
     if (!guard) {
+        LastGood copy;
         portENTER_CRITICAL(&last_good_lock);
-        status = last_good;
+        copy = last_good;  // POD: memberwise copy, no allocation
         portEXIT_CRITICAL(&last_good_lock);
-        status.valid = false;
-        return status;
+        return to_status(copy, false);
     }
-    status.state = playback_state_;
-    status.mode = play_mode_;
-    status.current_pattern_uuid = current_pattern_uuid_;
-    status.current_playlist_uuid = current_playlist_uuid_;
-    status.pattern_index = playlist_index_;
-    status.playlist_size = playlist_patterns_.size();
-    status.progress_percent = getTotalProgress();
-    status.feed_rate = feed_rate_;
-    status.is_shuffle = is_shuffle_;
-    status.is_loop = is_loop_;
-    status.valid = true;
+
+    LastGood snap = {};
+    snap.state = playback_state_.load(std::memory_order_relaxed);
+    snap.mode = play_mode_.load(std::memory_order_relaxed);
+    strlcpy(snap.pattern_uuid, current_pattern_uuid_, sizeof(snap.pattern_uuid));
+    strlcpy(snap.playlist_uuid, current_playlist_uuid_, sizeof(snap.playlist_uuid));
+    snap.pattern_index = playlist_index_;
+    snap.playlist_size = playlist_patterns_.size();
+    snap.progress_percent = getTotalProgress();
+    snap.feed_rate = feed_rate_.load(std::memory_order_relaxed);
+    snap.is_shuffle = is_shuffle_.load(std::memory_order_relaxed);
+    snap.is_loop = is_loop_.load(std::memory_order_relaxed);
+    guard.release();
 
     portENTER_CRITICAL(&last_good_lock);
-    last_good = status;
+    last_good = snap;
     portEXIT_CRITICAL(&last_good_lock);
-    return status;
+    return to_status(snap, true);
 }
 
 cJSON* SandTablePlayer::getStateJSON() {
@@ -823,7 +894,7 @@ cJSON* SandTablePlayer::getStateJSON() {
     // neither the docs nor the app, which read everything as undefined
     // and permanently showed "not playing".
     const char* state_str = "STOPPED";
-    switch (playback_state_) {
+    switch (playback_state_.load(std::memory_order_relaxed)) {
     case PlaybackState::PLAYING: state_str = "PLAYING"; break;
     case PlaybackState::PAUSED: state_str = "PAUSED"; break;
     default: break;
@@ -831,7 +902,7 @@ cJSON* SandTablePlayer::getStateJSON() {
     cJSON_AddStringToObject(root, "state", state_str);
 
     const char* mode_str = "SINGLE_PATTERN";
-    switch (play_mode_) {
+    switch (play_mode_.load(std::memory_order_relaxed)) {
     case PlayMode::PLAYLIST: mode_str = "PLAYLIST"; break;
     case PlayMode::PLAYLIST_LOOP: mode_str = "PLAYLIST_LOOP"; break;
     case PlayMode::PLAYLIST_SHUFFLE: mode_str = "PLAYLIST_SHUFFLE"; break;
@@ -879,10 +950,6 @@ sand_table::MotionController* SandTablePlayer::getMotionController() {
     return motion_controller_;
 }
 
-const Pattern* SandTablePlayer::getCurrentPattern() {
-    return current_pattern_.has_value() ? &current_pattern_.value() : nullptr;
-}
-
 const char* SandTablePlayer::getCurrentPatternUUID() {
     return current_pattern_uuid_;
 }
@@ -893,6 +960,30 @@ const char* SandTablePlayer::getCurrentPlaylistUUID() {
 
 bool SandTablePlayer::isPatternLoaded() {
     return file_loaded_;
+}
+
+bool SandTablePlayer::isPlayingPattern(const char* uuid) {
+    if (!initialized_ || !uuid || !uuid[0]) return false;
+    // Take the lock when we can; if it is busy (a play() mid-load) compare
+    // anyway — a false positive only costs the caller a redundant stop().
+    raii::MutexGuard guard(state_mutex_, pdMS_TO_TICKS(200));
+    const bool same = (strncmp(current_pattern_uuid_, uuid, MAX_UUID_LEN) == 0);
+    // "Loaded" is the file-open condition that matters to a deleter: a
+    // finished single pattern is STOPPED but still holds its file open.
+    return same && (file_loaded_ ||
+        playback_state_.load(std::memory_order_relaxed) != PlaybackState::STOPPED);
+}
+
+bool SandTablePlayer::waitStopped(TickType_t timeout) {
+    const TickType_t start = xTaskGetTickCount();
+    for (;;) {
+        const bool stopped =
+            playback_state_.load(std::memory_order_acquire) == PlaybackState::STOPPED &&
+            !(motion_controller_ && motion_controller_->is_moving());
+        if (stopped) return true;
+        if ((xTaskGetTickCount() - start) >= timeout) return false;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
 }
 
 // =============================================================================
@@ -932,7 +1023,7 @@ void SandTablePlayer::serviceTask() {
                     // Bail out promptly if an API thread stopped/paused us
                     // (unlocked read — just an exit hint, the next tick's
                     // locked snapshot is authoritative)
-                    if (playback_state_ != PlaybackState::PLAYING) break;
+                    if (playback_state_.load(std::memory_order_relaxed) != PlaybackState::PLAYING) break;
 
                     PatternLine line = peekNextLine();
                     if (line.is_valid) {
@@ -992,11 +1083,87 @@ void SandTablePlayer::serviceTask() {
 // Pattern File Handling
 // =============================================================================
 
-esp_err_t SandTablePlayer::loadPatternFile(const char* pattern_uuid) {
+esp_err_t SandTablePlayer::prepareFile(const char* pattern_uuid, PreparedFile& out) {
+    out = PreparedFile();
+
+    // Get pattern metadata to determine if encrypted (pattern_uuid is external_uuid)
+    auto pattern = ManifestDatabase::instance().getPatternByExternalUuid(pattern_uuid);
+    out.is_encrypted = pattern.has_value() ? pattern->encrypted : false;
+
+    // Create the appropriate reader via factory function
+    out.reader = createPatternReader(out.is_encrypted);
+    if (!out.reader) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    // Open the pattern by UUID (reader handles path internally)
+    esp_err_t ret = out.reader->open(pattern_uuid);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open pattern: %s (err=%s)", pattern_uuid, esp_err_to_name(ret));
+        out.reader.reset();
+        return ret;  // Propagates ESP_ERR_NOT_ALLOWED for license issues
+    }
+
+    out.total_lines = out.reader->getTotalLines();
+
+    // Measure the pattern's total drawn path length for real progress
+    // reporting. One sequential pass through the reader, then rewind; the
+    // result is cached per UUID so loop replays skip the scan. The cache
+    // is shared state: touch it under file_mutex_ only (two play() calls
+    // may prepare concurrently).
+    double cached_total = -1.0;
+    {
+        raii::MutexGuard guard(file_mutex_, pdMS_TO_TICKS(1000));
+        if (guard && strncmp(prescan_uuid_, pattern_uuid, MAX_UUID_LEN) == 0 &&
+            prescan_total_ > 0.0) {
+            cached_total = prescan_total_;
+        }
+    }
+    if (cached_total > 0.0) {
+        out.total_path_len = cached_total;
+    }
+    else {
+        const int64_t t_scan = esp_timer_get_time();
+        double total = 0.0, pt = 0.0, pr = 0.0;
+        bool first = true;
+        while (out.reader->hasMore()) {
+            PatternPoint p = out.reader->readNext();
+            if (!p.valid) break;
+            if (!first) total += segmentLength(pt, pr, p.theta, p.rho);
+            first = false;
+            pt = p.theta;
+            pr = p.rho;
+        }
+        if (out.reader->rewind() != ESP_OK) {
+            ESP_LOGE(TAG, "Rewind after path pre-scan failed");
+            out.reader->close();
+            out.reader.reset();
+            out.total_lines = 0;
+            return ESP_FAIL;
+        }
+        out.total_path_len = total;
+        {
+            raii::MutexGuard guard(file_mutex_, pdMS_TO_TICKS(1000));
+            if (guard) {
+                strlcpy(prescan_uuid_, pattern_uuid, sizeof(prescan_uuid_));
+                prescan_total_ = total;
+            }
+        }
+        ESP_LOGI(TAG, "Path pre-scan: %.1f units in %lldms",
+            total, (long long)((esp_timer_get_time() - t_scan) / 1000));
+    }
+
+    ESP_LOGI(TAG, "Prepared pattern: %s (%zu points, encrypted=%d)",
+        pattern_uuid, out.total_lines, out.is_encrypted);
+    return ESP_OK;
+}
+
+void SandTablePlayer::installPreparedFile(PreparedFile&& prepared) {
     raii::MutexGuard guard(file_mutex_, pdMS_TO_TICKS(1000));
     if (!guard) {
-        ESP_LOGE(TAG, "Failed to acquire file mutex");
-        return ESP_ERR_TIMEOUT;
+        // The prepared reader is closed by its destructor.
+        ESP_LOGE(TAG, "Failed to acquire file mutex; dropping prepared pattern");
+        return;
     }
 
     // Unload any existing reader first (without mutex, we already hold it)
@@ -1004,71 +1171,30 @@ esp_err_t SandTablePlayer::loadPatternFile(const char* pattern_uuid) {
         pattern_reader_->close();
         pattern_reader_.reset();
     }
+
+    pattern_reader_ = std::move(prepared.reader);
+    total_lines_ = prepared.total_lines;
     current_line_index_ = 0;
-    total_lines_ = 0;
-    file_loaded_ = false;
-
-    // Get pattern metadata to determine if encrypted (pattern_uuid is external_uuid)
-    auto pattern = ManifestDatabase::instance().getPatternByExternalUuid(pattern_uuid);
-    bool is_encrypted = pattern.has_value() ? pattern->encrypted : false;
-
-    // Create the appropriate reader via factory function
-    pattern_reader_ = createPatternReader(is_encrypted);
-
-    // Open the pattern by UUID (reader handles path internally)
-    esp_err_t ret = pattern_reader_->open(pattern_uuid);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open pattern: %s (err=%s)", pattern_uuid, esp_err_to_name(ret));
-        pattern_reader_.reset();
-        return ret;  // Propagates ESP_ERR_NOT_ALLOWED for license issues
-    }
-
-    total_lines_ = pattern_reader_->getTotalLines();
-    current_line_index_ = 0;
-
-    // Measure the pattern's total drawn path length for real progress
-    // reporting. One sequential pass through the reader, then rewind; the
-    // result is cached per UUID so loop replays skip the scan.
     completed_path_len_ = 0.0;
     have_prev_point_ = false;
-    total_path_len_ = 0.0;
-    if (strncmp(prescan_uuid_, pattern_uuid, MAX_UUID_LEN) == 0 && prescan_total_ > 0.0) {
-        total_path_len_ = prescan_total_;
-    }
-    else {
-        const int64_t t_scan = esp_timer_get_time();
-        double total = 0.0, pt = 0.0, pr = 0.0;
-        bool first = true;
-        while (pattern_reader_->hasMore()) {
-            PatternPoint p = pattern_reader_->readNext();
-            if (!p.valid) break;
-            if (!first) total += segmentLength(pt, pr, p.theta, p.rho);
-            first = false;
-            pt = p.theta;
-            pr = p.rho;
-        }
-        if (pattern_reader_->rewind() != ESP_OK) {
-            ESP_LOGE(TAG, "Rewind after path pre-scan failed");
-            pattern_reader_->close();
-            pattern_reader_.reset();
-            total_lines_ = 0;
-            return ESP_FAIL;
-        }
-        total_path_len_ = total;
-        strlcpy(prescan_uuid_, pattern_uuid, sizeof(prescan_uuid_));
-        prescan_total_ = total;
-        ESP_LOGI(TAG, "Path pre-scan: %.1f units in %lldms",
-            total, (long long)((esp_timer_get_time() - t_scan) / 1000));
-    }
+    total_path_len_ = prepared.total_path_len;
     path_progress_percent_.store(total_path_len_ > 0.0 ? 0 : -1,
         std::memory_order_relaxed);
+    file_loaded_ = (pattern_reader_ != nullptr);
+}
 
-    file_loaded_ = true;
-
-    ESP_LOGI(TAG, "Loaded pattern: %s (%zu points, encrypted=%d)",
-        pattern_uuid, total_lines_, is_encrypted);
-
-    return ESP_OK;
+// Lock-held paths (playlist advance, random chaining, skip/previous) load
+// inline; play*() use the two halves so the open runs with no lock held.
+esp_err_t SandTablePlayer::loadPatternFile(const char* pattern_uuid) {
+    PreparedFile prepared;
+    esp_err_t ret = prepareFile(pattern_uuid, prepared);
+    if (ret != ESP_OK) {
+        // A failed load leaves nothing loaded (as before).
+        unloadPatternFile();
+        return ret;
+    }
+    installPreparedFile(std::move(prepared));
+    return file_loaded_ ? ESP_OK : ESP_FAIL;
 }
 
 void SandTablePlayer::unloadPatternFile() {
@@ -1170,9 +1296,10 @@ void SandTablePlayer::loadPlaylist(const char* playlist_uuid) {
     if (playlist.has_value()) {
         // Convert pattern IDs to external UUIDs for playback
         for (uint32_t pattern_id : playlist->pattern_ids) {
-            auto pattern = ManifestDatabase::instance().getPattern(pattern_id);
-            if (pattern) {
-                playlist_patterns_.push_back(pattern->external_uuid);
+            // Only the uuid is needed — no per-entry JSON parse.
+            auto uuid = ManifestDatabase::instance().getPatternUuid(pattern_id);
+            if (uuid) {
+                playlist_patterns_.push_back(std::move(*uuid));
             }
         }
         playlist_order_.resize(playlist_patterns_.size());
@@ -1274,9 +1401,7 @@ void SandTablePlayer::shufflePlaylistOrder() {
         playlist_order_[i] = i;
     }
 
-    std::random_device rd;
-    std::mt19937 g(rd());
-    std::shuffle(playlist_order_.begin(), playlist_order_.end(), g);
+    shuffleIndices(playlist_order_);
 
     ESP_LOGI(TAG, "Shuffled playlist order");
 }
@@ -1294,6 +1419,16 @@ bool SandTablePlayer::processPatternLine(const PatternLine& line) {
     auto status = motion_controller_->get_status();
     if (!status.is_homed) {
         ESP_LOGE(TAG, "Motion controller not homed, stopping");
+        stop();
+        return false;
+    }
+    if (status.state == sand_table::SystemState::Error) {
+        // A segment failed to execute: the controller drained its queues and
+        // parked in Error (see MotionController::stepper_task_loop). Stop
+        // cleanly — the halt_and_drain() in stop() returns it to Idle —
+        // instead of feeding lines that would be refused one by one.
+        ESP_LOGE(TAG, "Motion controller in error state (%d), stopping playback",
+            static_cast<int>(status.last_error));
         stop();
         return false;
     }

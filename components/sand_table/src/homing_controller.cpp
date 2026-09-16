@@ -9,9 +9,6 @@ namespace sand_table {
 
     static const char* TAG = "HomingController";
 
-    // Global instance pointer for ISR access
-    static HomingController* g_homing_instance = nullptr;
-
     HomingController::HomingController(
         StepperDriver& theta,
         StepperDriver& rho,
@@ -22,7 +19,6 @@ namespace sand_table {
         , theta_tmc_(theta_tmc)
         , rho_tmc_(rho_tmc)
     {
-        g_homing_instance = this;
     }
 
     HomingController::~HomingController() {
@@ -31,8 +27,6 @@ namespace sand_table {
         // Remove ISR handlers
         gpio_isr_handler_remove(PinConfig::THETA_HALL);
         gpio_isr_handler_remove(PinConfig::RHO_DIAG);
-
-        g_homing_instance = nullptr;
     }
 
     Result<void> HomingController::init() {
@@ -72,9 +66,19 @@ namespace sand_table {
             return Result<void>::err(MotionError::HardwareFault);
         }
 
-        // Install GPIO ISR service (ignore if already installed)
-        esp_err_t isr_err = gpio_install_isr_service(0);
-        if (isr_err != ESP_OK && isr_err != ESP_ERR_INVALID_STATE) {
+        // Install the GPIO ISR service in IRAM: the hall/DIAG handlers stop
+        // the RMT sequencer and must keep firing while the flash cache is
+        // disabled (NVS commit, OTA write) mid-seek — otherwise the axis
+        // drives into the hard stop until the cache comes back. Both
+        // handlers and everything they call are IRAM-safe.
+        esp_err_t isr_err = gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
+        if (isr_err == ESP_ERR_INVALID_STATE) {
+            // Installed earlier by another component; its flags apply.
+            // Nothing in this firmware installs it first (checked), so this
+            // is only informational.
+            ESP_LOGW(TAG, "GPIO ISR service already installed - IRAM flag not applied here");
+        }
+        else if (isr_err != ESP_OK) {
             ESP_LOGE(TAG, "Failed to install GPIO ISR service");
             return Result<void>::err(MotionError::HardwareFault);
         }
@@ -194,9 +198,10 @@ namespace sand_table {
         // SIGNED, same convention as CoordinateTransformer: COUPLING_SIGN
         // flips the companion-move direction when exactly one axis has
         // ROBOT_*_INVERT_DIRECTION set. The theta seeks below apply this
-        // ratio with the theta step sign, so the sign rides along.
+        // ratio with the theta step sign, so the sign rides along. Uses the
+        // boot-applied steps/motor rev, like the transformer.
         return MechanicalConfig::COUPLING_SIGN *
-            static_cast<double>(MechanicalConfig::effective_steps_per_rev()) /
+            static_cast<double>(MechanicalConfig::applied_effective_steps_per_rev()) /
             static_cast<double>(theta_rot);
     }
 
@@ -229,8 +234,31 @@ namespace sand_table {
         if (stepper_controller_) {
             stepper_controller_->emergency_stop();
         }
-        homing_active_.store(false, std::memory_order_release);
-        state_.store(HomingState::Idle, std::memory_order_release);
+        // homing_active_/state_ are NOT cleared here: the run is still
+        // unwinding in its own task (clearing them early let a second
+        // home() start seeks on top of the aborting one).
+    }
+
+    void HomingController::note_seek_result(const Result<void>& result,
+                                            const volatile bool* sensor_flag) {
+        if (result.is_ok()) {
+            return;
+        }
+        if (result.error() == MotionError::EmergencyStop) {
+            if (sensor_flag && *sensor_flag) {
+                return;  // the sensor we armed ended the seek: expected
+            }
+            if (!abort_requested_.load(std::memory_order_acquire)) {
+                ESP_LOGW(TAG, "Seek interrupted by an external stop - aborting homing");
+                abort_requested_.store(true, std::memory_order_release);
+            }
+            return;
+        }
+        // Timeout / hardware fault / busy sequencer: the move did not run to
+        // its end, so a "not found" verdict would be meaningless.
+        ESP_LOGE(TAG, "Seek failed with motion error %d - aborting homing",
+            static_cast<int>(result.error()));
+        abort_requested_.store(true, std::memory_order_release);
     }
 
     HomingController::RhoSeek HomingController::rho_seek_stop(
@@ -249,19 +277,26 @@ namespace sand_table {
         // still be asserted from a previous stall, which fired the ISR
         // instantly and reported a stall after ~0 steps. Move a short
         // distance blind before arming stall detection.
-        (void)stepper_controller_->execute_constant_speed(
-            0, sign * kStallBlankingSteps, interval_us);
+        note_seek_result(stepper_controller_->execute_constant_speed(
+            0, sign * kStallBlankingSteps, interval_us), nullptr);
+
+        RhoSeek seek;
+        if (abort_requested_.load(std::memory_order_acquire)) {
+            seek.steps_moved = std::abs(rho_.position() - before);
+            return seek;
+        }
 
         rho_stall_triggered_ = false;
         enable_diag_isr();
 
-        // Single large armed move - the DIAG ISR stops RMT on stall.
-        (void)stepper_controller_->execute_constant_speed(
-            0, sign * static_cast<int32_t>(max_steps), interval_us);
+        // Single large armed move - the DIAG ISR stops RMT on stall. Any
+        // other stop (e-stop, abort, drain) is classified as an abort.
+        note_seek_result(stepper_controller_->execute_constant_speed(
+            0, sign * static_cast<int32_t>(max_steps), interval_us),
+            &rho_stall_triggered_);
 
         disable_diag_isr();
 
-        RhoSeek seek;
         seek.steps_moved = std::abs(rho_.position() - before);
         seek.stalled = rho_stall_triggered_;
         return seek;
@@ -269,9 +304,9 @@ namespace sand_table {
 
     bool HomingController::rho_slow_home(bool outward) {
         // One motor revolution of backoff - a fixed distance regardless of
-        // where on the arm the carriage sits.
+        // where on the arm the carriage sits (boot-applied step scale).
         const int32_t backoff = static_cast<int32_t>(
-            MechanicalConfig::effective_steps_per_rev());
+            MechanicalConfig::applied_effective_steps_per_rev());
         const int32_t sign = outward ? 1 : -1;
 
         for (int attempt = 1; attempt <= kRhoSlowHomeAttempts; ++attempt) {
@@ -281,8 +316,8 @@ namespace sand_table {
 
             // Back out of the stop (DIAG ISR off - this move ends in free air).
             disable_diag_isr();
-            (void)stepper_controller_->execute_constant_speed(
-                0, -sign * backoff, kRhoSlowHomingIntervalUs);
+            note_seek_result(stepper_controller_->execute_constant_speed(
+                0, -sign * backoff, kRhoSlowHomingIntervalUs), nullptr);
 
             // Settle: let the motor stop cleanly and StallGuard state clear.
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -430,8 +465,8 @@ namespace sand_table {
             int32_t rho_backoff = static_cast<int32_t>(std::lround(
                 kBackoffSteps * rho_steps_per_theta_step()));
 
-            (void)stepper_controller_->execute_constant_speed(
-                -kBackoffSteps, -rho_backoff, kThetaHomingIntervalUs);
+            note_seek_result(stepper_controller_->execute_constant_speed(
+                -kBackoffSteps, -rho_backoff, kThetaHomingIntervalUs), nullptr);
 
             if (abort_requested_.load(std::memory_order_acquire)) {
                 HomingResult result;
@@ -463,8 +498,9 @@ namespace sand_table {
             static_cast<double>(kMaxHomingSteps) * rho_steps_per_theta_step()));
 
         // Execute large forward move - ISR stops at first edge
-        (void)stepper_controller_->execute_constant_speed(
-            static_cast<int32_t>(kMaxHomingSteps), rho_steps_for_full_rotation, kThetaHomingIntervalUs);
+        note_seek_result(stepper_controller_->execute_constant_speed(
+            static_cast<int32_t>(kMaxHomingSteps), rho_steps_for_full_rotation, kThetaHomingIntervalUs),
+            &hall_triggered_);
 
         if (abort_requested_.load(std::memory_order_acquire)) {
             HomingResult result;
@@ -489,8 +525,9 @@ namespace sand_table {
         theta_before = theta_.position();
 
         // Execute another large forward move - ISR stops at second edge
-        (void)stepper_controller_->execute_constant_speed(
-            static_cast<int32_t>(kMaxHomingSteps), rho_steps_for_full_rotation, kThetaHomingIntervalUs);
+        note_seek_result(stepper_controller_->execute_constant_speed(
+            static_cast<int32_t>(kMaxHomingSteps), rho_steps_for_full_rotation, kThetaHomingIntervalUs),
+            &hall_triggered_);
 
         if (abort_requested_.load(std::memory_order_acquire)) {
             HomingResult result;
@@ -698,10 +735,10 @@ namespace sand_table {
         rho_.set_enabled(true);
 
         // Freshly arm StallGuard from live config (SGTHRS + TCOOLTHRS).
+        // (The old 50-step bit-banged "nudge" here bypassed the RMT
+        // sequencer and the position counters; the fast seek's blanking
+        // move already provides the StallGuard spin-up it was meant for.)
         configure_stallguard();
-
-        rho_.set_direction(true);  // Outwards
-        rho_.step_fixed_rate(50, 500);
 
         // Home rho to center using known max
         auto rho_result = home_rho_to_center(rho_max_steps_);
@@ -836,8 +873,8 @@ namespace sand_table {
             int32_t rho_backoff = static_cast<int32_t>(std::lround(
                 kBackoffSteps * rho_steps_per_theta_step()));
 
-            (void)stepper_controller_->execute_constant_speed(
-                -kBackoffSteps, -rho_backoff, kThetaHomingIntervalUs);
+            note_seek_result(stepper_controller_->execute_constant_speed(
+                -kBackoffSteps, -rho_backoff, kThetaHomingIntervalUs), nullptr);
 
             if (abort_requested_.load(std::memory_order_acquire)) {
                 HomingResult result;
@@ -869,8 +906,9 @@ namespace sand_table {
             static_cast<double>(kMaxHomingSteps) * rho_steps_per_theta_step()));
 
         // Execute large forward move - ISR stops at hall edge
-        (void)stepper_controller_->execute_constant_speed(
-            static_cast<int32_t>(kMaxHomingSteps), rho_steps_for_full_rotation, kThetaHomingIntervalUs);
+        note_seek_result(stepper_controller_->execute_constant_speed(
+            static_cast<int32_t>(kMaxHomingSteps), rho_steps_for_full_rotation, kThetaHomingIntervalUs),
+            &hall_triggered_);
 
         // Calculate actual steps moved
         int32_t theta_after = theta_.position();

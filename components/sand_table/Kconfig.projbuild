@@ -51,11 +51,10 @@ menu "TMC Stepper Configuration"
 
     config ROBOT_RHO_STALLGUARD_DIAG_PIN
         int "Rho StallGuard Diag Pin"
-        default 14
-
-    config ROBOT_THETA_STALLGUARD_DIAG_PIN
-        int "Theta StallGuard Diag Pin"
-        default 2
+        # Must differ from ROBOT_RHO_ENABLE_PIN (both once defaulted to 14,
+        # so an unconfigured build drove the enable line from the DIAG
+        # input). 17 matches the current board configuration.
+        default 17
 endmenu
 
 menu "Theta Axis Hardware"

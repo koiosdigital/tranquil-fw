@@ -2,6 +2,7 @@
 
 #include "types.h"
 #include "config.h"
+#include "internal_alloc.h"
 
 #include "tmc2209.h"
 #include "uartbus.h"
@@ -29,6 +30,19 @@ namespace sand_table {
 
     /// Top-level motion controller that coordinates all subsystems.
     /// Manages FreeRTOS tasks for planning and step execution.
+    ///
+    /// Locking (in acquisition order; never take a later one while holding
+    /// an earlier one in reverse):
+    ///   1. plan_mutex_     - a whole plan_*_move() call and every resync of
+    ///                        the planner position (drain, e-stop clear,
+    ///                        homing). Serializes "where the planner thinks
+    ///                        it is" against being overwritten mid-plan.
+    ///   2. planner_mutex_  - the velocity planner's buffer (enqueue vs.
+    ///                        transfer/clear).
+    ///   3. stepper controller ownership (CoordinatedStepperController::busy_,
+    ///      a CAS) - the shared Bresenham/interval state, then the sequencer's
+    ///      own executing_ CAS inside it.
+    ///   motor_power_mutex_ is leaf-level (enable/disable only).
     class MotionController {
     public:
         MotionController();
@@ -76,9 +90,20 @@ namespace sand_table {
         // Homing
         // =========================================================================
 
-        /// Execute homing sequence
+        /// Execute homing sequence. Runs in the CALLER's task. Exactly one
+        /// homing run at a time (console, REST and boot all funnel through
+        /// here): InvalidState while another is in progress, EmergencyStop
+        /// while an e-stop is latched, RebootRequired when the runtime
+        /// steps_per_rev/microsteps no longer match what the drivers were
+        /// programmed with at boot. On failure the controller is left NOT
+        /// homed, with the planner resynced to the physical position and
+        /// state Idle (or EStop if one is latched).
         /// @param force_full If true, performs full calibration. Otherwise uses cached calibration if available.
         [[nodiscard]] Result<void> home(bool force_full = false);
+
+        /// Abort a homing run in progress (from any task). home() then
+        /// returns EmergencyStop to its caller. No-op when not homing.
+        void abort_homing();
 
         /// Check if system is homed
         [[nodiscard]] bool is_homed() const noexcept {
@@ -148,15 +173,21 @@ namespace sand_table {
         /// Normal stop: abort the in-flight segment, discard everything
         /// queued (segment queue + velocity planner), and resync the
         /// planner position from the physical motor position. Blocks until
-        /// the stepper task acknowledges the drain (bounded wait).
-        /// Use this for user-initiated stops; emergency_stop() is for
-        /// safety stops and leaves the controller in the EStop state.
-        void halt_and_drain();
+        /// the stepper task acknowledges the drain (bounded wait). Also
+        /// clears an Error state. Use this for user-initiated stops;
+        /// emergency_stop() is for safety stops and leaves the controller
+        /// in the EStop state.
+        /// @return false when refused because homing owns the sequencer
+        ///         (a drain would kill the seek in flight; use
+        ///         abort_homing() for that). True otherwise.
+        bool halt_and_drain();
 
-        /// Emergency stop - immediately halt all motion
+        /// Emergency stop - immediately halt all motion and latch EStop.
+        /// Also aborts a homing run in progress.
         void emergency_stop();
 
-        /// Clear emergency stop state
+        /// Clear emergency stop (and Error) state: resyncs the planner from
+        /// the physical position and returns to Idle.
         void clear_emergency_stop();
 
         // =========================================================================
@@ -249,9 +280,10 @@ namespace sand_table {
         // TMC UART bus (shared by both drivers)
         std::unique_ptr<tmc::UartBus> tmc_bus_;
 
-        // Stepper drivers
-        std::unique_ptr<StepperDriver> theta_stepper_;
-        std::unique_ptr<StepperDriver> rho_stepper_;
+        // Stepper drivers. Internal RAM: their position counters are
+        // credited from the RMT TX-done ISR (see internal_alloc.h).
+        internal_ptr<StepperDriver> theta_stepper_;
+        internal_ptr<StepperDriver> rho_stepper_;
 
         // TMC2209 drivers
         std::unique_ptr<tmc::TMC2209Stepper> theta_tmc_;
@@ -277,10 +309,31 @@ namespace sand_table {
         // queue's consumer side, so it performs the actual drain and clears
         // this flag as the acknowledgement.
         std::atomic<bool> drain_requested_{ false };
-        // While set, enqueue_segment() refuses new segments (returns false)
+        // While > 0, enqueue_segment() refuses new segments (returns false)
         // so a task blocked mid-plan unwinds instead of refilling the
-        // planner that is being drained.
-        std::atomic<bool> abort_planning_{ false };
+        // planner that is being drained/resynced. A depth count, not a
+        // flag: the drain and the segment-error path can overlap.
+        std::atomic<int> abort_planning_depth_{ 0 };
+
+        // Serializes a whole plan_*_move() against planner-position resyncs
+        // (see the class comment for lock order). mutable: taken in the
+        // const get_planning_position().
+        mutable SemaphoreHandle_t plan_mutex_ = nullptr;
+
+        // The single homing slot (home() CAS); released when home() returns.
+        std::atomic<bool> homing_claim_{ false };
+
+        // steps_per_rev * microsteps the TMC drivers were programmed with in
+        // init_tmc(); home() refuses to run when the live config differs.
+        uint32_t applied_steps_per_rev_ = 0;
+
+        // Set by the stepper task on exit; stop() waits for it before the
+        // destructor deletes the mutexes the task may still be using.
+        std::atomic<bool> stepper_task_exited_{ false };
+
+        // Why state_ == Error (the failed segment's error). None otherwise;
+        // cleared by the drain / e-stop clear / a successful home.
+        std::atomic<MotionError> last_error_{ MotionError::None };
 
         // Guards velocity_planner_: it is mutated from the planning task
         // (enqueue_segment via move_to) AND the stepper task
@@ -329,6 +382,14 @@ namespace sand_table {
         // Internal helpers
         void reset_inactivity_timer();
         Result<void> init_tmc();
+
+        // Drop everything queued (segment queue + velocity planner).
+        void discard_queued_motion();
+        // Re-seat the planner on the physical motor position (and reset
+        // the transformer's fractional accumulators, which belong to the
+        // discarded plan). Takes plan_mutex_ (bounded) so an in-flight
+        // plan_*_move cannot advance the position underneath it.
+        void resync_planner_from_physical();
 
         // Position overflow handling (like main branch's handleStepOverflow)
         // Wraps theta position when it exceeds ±1 rotation and adjusts rho accordingly

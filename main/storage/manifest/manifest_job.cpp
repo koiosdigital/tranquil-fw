@@ -58,16 +58,15 @@ jobs::Job job_from_storage(const cJSON* obj) {
     return j;
 }
 
-// Serialize + update + save in one step (shared by all job mutators)
-static esp_err_t store_job(manifest::JsonlTable& table, const jobs::Job& j) {
+// Serialize + update the row in RAM (shared by all job mutators). The caller
+// persists via Impl::save() so a BatchScope can defer it.
+static esp_err_t update_job_row(manifest::JsonlTable& table, const jobs::Job& j) {
     cJSON* obj = job_to_storage(j);
     if (!obj) return ESP_ERR_NO_MEM;
 
     bool ok = table.update(j.id, obj);
     cJSON_Delete(obj);
-    if (!ok) return ESP_FAIL;
-
-    return table.save() ? ESP_OK : ESP_FAIL;
+    return ok ? ESP_OK : ESP_FAIL;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -90,27 +89,35 @@ esp_err_t ManifestDatabase::enqueueJob(jobs::Job& job) {
         return ESP_ERR_NO_MEM;
     }
     job.id = id;
-    if (!impl_->jobs.save()) return ESP_FAIL;
+    if (!impl_->save(impl_->jobs)) return ESP_FAIL;
 
     ESP_LOGI(TAG, "Job enqueued: id=%lu", (unsigned long)job.id);
     return ESP_OK;
 }
 
 std::optional<jobs::Job> ManifestDatabase::claimNextPendingJob() {
+    return claimNextPendingJob(nullptr, nullptr);
+}
+
+std::optional<jobs::Job> ManifestDatabase::claimNextPendingJob(
+    bool (*eligible)(const jobs::Job&, void* ctx), void* ectx) {
     ManifestLock lock(impl_->mutex);
     if (!impl_->initialized) return std::nullopt;
 
-    // Find best pending job (highest priority, oldest created_at)
+    // Find best eligible pending job (highest priority, oldest created_at)
     struct FindCtx {
         bool found;
         jobs::Job bestJob;
-    } ctx = { false, {} };
+        bool (*eligible)(const jobs::Job&, void*);
+        void* ectx;
+    } ctx = { false, {}, eligible, ectx };
 
     impl_->jobs.foreach(
         [](uint32_t, const cJSON* obj, void* c) -> bool {
             auto* ctx = static_cast<FindCtx*>(c);
             jobs::Job j = job_from_storage(obj);
             if (j.status != jobs::JobStatus::Pending) return true;
+            if (ctx->eligible && !ctx->eligible(j, ctx->ectx)) return true;
 
             if (!ctx->found ||
                 j.priority > ctx->bestJob.priority ||
@@ -127,7 +134,8 @@ std::optional<jobs::Job> ManifestDatabase::claimNextPendingJob() {
     ctx.bestJob.status = jobs::JobStatus::InProgress;
     ctx.bestJob.started_at = currentTimestamp();
 
-    if (store_job(impl_->jobs, ctx.bestJob) != ESP_OK) {
+    if (update_job_row(impl_->jobs, ctx.bestJob) != ESP_OK ||
+        !impl_->save(impl_->jobs)) {
         return std::nullopt;
     }
 
@@ -177,7 +185,7 @@ size_t ManifestDatabase::recoverOrphanedJobs() {
         ESP_LOGI(TAG, "Purged %zu finished jobs at boot", ctx.purged);
     }
     if (ctx.purged > 0 || ctx.recovered > 0) {
-        impl_->jobs.save();
+        impl_->save(impl_->jobs);
     }
     return ctx.recovered;
 }
@@ -263,15 +271,16 @@ esp_err_t ManifestDatabase::markJobCompleted(uint32_t id) {
     ManifestLock lock(impl_->mutex);
     if (!impl_->initialized) return ESP_ERR_INVALID_STATE;
 
-    auto j = getJob(id);
-    if (!j) return ESP_ERR_NOT_FOUND;
+    // A completed row is never read again (the completion callback receives
+    // the worker's own copy of the job), so purge it instead of parking a
+    // terminal status in the table. Otherwise every download leaves three
+    // dead rows behind and hasJobForPattern() — run on each enqueue and each
+    // thumbnail request — parses all of them, forever.
+    if (!impl_->jobs.remove(id)) return ESP_ERR_NOT_FOUND;
 
-    j->status = jobs::JobStatus::Completed;
-    j->completed_at = currentTimestamp();
-
-    esp_err_t rc = store_job(impl_->jobs, *j);
+    esp_err_t rc = impl_->save(impl_->jobs) ? ESP_OK : ESP_FAIL;
     if (rc == ESP_OK) {
-        ESP_LOGI(TAG, "Job completed: id=%lu", (unsigned long)id);
+        ESP_LOGI(TAG, "Job completed: id=%lu (row purged)", (unsigned long)id);
     }
     return rc;
 }
@@ -296,7 +305,9 @@ esp_err_t ManifestDatabase::markJobFailed(uint32_t id, const std::string& error,
         j->completed_at = currentTimestamp();
     }
 
-    return store_job(impl_->jobs, *j);
+    esp_err_t rc = update_job_row(impl_->jobs, *j);
+    if (rc != ESP_OK) return rc;
+    return impl_->save(impl_->jobs) ? ESP_OK : ESP_FAIL;
 }
 
 esp_err_t ManifestDatabase::releaseJob(uint32_t id) {
@@ -311,7 +322,9 @@ esp_err_t ManifestDatabase::releaseJob(uint32_t id) {
     j->status = jobs::JobStatus::Pending;
     j->started_at.clear();
 
-    return store_job(impl_->jobs, *j);
+    esp_err_t rc = update_job_row(impl_->jobs, *j);
+    if (rc != ESP_OK) return rc;
+    return impl_->save(impl_->jobs) ? ESP_OK : ESP_FAIL;
 }
 
 esp_err_t ManifestDatabase::deleteJob(uint32_t id) {
@@ -321,7 +334,7 @@ esp_err_t ManifestDatabase::deleteJob(uint32_t id) {
     if (!impl_->jobs.remove(id)) {
         return ESP_ERR_NOT_FOUND;
     }
-    if (!impl_->jobs.save()) return ESP_FAIL;
+    if (!impl_->save(impl_->jobs)) return ESP_FAIL;
     ESP_LOGI(TAG, "Job deleted: id=%lu", (unsigned long)id);
     return ESP_OK;
 }
@@ -347,7 +360,7 @@ esp_err_t ManifestDatabase::cancelJobsForPattern(uint32_t pattern_id) {
         }, &ctx);
 
     if (ctx.deleted > 0) {
-        if (!impl_->jobs.save()) return ESP_FAIL;
+        if (!impl_->save(impl_->jobs)) return ESP_FAIL;
         ESP_LOGI(TAG, "Cancelled %d jobs for pattern id=%lu", ctx.deleted, (unsigned long)pattern_id);
     }
     return ESP_OK;
@@ -376,7 +389,7 @@ esp_err_t ManifestDatabase::cancelJobsForExternalUuid(const std::string& externa
         }, &ctx);
 
     if (ctx.deleted > 0) {
-        if (!impl_->jobs.save()) return ESP_FAIL;
+        if (!impl_->save(impl_->jobs)) return ESP_FAIL;
         ESP_LOGI(TAG, "Cancelled %d jobs for pattern uuid=%s",
             ctx.deleted, external_uuid.c_str());
     }

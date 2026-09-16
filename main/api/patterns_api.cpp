@@ -1,33 +1,35 @@
+// Pattern REST API: list / detail / delete are a thin JSON codec over
+// library_ops; upload, download and thumbnails are HTTP-only paths.
 #include "patterns_api.h"
 #include "esp_http_server.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "cJSON.h"
 #include "api_common.h"
+#include "ops/library_ops.h"
 #include "ManifestDatabase.h"
-#include "PatternReader.h"
 #include "jobs/job_queue.h"
 #include "jobs/job_types.h"
 #include "jobs/job_processor.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include "raii_utils.hpp"
 #include <string.h>
 #include <stdlib.h>
 #include <sys/stat.h>
-#include <vector>
 #include <unistd.h>
 #include <cstdio>
-#include <cmath>
 #include <algorithm>
 
 static const char* TAG = "patterns_api";
 
-// Upload constants
-static constexpr size_t UPLOAD_CHUNK_SIZE = 8 * 1024;  // heap-allocated per upload (too big for the 8KB httpd stack)
+// Upload constants. The receive buffer is heap-allocated per upload: 8 KB
+// would not fit alongside the parser state on the 12 KB httpd task stack.
+static constexpr size_t UPLOAD_CHUNK_SIZE = 8 * 1024;
 static constexpr size_t MAX_BOUNDARY_SIZE = 128;
 static constexpr size_t MAX_FILENAME_SIZE = 256;
 static constexpr size_t MAX_HEADER_SIZE = 1024;
+// Longest tail of a chunk that could be the start of a closing boundary
+// ("\r\n--" + boundary) split across two reads; carried into the next recv.
+static constexpr size_t CARRY_MAX = MAX_BOUNDARY_SIZE + 8;
 
 // Upload context for tracking state during multipart parsing
 struct UploadContext {
@@ -37,79 +39,15 @@ struct UploadContext {
     char temp_path[128] = { 0 };
     char final_path[128] = { 0 };
     size_t bytes_written = 0;
-    bool in_content = false;
     char boundary[MAX_BOUNDARY_SIZE] = { 0 };
     size_t boundary_len = 0;
 };
 
 namespace {
 
-    // Helper: get pattern file path with correct extension
-    // Both encrypted (KDEP) and unencrypted (THRB) patterns use .dat
-    void getPatternFilePath(const std::string& uuid, bool encrypted, char* path, size_t path_size) {
-        (void)encrypted;  // Now unused - all patterns are .dat
+    // Both encrypted (KDEP) and unencrypted (THRB) patterns are stored as .dat
+    void pattern_dat_path(const std::string& uuid, char* path, size_t path_size) {
         snprintf(path, path_size, "/sd/patterns/%s.dat", uuid.c_str());
-    }
-
-    // Helper: get pattern file size on disk
-    size_t getPatternFileSize(const std::string& uuid, bool encrypted) {
-        char path[128];
-        getPatternFilePath(uuid, encrypted, path, sizeof(path));
-        struct stat st;
-        if (stat(path, &st) == 0) {
-            return st.st_size;
-        }
-        return 0;
-    }
-
-    // Stream a pattern object without building a cJSON tree. Field set
-    // mirrors ManifestDatabase::patternToJson.
-    void write_pattern_json(api_common::ChunkBuf* cb, const Pattern& p) {
-        using namespace api_common;
-        chunk_buf_write_str(cb, "{\"uuid\":");
-        chunk_buf_write_json_string(cb, p.external_uuid.c_str());
-        chunk_buf_printf(cb, ",\"id\":%lu,\"name\":", (unsigned long)p.id);
-        chunk_buf_write_json_string(cb, p.name.c_str());
-        chunk_buf_write_str(cb, ",\"creator\":");
-        chunk_buf_write_json_string(cb, p.creator.c_str());
-        chunk_buf_write_str(cb, ",\"date\":");
-        chunk_buf_write_json_string(cb, p.date.c_str());
-        chunk_buf_printf(cb, ",\"popularity\":%d,\"reversible\":%s,\"start_point\":%u,\"encrypted\":%s,\"size_bytes\":%lu",
-            p.popularity,
-            p.reversible ? "true" : "false",
-            (unsigned)p.start_point,
-            p.encrypted ? "true" : "false",
-            (unsigned long)p.size_bytes);
-        // URLs per the swagger contract (download only for unencrypted patterns)
-        chunk_buf_write_str(cb, ",\"thumb_url\":\"/api/pattern_thumbs/");
-        chunk_buf_write_str(cb, p.external_uuid.c_str());
-        chunk_buf_write_str(cb, ".png\",\"download_url\":\"");
-        if (!p.encrypted) {
-            chunk_buf_write_str(cb, "/api/pattern_download/");
-            chunk_buf_write_str(cb, p.external_uuid.c_str());
-        }
-        chunk_buf_write(cb, "\"", 1);
-        if (!p.created_at.empty()) {
-            chunk_buf_write_str(cb, ",\"created_at\":");
-            chunk_buf_write_json_string(cb, p.created_at.c_str());
-        }
-        if (!p.last_played_at.empty()) {
-            chunk_buf_write_str(cb, ",\"last_played_at\":");
-            chunk_buf_write_json_string(cb, p.last_played_at.c_str());
-        }
-        if (!p.downloaded_at.empty()) {
-            chunk_buf_write_str(cb, ",\"downloaded_at\":");
-            chunk_buf_write_json_string(cb, p.downloaded_at.c_str());
-        }
-        chunk_buf_printf(cb, ",\"is_owned\":%s", p.purchased ? "true" : "false");
-        if (p.purchased) {
-            chunk_buf_printf(cb, ",\"purchased_at\":%lld", (long long)p.purchased_at);
-            if (!p.receipt_id.empty()) {
-                chunk_buf_write_str(cb, ",\"receipt_id\":");
-                chunk_buf_write_json_string(cb, p.receipt_id.c_str());
-            }
-        }
-        chunk_buf_write(cb, "}", 1);
     }
 
     // Extract boundary from Content-Type header
@@ -141,7 +79,7 @@ namespace {
         else {
             // Unquoted - copy until space or semicolon
             size_t i = 0;
-            while (*boundary_start&&* boundary_start != ' ' && *boundary_start != ';' && i < max_len - 1) {
+            while (*boundary_start && *boundary_start != ' ' && *boundary_start != ';' && i < max_len - 1) {
                 boundary[i++] = *boundary_start++;
             }
             boundary[i] = '\0';
@@ -163,7 +101,7 @@ namespace {
         }
 
         size_t i = 0;
-        while (*fname_start&&* fname_start != '"' && *fname_start != '\r' && *fname_start != '\n' && i < max_len - 1) {
+        while (*fname_start && *fname_start != '"' && *fname_start != '\r' && *fname_start != '\n' && i < max_len - 1) {
             filename[i++] = *fname_start++;
         }
         filename[i] = '\0';
@@ -184,6 +122,26 @@ namespace {
             }
         }
         return nullptr;
+    }
+
+    // Append body bytes to the temp file; false on a short write.
+    bool write_body(UploadContext* ctx, const char* data, size_t len) {
+        if (len == 0) return true;
+        if (fwrite(data, 1, len, ctx->file) != len) {
+            ESP_LOGE(TAG, "Write failed at %zu bytes: %s", ctx->bytes_written, ctx->temp_path);
+            return false;
+        }
+        ctx->bytes_written += len;
+        return true;
+    }
+
+    esp_err_t send_pattern(httpd_req_t* req, const Pattern& p) {
+        httpd_resp_set_type(req, "application/json");
+        api_common::ChunkBuf cb;
+        api_common::chunk_buf_init(&cb, req);
+        library_ops::pattern_to_json(&cb, p);
+        api_common::chunk_buf_finish(&cb);
+        return ESP_OK;
     }
 
 } // anonymous namespace
@@ -208,12 +166,9 @@ static esp_err_t patterns_list_handler(httpd_req_t* req) {
 
     bool first = true;
     for (auto& pattern : result.items) {
-        // Update size from disk if not set
-        if (pattern.size_bytes == 0) {
-            pattern.size_bytes = getPatternFileSize(pattern.external_uuid, pattern.encrypted);
-        }
+        library_ops::fill_size_from_disk(pattern);
         if (!first) chunk_buf_write(&cb, ",", 1);
-        write_pattern_json(&cb, pattern);
+        library_ops::pattern_to_json(&cb, pattern);
         first = false;
     }
 
@@ -226,15 +181,15 @@ static esp_err_t patterns_list_handler(httpd_req_t* req) {
 static esp_err_t patterns_upload_handler(httpd_req_t* req) {
     esp_err_t ret = ESP_OK;
 
-    // The receive buffer alone is UPLOAD_CHUNK_SIZE (8KB) — the same size as
-    // the entire httpd task stack — so the big buffers must live on the heap
-    // (SPIRAM preferred). Only small state stays on the stack.
+    // Big buffers live on the heap (SPIRAM preferred); only small state
+    // stays on the httpd stack. The receive buffer has room in front for the
+    // boundary carry-over: [carry (<= CARRY_MAX)][fresh bytes (<= chunk)].
     UploadContext ctx_storage = {};
     UploadContext* ctx = &ctx_storage;
     char* header_buf = static_cast<char*>(
         heap_caps_malloc(MAX_HEADER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     char* buffer = static_cast<char*>(
-        heap_caps_malloc(UPLOAD_CHUNK_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        heap_caps_malloc(CARRY_MAX + UPLOAD_CHUNK_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (!header_buf || !buffer) {
         ESP_LOGE(TAG, "Failed to allocate upload buffers");
         free(header_buf);
@@ -265,7 +220,7 @@ static esp_err_t patterns_upload_handler(httpd_req_t* req) {
     snprintf(ctx->temp_path, sizeof(ctx->temp_path), "/sd/patterns/%.36s.tmp", ctx->uuid);
     snprintf(ctx->final_path, sizeof(ctx->final_path), "/sd/patterns/%.36s.thr", ctx->uuid);
 
-    // Pre-build boundary strings (avoid repeated stack allocation in loop)
+    // Pre-build boundary strings
     // first_boundary: "--" + boundary + null = 2 + 127 + 1 = 130 max
     // close_boundary: "\r\n--" + boundary + null = 4 + 127 + 1 = 132 max
     char first_boundary[MAX_BOUNDARY_SIZE + 8];
@@ -274,23 +229,24 @@ static esp_err_t patterns_upload_handler(httpd_req_t* req) {
              (int)(MAX_BOUNDARY_SIZE - 1), ctx->boundary);
     snprintf(close_boundary, sizeof(close_boundary), "\r\n--%.*s",
              (int)(MAX_BOUNDARY_SIZE - 1), ctx->boundary);
-    size_t fb_len = strlen(first_boundary);
-    size_t cb_len = strlen(close_boundary);
+    const size_t fb_len = strlen(first_boundary);
+    const size_t cb_len = strlen(close_boundary);
 
     // We'll use a simple state machine for multipart parsing
-    // States: PREAMBLE -> HEADERS -> BODY -> EPILOGUE
+    // States: PREAMBLE -> HEADERS -> BODY -> DONE
     enum State { PREAMBLE, HEADERS, BODY, DONE } state = PREAMBLE;
 
     size_t header_len = 0;
+    size_t carry_len = 0;      // bytes at buffer[0..carry_len) held back from the last chunk
 
     size_t total_received = 0;
-    size_t content_len = req->content_len;
+    const size_t content_len = req->content_len;
 
     while (total_received < content_len && state != DONE) {
         size_t to_read = content_len - total_received;
         if (to_read > UPLOAD_CHUNK_SIZE) to_read = UPLOAD_CHUNK_SIZE;
 
-        int received = httpd_req_recv(req, buffer, to_read);
+        int received = httpd_req_recv(req, buffer + carry_len, to_read);
         if (received <= 0) {
             ESP_LOGE(TAG, "Receive error: %d", received);
             ret = ESP_FAIL;
@@ -298,8 +254,10 @@ static esp_err_t patterns_upload_handler(httpd_req_t* req) {
         }
 
         total_received += received;
-        char* data = buffer;
-        size_t data_len = received;
+        const bool last_chunk = total_received >= content_len;
+        char* data = buffer;                       // window = carry + fresh bytes
+        size_t data_len = carry_len + received;
+        carry_len = 0;
 
         // Process data based on state
         while (data_len > 0 && state != DONE) {
@@ -356,7 +314,7 @@ static esp_err_t patterns_upload_handler(httpd_req_t* req) {
                     }
                 }
 
-                if (header_len >= MAX_HEADER_SIZE - 1) {
+                if (state == HEADERS && header_len >= MAX_HEADER_SIZE - 1) {
                     ESP_LOGE(TAG, "Headers too large");
                     ret = ESP_FAIL;
                     state = DONE;
@@ -364,57 +322,44 @@ static esp_err_t patterns_upload_handler(httpd_req_t* req) {
             }
 
             if (state == BODY && ctx->file) {
-                // Search for boundary in current data
                 const char* bound = find_pattern(data, data_len, close_boundary, cb_len);
                 if (bound) {
-                    // Write data up to boundary
-                    size_t write_len = bound - data;
-                    if (write_len > 0) {
-                        fwrite(data, 1, write_len, ctx->file);
-                        ctx->bytes_written += write_len;
-                    }
+                    // Body ends at the boundary.
+                    if (!write_body(ctx, data, static_cast<size_t>(bound - data))) ret = ESP_FAIL;
                     state = DONE;
                     break;
                 }
-                else {
-                    // No boundary found, but it might span chunks
-                    // Keep last cb_len-1 bytes as carry-over
-                    size_t safe_len = (data_len > cb_len - 1) ? data_len - (cb_len - 1) : 0;
-                    if (safe_len > 0) {
-                        fwrite(data, 1, safe_len, ctx->file);
-                        ctx->bytes_written += safe_len;
-                        data += safe_len;
-                        data_len -= safe_len;
-                    }
 
-                    // Store potential boundary start as carry-over for next iteration
-                    // For simplicity, just write remaining and check in next chunk
-                    // (This is a slight simplification - may write trailing boundary chars)
-                    if (data_len > 0 && total_received >= content_len) {
-                        // Last chunk - don't write potential boundary
-                        // Check if it ends with boundary
-                        if (data_len >= cb_len && memcmp(data + data_len - cb_len, close_boundary, cb_len) == 0) {
-                            fwrite(data, 1, data_len - cb_len, ctx->file);
-                            ctx->bytes_written += data_len - cb_len;
-                        }
-                        else {
-                            fwrite(data, 1, data_len, ctx->file);
-                            ctx->bytes_written += data_len;
-                        }
-                    }
-                    else if (data_len > 0) {
-                        fwrite(data, 1, data_len, ctx->file);
-                        ctx->bytes_written += data_len;
-                    }
+                // No boundary in the window. Everything but the last cb_len-1
+                // bytes is certainly content; those bytes might be the start
+                // of a boundary split across reads, so carry them into the
+                // next recv. On the final chunk there is nothing to wait for.
+                const size_t keep = last_chunk ? 0 : std::min(data_len, cb_len - 1);
+                const size_t write_len = data_len - keep;
+                if (!write_body(ctx, data, write_len)) {
+                    ret = ESP_FAIL;
+                    state = DONE;
                     break;
                 }
+                if (keep) {
+                    memmove(buffer, data + write_len, keep);
+                    carry_len = keep;
+                }
+                else if (last_chunk) {
+                    ESP_LOGW(TAG, "Upload ended without a closing boundary; keeping the body as received");
+                }
+                data_len = 0;
+                break;
             }
         }
     }
 
-    // Close file
+    // Close file; a failed close means the last buffered bytes never landed.
     if (ctx->file) {
-        fclose(ctx->file);
+        if (fclose(ctx->file) != 0) {
+            ESP_LOGE(TAG, "Failed to close %s", ctx->temp_path);
+            ret = ESP_FAIL;
+        }
         ctx->file = nullptr;
     }
 
@@ -475,7 +420,8 @@ static esp_err_t patterns_upload_handler(httpd_req_t* req) {
 
     ESP_LOGI(TAG, "Pattern uploaded, conversion queued: %s (%zu bytes)", ctx->uuid, ctx->bytes_written);
 
-    // Return 200 OK with processing status
+    // Return 200 OK with processing status. (The list push happens when the
+    // conversion completes and the pattern becomes playable.)
     cJSON* response = cJSON_CreateObject();
     cJSON_AddStringToObject(response, "uuid", ctx->uuid);
     cJSON_AddStringToObject(response, "name", conv_data.name.c_str());
@@ -501,67 +447,31 @@ static esp_err_t patterns_upload_handler(httpd_req_t* req) {
 
 // GET /api/patterns/{uuid} - detail
 static esp_err_t patterns_detail_handler(httpd_req_t* req) {
-    const char* uri = req->uri;
-    const char* base = "/api/patterns/";
-
-    if (strncmp(uri, base, strlen(base)) != 0) {
+    std::string uuid = api_common::extract_uuid(req->uri, "/api/patterns/");
+    if (uuid.empty()) {
         httpd_resp_send_404(req);
         return ESP_FAIL;
     }
 
-    const char* uuid = uri + strlen(base);
-    if (!uuid || strlen(uuid) == 0) {
-        httpd_resp_send_404(req);
-        return ESP_FAIL;
-    }
-
-    // uuid is external_uuid
-    auto pattern = ManifestDatabase::instance().getPatternByExternalUuid(uuid);
+    auto pattern = library_ops::get_pattern(uuid);
     if (!pattern) {
         httpd_resp_send_404(req);
         return ESP_FAIL;
     }
 
-    // Update size from disk if not set
-    if (pattern->size_bytes == 0) {
-        pattern->size_bytes = getPatternFileSize(pattern->external_uuid, pattern->encrypted);
-    }
-
-    httpd_resp_set_type(req, "application/json");
-    api_common::ChunkBuf cb;
-    api_common::chunk_buf_init(&cb, req);
-    write_pattern_json(&cb, *pattern);
-    api_common::chunk_buf_finish(&cb);
-    return ESP_OK;
+    return send_pattern(req, *pattern);
 }
 
 // DELETE /api/patterns/{uuid}
 static esp_err_t patterns_delete_handler(httpd_req_t* req) {
-    const char* uri = req->uri;
-    const char* base = "/api/patterns/";
-
-    if (strncmp(uri, base, strlen(base)) != 0) {
+    std::string uuid = api_common::extract_uuid(req->uri, "/api/patterns/");
+    if (uuid.empty()) {
         httpd_resp_send_404(req);
         return ESP_FAIL;
     }
 
-    const char* uuid = uri + strlen(base);
-    if (!uuid || strlen(uuid) == 0) {
-        httpd_resp_send_404(req);
-        return ESP_FAIL;
-    }
-
-    // uuid is external_uuid - look up to get internal ID
-    auto pattern = ManifestDatabase::instance().getPatternByExternalUuid(uuid);
-    if (!pattern) {
-        httpd_resp_send_404(req);
-        return ESP_FAIL;
-    }
-
-    if (ManifestDatabase::instance().deletePattern(pattern->id) != ESP_OK) {
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
+    OpResult r = library_ops::delete_pattern(uuid);
+    if (!r.ok()) return api_common::send_op_error(req, r);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"status\":\"deleted\"}", -1);
@@ -570,16 +480,8 @@ static esp_err_t patterns_delete_handler(httpd_req_t* req) {
 
 // GET /api/pattern_download/{uuid} - download pattern file
 static esp_err_t patterns_download_handler(httpd_req_t* req) {
-    const char* uri = req->uri;
-    const char* base = "/api/pattern_download/";
-
-    if (strncmp(uri, base, strlen(base)) != 0) {
-        httpd_resp_send_404(req);
-        return ESP_FAIL;
-    }
-
-    const char* uuid = uri + strlen(base);
-    if (!uuid || strlen(uuid) == 0 || strlen(uuid) >= 64) {
+    std::string uuid = api_common::extract_uuid(req->uri, "/api/pattern_download/");
+    if (uuid.empty()) {
         httpd_resp_send_404(req);
         return ESP_FAIL;
     }
@@ -597,9 +499,8 @@ static esp_err_t patterns_download_handler(httpd_req_t* req) {
         return ESP_FAIL;
     }
 
-    // Get file path (use external_uuid for file naming)
     char file_path[128];
-    getPatternFilePath(pattern->external_uuid, pattern->encrypted, file_path, sizeof(file_path));
+    pattern_dat_path(pattern->external_uuid, file_path, sizeof(file_path));
 
     FILE* f = fopen(file_path, "rb");
     if (!f) {
@@ -619,12 +520,14 @@ static esp_err_t patterns_download_handler(httpd_req_t* req) {
     }
     size_t file_size = static_cast<size_t>(file_pos);
 
-    // Set response headers (no Content-Length when using chunked transfer)
+    // Set response headers (no Content-Length when using chunked transfer).
+    // The filename is the uuid: pattern names are user text and could carry
+    // quotes / CR-LF into the header.
     httpd_resp_set_type(req, "application/octet-stream");
 
-    char content_disp[256];
+    char content_disp[160];
     snprintf(content_disp, sizeof(content_disp), "attachment; filename=\"%s.thrb\"",
-        pattern->name.empty() ? uuid : pattern->name.c_str());
+        pattern->external_uuid.c_str());
     httpd_resp_set_hdr(req, "Content-Disposition", content_disp);
 
     // Stream file in chunks
@@ -665,7 +568,7 @@ static esp_err_t patterns_download_handler(httpd_req_t* req) {
         return ESP_FAIL;
     }
 
-    ESP_LOGD(TAG, "Pattern downloaded: %s (%zu bytes)", uuid, bytes_sent);
+    ESP_LOGD(TAG, "Pattern downloaded: %s (%zu bytes)", uuid.c_str(), bytes_sent);
     return ESP_OK;
 }
 
@@ -708,7 +611,7 @@ static esp_err_t pattern_thumb_handler(httpd_req_t* req) {
             // Only enqueue if the pattern's .dat file actually exists —
             // otherwise the job is doomed and every 404 would re-enqueue it.
             char dat_path[128];
-            getPatternFilePath(pattern->external_uuid, pattern->encrypted, dat_path, sizeof(dat_path));
+            pattern_dat_path(pattern->external_uuid, dat_path, sizeof(dat_path));
             struct stat dat_st;
             if (stat(dat_path, &dat_st) == 0) {
                 jobs::ThumbnailJobData data;

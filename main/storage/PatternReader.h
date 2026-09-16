@@ -119,6 +119,17 @@ private:
     UnencryptedPatternHeader header_;
     size_t current_point_ = 0;
 
+    // Block-buffered reads: points are pulled from the file kBlockPoints
+    // at a time (one fread) instead of one 6-byte fread per point. The
+    // progress pre-scan walks every point of a pattern at load, and the
+    // player pumps up to 64 points per 10 ms tick — per-point freads through
+    // stdio's small buffer were a measurable share of that.
+    static constexpr size_t kBlockPoints = 128;
+    BinaryPoint block_[kBlockPoints];
+    size_t block_count_ = 0;      // points held in block_
+    size_t block_pos_ = 0;        // next unread point in block_
+    size_t points_fetched_ = 0;   // points pulled from the file so far
+
     // Terminal read failure (truncated/corrupt file): once set, hasMore()
     // returns false so playback ends cleanly instead of spinning.
     bool read_failed_ = false;
@@ -129,4 +140,8 @@ private:
 
     void getFilePath(const char* uuid, char* path, size_t path_size);
     PatternPoint readBinaryPoint();
+    // Refill block_ from the file. False at end of data or on a read error
+    // (read_failed_ set).
+    bool fillBlock();
+    void resetBlock() { block_count_ = block_pos_ = points_fetched_ = 0; }
 };

@@ -7,6 +7,7 @@
 #include "handlers.h"
 #include "messages.h"
 #include "PatternDownloader.h"
+#include "websocket_server.h"
 
 #include <esp_log.h>
 #include <esp_heap_caps.h>
@@ -25,10 +26,16 @@ static const char* TAG = "cloud_sockets";
 
 namespace {
 
-    // Inbound cap. Coredumps and full purchase/pattern-list bundles can be
-    // large; the old hand-rolled layer capped at 8 KB, which truncated them.
-    // tranquil has PSRAM, so 32 KB is comfortable.
+    // Message size cap handed to cloudlink (cfg.max_msg_size): applies to
+    // BOTH directions — the largest inbound frame it will unpack and the
+    // largest outbound message koios_cloudlink_send() accepts. 32 KB:
+    // coredumps and full purchase/pattern-list bundles exceed the 8 KB the
+    // old hand-rolled layer allowed, and tranquil has PSRAM to spare.
     constexpr size_t MAX_MSG_SIZE = 32 * 1024;
+
+    // Factory reset sets this; inbound messages are dropped from then on
+    // (see cloud_sockets_quiesce).
+    std::atomic<bool> quiesced{ false };
 
     // Protobuf unpacks land in PSRAM (tranquil has it) rather than internal RAM.
     void* spiram_alloc(void*, size_t size) {
@@ -44,6 +51,10 @@ namespace {
     };
 
     void on_message(const uint8_t* data, size_t len) {
+        if (quiesced.load(std::memory_order_acquire)) {
+            ESP_LOGW(TAG, "Quiesced: dropping %zu-byte cloud message", len);
+            return;
+        }
         auto* msg = kd__v1__tranquil_message__unpack(&spiram_allocator, len, data);
         if (msg) {
             cloud_handle_message(msg);
@@ -72,6 +83,26 @@ namespace {
 
     void on_disconnect() {
         ESP_LOGI(TAG, "Cloud session lost");
+    }
+
+    // Restart policy. cloudlink escalates persistent cloud failures all the
+    // way to a device restart (socket -> network reset -> reboot). A table
+    // that someone is driving over the LAN must not reboot under them just
+    // because the cloud is unreachable; connected LAN WebSocket clients are
+    // the cheap "in use" signal (the app holds one open while it is in the
+    // foreground). Registered after every koios_cloudlink_init().
+    bool may_restart(void*) {
+        const size_t lan_clients = ws_connected_client_count();
+        if (lan_clients > 0) {
+            ESP_LOGW(TAG, "Cloud-failure restart deferred: %zu LAN WebSocket client(s) connected",
+                lan_clients);
+            return false;
+        }
+        return true;
+    }
+
+    void install_restart_policy() {
+        koios_cloudlink_set_restart_policy(may_restart, nullptr);
     }
 
     koios_cloudlink_config_t cloudlink_cfg() {
@@ -105,6 +136,7 @@ namespace {
         koios_cloudlink_deinit();
         koios_cloudlink_config_t cfg = cloudlink_cfg();
         koios_cloudlink_init(&cfg);
+        install_restart_policy();
 
         cert_reload_pending = false;
         vTaskDelete(nullptr);
@@ -119,6 +151,7 @@ void cloud_sockets_init() {
 
     koios_cloudlink_config_t cfg = cloudlink_cfg();
     koios_cloudlink_init(&cfg);
+    install_restart_policy();
 
     ESP_LOGI(TAG, "Cloud sockets initialized (cloudlink)");
 }
@@ -126,6 +159,14 @@ void cloud_sockets_init() {
 void cloud_sockets_deinit() {
     PatternDownloader::instance().shutdown();
     koios_cloudlink_deinit();
+}
+
+void cloud_sockets_quiesce() {
+    quiesced.store(true, std::memory_order_release);
+    // Refuses new download jobs (queueDownload -> "not initialized"); the
+    // job processor itself is stopped by the caller.
+    PatternDownloader::instance().shutdown();
+    ESP_LOGW(TAG, "Cloud sockets quiesced: inbound messages dropped until reboot");
 }
 
 bool cloud_sockets_is_connected() {

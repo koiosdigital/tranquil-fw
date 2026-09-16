@@ -1,4 +1,4 @@
-// Unified playlist handler
+// Unified playlist handler: a thin protobuf codec over library_ops.
 #pragma once
 
 #include "handler_base.h"
@@ -16,15 +16,6 @@ public:
     bool canHandle(Kd__V1__TranquilMessage__MessageCase msg_case) const override;
     std::vector<Kd__V1__TranquilMessage__MessageCase> supportedMessages() const override;
 
-    // Builds a Playlists message from the manifest. Public so the library
-    // notifier can push it on change / on cloud (re)connect.
-    ResponseMessage buildPlaylistListMessage();
-
 private:
     PlaylistHandler() = default;
-
-    HandleResult handlePlaylistsRequest(ResponseMessage& response);
-    HandleResult handleCreatePlaylist(const Kd__V1__CreatePlaylist* msg, ResponseMessage& response);
-    HandleResult handleUpdatePlaylist(const Kd__V1__UpdatePlaylist* msg, ResponseMessage& response);
-    HandleResult handleDeletePlaylist(const Kd__V1__DeletePlaylist* msg, ResponseMessage& response);
 };

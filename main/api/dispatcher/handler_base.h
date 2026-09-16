@@ -2,6 +2,7 @@
 #pragma once
 
 #include "message_context.h"
+#include "ops/op_result.h"
 #include <kd/v1/tranquil.pb-c.h>
 #include <esp_err.h>
 #include <esp_log.h>
@@ -11,11 +12,11 @@
 
 // Result of handling a message
 struct HandleResult {
-    bool handled;           // Message was processed
-    bool has_response;      // Response should be sent
-    bool broadcast;         // Response should broadcast to all local clients
-    bool forward_to_cloud;  // Forward original message to cloud
-    bool send_to_cloud;     // Send response to cloud (in addition to local)
+    bool handled = false;          // Message was processed
+    bool has_response = false;     // Response should be sent
+    bool broadcast = false;        // Response should broadcast to all local clients
+    bool forward_to_cloud = false; // Forward original message to cloud
+    bool send_to_cloud = false;    // Send response to cloud (in addition to local)
 
     static HandleResult ok(bool broadcast_to_locals = false, bool also_send_to_cloud = false) {
         return { true, true, broadcast_to_locals, false, also_send_to_cloud };
@@ -126,24 +127,40 @@ public:
         return false;
     }
 
-    // Helper to create a CommandResult response (public for use by dispatcher)
-    static ResponseMessage makeCommandResult(bool success, const char* detail = nullptr) {
+    // The one esp_err -> CommandResult mapping for every WS handler.
+    // error_code carries the esp_err_t value (0 on success); request_id is
+    // echoed on both the CommandResult and the envelope when the request
+    // carried one (MessageContext::request_id).
+    static ResponseMessage makeCommandResult(bool success, const char* detail = nullptr,
+                                             const char* request_id = nullptr,
+                                             int32_t error_code = ESP_FAIL) {
         Kd__V1__CommandResult result = KD__V1__COMMAND_RESULT__INIT;
         result.success = success;
-        result.error_code = success ? 0 : -1;
-        result.detail = detail ? const_cast<char*>(detail) : nullptr;
+        result.error_code = success ? 0 : error_code;
+        result.detail = const_cast<char*>(detail ? detail : "");
+        result.request_id = const_cast<char*>(request_id ? request_id : "");
 
         Kd__V1__TranquilMessage resp = KD__V1__TRANQUIL_MESSAGE__INIT;
         resp.message_case = KD__V1__TRANQUIL_MESSAGE__MESSAGE_COMMAND_RESULT;
         resp.command_result = &result;
 
-        return serialize(&resp);
+        return serialize(&resp, request_id);
     }
 
-protected:
-    // Helper to serialize a response message
-    static ResponseMessage serialize(const Kd__V1__TranquilMessage* msg) {
-        size_t len = kd__v1__tranquil_message__get_packed_size(msg);
+    static ResponseMessage makeCommandResult(const OpResult& r, const char* request_id = nullptr) {
+        return makeCommandResult(r.ok(), r.detail, request_id, static_cast<int32_t>(r.err));
+    }
+
+    // Pack a TranquilMessage. When `request_id` is set it is echoed on the
+    // envelope (the payload is left untouched: the caller's struct is copied
+    // shallowly, so it may stay const).
+    static ResponseMessage serialize(const Kd__V1__TranquilMessage* msg, const char* request_id = nullptr) {
+        Kd__V1__TranquilMessage env = *msg;
+        if (request_id && request_id[0]) {
+            env.request_id = const_cast<char*>(request_id);
+        }
+
+        size_t len = kd__v1__tranquil_message__get_packed_size(&env);
 
         // Response ceiling. Matches the cloud link's 32 KB cap; local WS
         // frames have no smaller limit outbound. Buffers live in PSRAM.
@@ -153,14 +170,14 @@ protected:
             return ResponseMessage();
         }
 
-        // PSRAM, not internal RAM: every handler response (up to 16 KB, and a
+        // PSRAM, not internal RAM: every handler response (up to 32 KB, and a
         // pattern-list broadcast fans out several copies) is only read by the
         // socket write / per-client copy, never DMA'd. ResponseMessage frees
         // with free(), which is valid on SPIRAM pointers.
         uint8_t* buf = static_cast<uint8_t*>(heap_caps_malloc(len, MALLOC_CAP_SPIRAM));
         if (!buf) return ResponseMessage();
 
-        size_t packed = kd__v1__tranquil_message__pack(msg, buf);
+        size_t packed = kd__v1__tranquil_message__pack(&env, buf);
         if (packed != len) {
             free(buf);
             return ResponseMessage();
@@ -169,3 +186,9 @@ protected:
         return ResponseMessage(buf, len);
     }
 };
+
+// Pack a TranquilMessage outside a handler (state snapshot builders in
+// main/api/state and main/api/ops).
+inline ResponseMessage pack_tranquil_message(const Kd__V1__TranquilMessage* msg, const char* request_id = nullptr) {
+    return HandlerBase::serialize(msg, request_id);
+}

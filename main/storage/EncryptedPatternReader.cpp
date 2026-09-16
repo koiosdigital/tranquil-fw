@@ -90,6 +90,8 @@ EncryptedPatternReader::EncryptedPatternReader() {
     memset(aes_key_, 0, sizeof(aes_key_));
     memset(&header_, 0, sizeof(header_));
     memset(base_iv_, 0, sizeof(base_iv_));
+    memset(cipher_block_, 0, sizeof(cipher_block_));
+    memset(block_, 0, sizeof(block_));
 }
 
 EncryptedPatternReader::~EncryptedPatternReader() {
@@ -319,8 +321,9 @@ esp_err_t EncryptedPatternReader::openFile(const char* path, const char* uuid) {
     current_point_ = 0;
     has_peeked_ = false;
     read_failed_ = false;
+    resetBlock();
 
-    ESP_LOGI(TAG, "Successfully opened encrypted pattern (bufferless)");
+    ESP_LOGI(TAG, "Successfully opened encrypted pattern (%zu-point blocks)", kBlockPoints);
     return ESP_OK;
 }
 
@@ -363,9 +366,11 @@ void EncryptedPatternReader::close() {
         aes_key_id_ = PSA_KEY_ID_NULL;
     }
 
-    // Zeroize sensitive data
+    // Zeroize sensitive data (the plaintext block included)
     clearKey();
     mbedtls_platform_zeroize(base_iv_, sizeof(base_iv_));
+    mbedtls_platform_zeroize(block_, sizeof(block_));
+    mbedtls_platform_zeroize(cipher_block_, sizeof(cipher_block_));
 
     if (file_) {
         fclose(file_);
@@ -377,6 +382,7 @@ void EncryptedPatternReader::close() {
     current_point_ = 0;
     has_peeked_ = false;
     read_failed_ = false;
+    resetBlock();
 }
 
 bool EncryptedPatternReader::isOpen() const {
@@ -391,56 +397,72 @@ size_t EncryptedPatternReader::getCurrentLine() const {
     return current_point_;
 }
 
-PatternPoint EncryptedPatternReader::readBinaryPoint() {
-    if (!isOpen() || read_failed_ || current_point_ >= header_.point_count) {
-        return PatternPoint();
+bool EncryptedPatternReader::fillBlock() {
+    block_pos_ = 0;
+    block_count_ = 0;
+    if (points_fetched_ >= header_.point_count) {
+        return false;  // end of data
     }
 
-    // Read encrypted point directly from file. A short read is terminal:
-    // the file offset and CTR keystream would be desynced from here on.
-    BinaryPoint bp;
-    if (fread(&bp, sizeof(bp), 1, file_) != 1) {
-        ESP_LOGE(TAG, "Failed to read encrypted point at index %zu", current_point_);
+    // Read a block of ciphertext. A short read is terminal: the file
+    // offset and CTR keystream would be desynced from here on.
+    const size_t remaining = header_.point_count - points_fetched_;
+    const size_t want = remaining < kBlockPoints ? remaining : kBlockPoints;
+    const size_t got = fread(cipher_block_, sizeof(BinaryPoint), want, file_);
+    if (got == 0) {
+        ESP_LOGE(TAG, "Failed to read encrypted points at index %zu", points_fetched_);
         read_failed_ = true;
-        return PatternPoint();
+        return false;
     }
 
-    // Decrypt using PSA cipher
-    uint8_t decrypted[sizeof(BinaryPoint)];
+    // Decrypt the whole block in one PSA call (CTR: output size == input)
+    const size_t bytes = got * sizeof(BinaryPoint);
     size_t out_len = 0;
     psa_status_t status = psa_cipher_update(&cipher_op_,
-        reinterpret_cast<uint8_t*>(&bp), sizeof(bp),
-        decrypted, sizeof(decrypted), &out_len);
+        cipher_block_, bytes,
+        reinterpret_cast<uint8_t*>(block_), sizeof(block_), &out_len);
 
-    if (status != PSA_SUCCESS || out_len != sizeof(decrypted)) {
-        ESP_LOGE(TAG, "psa_cipher_update failed: %d (out_len %zu)", status, out_len);
+    if (status != PSA_SUCCESS || out_len != bytes) {
+        ESP_LOGE(TAG, "psa_cipher_update failed: %d (out_len %zu of %zu)",
+            status, out_len, bytes);
         // Terminal: abort the cipher so nothing keeps decrypting a
         // desynced keystream
         read_failed_ = true;
         psa_cipher_abort(&cipher_op_);
         cipher_active_ = false;
+        return false;
+    }
+
+    decrypt_position_ += bytes;
+    block_count_ = got;
+    points_fetched_ += got;
+    return true;
+}
+
+PatternPoint EncryptedPatternReader::readBinaryPoint() {
+    if (!isOpen() || read_failed_) {
+        return PatternPoint();
+    }
+    if (block_pos_ >= block_count_ && !fillBlock()) {
         return PatternPoint();
     }
 
-    decrypt_position_ += sizeof(bp);
-
-    // Parse decrypted point
-    BinaryPoint* dbp = reinterpret_cast<BinaryPoint*>(decrypted);
+    const BinaryPoint dbp = block_[block_pos_++];
 
     // Reject garbage motion targets: theta must be a finite, sane angle
     // (|theta| < 10000 rad is generous for multi-rotation patterns).
     // Terminal: CTR garbage here means the rest of the stream is garbage
     // too (wrong key or corrupt ciphertext).
-    if (!std::isfinite(dbp->theta) || std::fabs(dbp->theta) >= 10000.0f) {
+    if (!std::isfinite(dbp.theta) || std::fabs(dbp.theta) >= 10000.0f) {
         ESP_LOGE(TAG, "Invalid theta at point %zu (corrupt stream)", current_point_);
         read_failed_ = true;
         return PatternPoint();
     }
 
     // Convert uint16 rho to float 0.0-1.0 (in [0,1] by construction)
-    double rho = static_cast<double>(dbp->rho) / 65535.0;
+    double rho = static_cast<double>(dbp.rho) / 65535.0;
 
-    return PatternPoint(static_cast<double>(dbp->theta), rho);
+    return PatternPoint(static_cast<double>(dbp.theta), rho);
 }
 
 PatternPoint EncryptedPatternReader::readNext() {
@@ -515,6 +537,7 @@ esp_err_t EncryptedPatternReader::rewind() {
     current_point_ = 0;
     has_peeked_ = false;
     read_failed_ = false;
+    resetBlock();  // buffered plaintext is from past the new position
 
     return ESP_OK;
 }
