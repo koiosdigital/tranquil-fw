@@ -1,4 +1,5 @@
 #include "api_common.h"
+#include <esp_heap_caps.h>
 
 #include <esp_log.h>
 #include <stdarg.h>
@@ -141,15 +142,49 @@ void chunk_buf_write(ChunkBuf* cb, const char* data, size_t len) {
     cb->pos += len;
 }
 
+// Formats straight into the scratch buffer. If the text does not fit in
+// what is left, the buffer is flushed and the format retried into the empty
+// buffer; anything longer than the whole buffer goes out as its own chunk.
+// (A fixed 128-byte temp here used to truncate longer lines — the config
+// response lost the end of its LED object on RGBCCT tables and the app could
+// not parse it.)
 void chunk_buf_printf(ChunkBuf* cb, const char* fmt, ...) {
-    char tmp[128];
+    if (!cb || !fmt) return;
     va_list args;
     va_start(args, fmt);
-    int n = vsnprintf(tmp, sizeof(tmp), fmt, args);
+    va_list retry;
+    va_copy(retry, args);
+
+    const size_t avail = sizeof(cb->buf) - cb->pos;
+    int n = vsnprintf(cb->buf + cb->pos, avail, fmt, args);
     va_end(args);
-    if (n > 0) {
-        chunk_buf_write(cb, tmp, (n < (int)sizeof(tmp)) ? (size_t)n : sizeof(tmp) - 1);
+    if (n < 0) {
+        va_end(retry);
+        return;
     }
+    if ((size_t)n < avail) {
+        cb->pos += (size_t)n;
+        va_end(retry);
+        return;
+    }
+
+    // Did not fit: whatever was already buffered is intact (pos unchanged).
+    if (cb->pos > 0) {
+        httpd_resp_send_chunk(cb->req, cb->buf, cb->pos);
+        cb->pos = 0;
+    }
+    if ((size_t)n < sizeof(cb->buf)) {
+        vsnprintf(cb->buf, sizeof(cb->buf), fmt, retry);
+        cb->pos = (size_t)n;
+    } else {
+        char* big = static_cast<char*>(heap_caps_malloc((size_t)n + 1, MALLOC_CAP_SPIRAM));
+        if (big) {
+            vsnprintf(big, (size_t)n + 1, fmt, retry);
+            httpd_resp_send_chunk(cb->req, big, (size_t)n);
+            heap_caps_free(big);
+        }
+    }
+    va_end(retry);
 }
 
 void chunk_buf_finish(ChunkBuf* cb) {
