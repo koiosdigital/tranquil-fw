@@ -58,7 +58,7 @@ constexpr uint8_t kLedHasBrightness = 1 << 1;
 constexpr uint8_t kLedHasSpeed = 1 << 2;
 constexpr uint8_t kLedHasEnabled = 1 << 3;
 constexpr uint8_t kLedHasColor = 1 << 4;
-constexpr uint8_t kQuietStop = 1 << 0;
+constexpr uint8_t kQuietPause = 1 << 0;  // was 'stop'; same bit, playback now pauses
 constexpr uint8_t kQuietLights = 1 << 1;
 
 struct Writer {
@@ -303,6 +303,7 @@ esp_err_t ScheduleManager::setSchedule(std::vector<ScheduleItem> items,
         if (quiet) {
             quiet_ = *quiet;
             sanitize(quiet_);
+            if (!quiet_.pause_playback) paused_by_quiet_ = false;
         }
         // Forget fire records for items that no longer exist.
         for (auto it = last_fired_.begin(); it != last_fired_.end();) {
@@ -334,7 +335,7 @@ esp_err_t ScheduleManager::saveLocked() {
     w.u8(kBlobMagic0);
     w.u8(kBlobMagic1);
     w.u8(kBlobVersion);
-    w.u8((quiet_.stop_playback ? kQuietStop : 0) | (quiet_.lights_off ? kQuietLights : 0));
+    w.u8((quiet_.pause_playback ? kQuietPause : 0) | (quiet_.lights_off ? kQuietLights : 0));
 
     w.u8(static_cast<uint8_t>(quiet_.windows.size()));
     for (const auto& win : quiet_.windows) {
@@ -401,7 +402,7 @@ bool ScheduleManager::loadV2(const uint8_t* data, size_t len) {
     const uint8_t qflags = r.u8();
 
     QuietHours quiet;
-    quiet.stop_playback = (qflags & kQuietStop) != 0;
+    quiet.pause_playback = (qflags & kQuietPause) != 0;
     quiet.lights_off = (qflags & kQuietLights) != 0;
     const uint8_t n_windows = r.u8();
     for (uint8_t i = 0; i < n_windows && r.ok; i++) {
@@ -546,11 +547,15 @@ void ScheduleManager::quietEdgeTask(void* arg) {
 void ScheduleManager::onQuietEdge(bool entering) {
     QuietHours quiet = getQuietHours();
     if (entering) {
-        ESP_LOGI(TAG, "Quiet hours started (stop=%d lights_off=%d)", quiet.stop_playback, quiet.lights_off);
-        if (quiet.stop_playback) {
-            auto state = SandTablePlayer::getPlaybackState();
-            if (state == PlaybackState::PLAYING || state == PlaybackState::PAUSED) {
-                SandTablePlayer::stop();
+        ESP_LOGI(TAG, "Quiet hours started (pause=%d lights_off=%d)", quiet.pause_playback, quiet.lights_off);
+        if (quiet.pause_playback && SandTablePlayer::getPlaybackState() == PlaybackState::PLAYING) {
+            // Pause, never stop: a single pattern, a playlist or a random loop
+            // picks up where it left off when the window ends. A pause the
+            // user already made is left alone (and not resumed later).
+            if (SandTablePlayer::pause() == ESP_OK) {
+                Lock lock(mutex_);
+                paused_by_quiet_ = true;
+                ESP_LOGI(TAG, "Quiet hours: playback paused");
             }
         }
         if (quiet.lights_off) {
@@ -570,11 +575,20 @@ void ScheduleManager::onQuietEdge(bool entering) {
         }
     } else {
         std::vector<uint32_t> dimmed;
+        bool resume_playback = false;
         {
             Lock lock(mutex_);
             dimmed.swap(quiet_dimmed_channels_);
+            resume_playback = paused_by_quiet_;
+            paused_by_quiet_ = false;
         }
-        ESP_LOGI(TAG, "Quiet hours ended (restoring %zu LED channels)", dimmed.size());
+        ESP_LOGI(TAG, "Quiet hours ended (restoring %zu LED channels%s)", dimmed.size(),
+            resume_playback ? ", resuming playback" : "");
+        // Only what the window paused, and only if nobody changed it since:
+        // a play/pause/stop from a client clears paused_by_quiet_.
+        if (resume_playback && SandTablePlayer::getPlaybackState() == PlaybackState::PAUSED) {
+            SandTablePlayer::resume();
+        }
         for (uint32_t index : dimmed) {
             led_state::ChannelPatch patch;
             patch.enabled = true;
@@ -647,9 +661,21 @@ void ScheduleManager::checkAndExecute() {
     }
 }
 
+void ScheduleManager::notePlaybackCommand() {
+    Lock lock(mutex_);
+    paused_by_quiet_ = false;
+}
+
 ScheduleManager::RunResult ScheduleManager::runAction(const ScheduleAction& action, bool force) {
     if (!force && isQuietNow()) {
         return {false, "Quiet hours active"};
+    }
+    switch (action.type) {
+        case kTypeRandom: case kTypePlaylist: case kTypePattern: case kTypeStop:
+            notePlaybackCommand();  // a scheduled play/stop overrides a quiet-hours pause
+            break;
+        default:
+            break;
     }
 
     switch (action.type) {
@@ -779,7 +805,7 @@ std::optional<QuietHours> ScheduleManager::quietFromProto(const Kd__V1__Tranquil
     if (!proto || !proto->quiet_hours) return std::nullopt;
     QuietHours q;
     const auto* p = proto->quiet_hours;
-    q.stop_playback = p->stop_playback != 0;
+    q.pause_playback = p->pause_playback != 0;
     q.lights_off = p->lights_off != 0;
     for (size_t i = 0; i < p->n_windows; i++) {
         const auto* w = p->windows[i];
@@ -871,7 +897,7 @@ void ScheduleManager::toProto(ScheduleProtoScratch& s) const {
     s.quiet = KD__V1__TRANQUIL_QUIET_HOURS__INIT;
     s.quiet.n_windows = nw;
     s.quiet.windows = s.window_ptrs.data();
-    s.quiet.stop_playback = s.quiet_snapshot.stop_playback;
+    s.quiet.pause_playback = s.quiet_snapshot.pause_playback;
     s.quiet.lights_off = s.quiet_snapshot.lights_off;
 
     s.schedule = KD__V1__TRANQUIL_SCHEDULE__INIT;

@@ -1028,9 +1028,9 @@ components:
           maxItems: 4
           items:
             $ref: '#/components/schemas/TranquilQuietWindow'
-        stop_playback:
+        pause_playback:
           type: boolean
-          description: Stop the table when a window starts
+          description: Pause playback when a window starts and resume it when the window ends (a manual play/pause/stop during the window takes precedence)
         lights_off:
           type: boolean
           description: LEDs off when a window starts, restored when it ends

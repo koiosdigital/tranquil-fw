@@ -1,5 +1,6 @@
 // Player operations implementation
 #include "player_ops.h"
+#include "schedule_manager.h"
 
 #include <esp_log.h>
 #include <cmath>
@@ -74,18 +75,21 @@ OpResult play(const PlayRequest& r) {
 }
 
 OpResult play_pattern(const char* pattern_uuid) {
+    ScheduleManager::instance().notePlaybackCommand();
     if (!uuid_ok(pattern_uuid)) return OpResult::fail(ESP_ERR_INVALID_ARG, "Missing or invalid pattern_uuid");
     ESP_LOGI(TAG, "Play pattern %s", pattern_uuid);
     return from_play_err(SandTablePlayer::playPattern(pattern_uuid), false);
 }
 
 OpResult play_playlist(const char* playlist_uuid, bool shuffle, bool loop) {
+    ScheduleManager::instance().notePlaybackCommand();
     if (!uuid_ok(playlist_uuid)) return OpResult::fail(ESP_ERR_INVALID_ARG, "Missing or invalid playlist_uuid");
     ESP_LOGI(TAG, "Play playlist %s (shuffle=%d loop=%d)", playlist_uuid, shuffle, loop);
     return from_play_err(SandTablePlayer::playPlaylist(playlist_uuid, shuffle, loop), false);
 }
 
 OpResult play_playlist_from_pattern(const char* playlist_uuid, const char* pattern_uuid, bool shuffle, bool loop) {
+    ScheduleManager::instance().notePlaybackCommand();
     if (!uuid_ok(playlist_uuid)) return OpResult::fail(ESP_ERR_INVALID_ARG, "Missing or invalid playlist_uuid");
     if (!uuid_ok(pattern_uuid)) return OpResult::fail(ESP_ERR_INVALID_ARG, "Missing or invalid pattern_uuid");
     ESP_LOGI(TAG, "Play playlist %s from %s (shuffle=%d loop=%d)", playlist_uuid, pattern_uuid, shuffle, loop);
@@ -94,17 +98,20 @@ OpResult play_playlist_from_pattern(const char* playlist_uuid, const char* patte
 }
 
 OpResult play_random(bool loop) {
+    ScheduleManager::instance().notePlaybackCommand();
     ESP_LOGI(TAG, "Play random (loop=%d)", loop);
     return from_play_err(SandTablePlayer::playRandom(loop), true);
 }
 
 OpResult set_paused(bool paused) {
+    ScheduleManager::instance().notePlaybackCommand();
     ESP_LOGI(TAG, "%s", paused ? "Pause" : "Resume");
     esp_err_t err = paused ? SandTablePlayer::pause() : SandTablePlayer::resume();
     return from_ctrl_err(err, paused ? "Failed to pause" : "Failed to resume", "Player not initialized");
 }
 
 OpResult stop(bool emergency) {
+    ScheduleManager::instance().notePlaybackCommand();
     ESP_LOGI(TAG, "%s", emergency ? "Emergency stop" : "Stop");
     esp_err_t err = emergency ? SandTablePlayer::emergencyStop() : SandTablePlayer::stop();
     return from_ctrl_err(err, "Failed to stop", "Player not initialized");

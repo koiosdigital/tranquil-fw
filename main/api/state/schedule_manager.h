@@ -85,7 +85,7 @@ struct QuietWindow {
 
 struct QuietHours {
     std::vector<QuietWindow> windows;
-    bool stop_playback = false; // stop the table when a window starts
+    bool pause_playback = false; // pause playback when a window starts, resume when it ends
     bool lights_off = false;    // LEDs off when a window starts, restored when it ends
 };
 
@@ -156,6 +156,11 @@ public:
     // call from httpd / socket tasks (play() touches the SD card and motion).
     RunResult runAction(const ScheduleAction& action, bool force);
 
+    // A client issued play / pause / stop. Whatever the quiet-hours edge
+    // paused is now the user's business: the end of the window resumes only
+    // a pause the device made itself and nobody touched since.
+    void notePlaybackCommand();
+
     // Protobuf conversions
     static ScheduleAction actionFromProto(const Kd__V1__ScheduleAction* proto);
     static ScheduleItem itemFromProto(const Kd__V1__TranquilScheduleItem* proto);
@@ -197,6 +202,8 @@ private:
 
     // Quiet-hours edge tracking (timer task only)
     bool quiet_active_ = false;
+    // Set when the window entry paused playback (guarded by mutex_).
+    bool paused_by_quiet_ = false;
     // Channels we switched off on window entry, to restore on exit.
     std::vector<uint32_t> quiet_dimmed_channels_;
 

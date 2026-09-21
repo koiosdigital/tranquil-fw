@@ -2443,9 +2443,9 @@
               "$ref": "#/components/schemas/QuietWindow"
             }
           },
-          "stop_playback": {
+          "pause_playback": {
             "type": "boolean",
-            "description": "Stop the table when a window starts"
+            "description": "Pause whatever is playing (single pattern, playlist or random loop) when a window starts and resume it when the window ends. A play, pause or stop issued during the window takes precedence. Accepted as the legacy key stop_playback on PUT."
           },
           "lights_off": {
             "type": "boolean",

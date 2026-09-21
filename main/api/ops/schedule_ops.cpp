@@ -132,7 +132,8 @@ bool parse_item(const cJSON* item_json, ScheduleItem& item, const char** err) {
 }
 
 bool parse_quiet(const cJSON* q, QuietHours& out, const char** err) {
-    out.stop_playback = json_bool(q, "stop_playback", false);
+    // "stop_playback" is the pre-rename key; the behaviour has been a pause since.
+    out.pause_playback = json_bool(q, "pause_playback", json_bool(q, "stop_playback", false));
     out.lights_off = json_bool(q, "lights_off", false);
     const cJSON* windows = cJSON_GetObjectItem(q, "windows");
     if (windows && !cJSON_IsArray(windows)) { *err = "quiet_hours.windows must be an array"; return false; }
@@ -238,8 +239,8 @@ void to_json(ChunkBuf* cb) {
         chunk_buf_printf(cb, "{\"day_mask\":%lu,\"start_min\":%u,\"end_min\":%u,\"enabled\":%s}",
             (unsigned long)w.day_mask, w.start_min, w.end_min, w.enabled ? "true" : "false");
     }
-    chunk_buf_printf(cb, "],\"stop_playback\":%s,\"lights_off\":%s},\"quiet_now\":%s}",
-        quiet.stop_playback ? "true" : "false",
+    chunk_buf_printf(cb, "],\"pause_playback\":%s,\"lights_off\":%s},\"quiet_now\":%s}",
+        quiet.pause_playback ? "true" : "false",
         quiet.lights_off ? "true" : "false",
         mgr.isQuietNow() ? "true" : "false");
 }
