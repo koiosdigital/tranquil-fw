@@ -1,8 +1,34 @@
 #
+# Tranquil 4 hardware variant
+#
+# Overlaid onto sdkconfig by CI (acvigue/.github idf_build.yaml): every
+# CONFIG_X=... line here replaces the matching line in sdkconfig, and keys not
+# present in sdkconfig are appended. Lines of the form
+# "# CONFIG_X is not set" are NOT applied by the overlay, so disabled bools
+# must be written as CONFIG_X=n.
+#
+# Pin values are the ones the firmware carried before the Tranquil 5 bring-up
+# (commit 38f1b57, 2026-09-02): the SD pins were hardcoded in main/storage/sd.h,
+# and the TMC enable line was the single ROBOT_COMMON_ENABLE_PIN.
+#
+
+#
 # LED Hardware Configuration
 #
 CONFIG_LED_PIN=18
 # end of LED Hardware Configuration
+
+#
+# SD Card Configuration
+#
+CONFIG_SD_PIN_CLK=6
+CONFIG_SD_PIN_CMD=7
+CONFIG_SD_PIN_D0=5
+CONFIG_SD_PIN_D1=4
+CONFIG_SD_PIN_D2=16
+CONFIG_SD_PIN_D3=15
+CONFIG_SD_PIN_CD=8
+# end of SD Card Configuration
 
 #
 # Polar Robot Motion System - Hardware Configuration
@@ -21,7 +47,10 @@ CONFIG_ROBOT_THETA_STEP_PIN=39
 CONFIG_ROBOT_THETA_DIR_PIN=40
 CONFIG_ROBOT_RHO_STEP_PIN=11
 CONFIG_ROBOT_RHO_DIR_PIN=10
-CONFIG_ROBOT_COMMON_ENABLE_PIN=21
+# Tranquil 4 has one shared driver enable line (formerly ROBOT_COMMON_ENABLE_PIN=21),
+# so both per-axis enable pins point at the same GPIO.
+CONFIG_ROBOT_THETA_ENABLE_PIN=21
+CONFIG_ROBOT_RHO_ENABLE_PIN=21
 CONFIG_ROBOT_RHO_STALLGUARD_DIAG_PIN=14
 CONFIG_ROBOT_THETA_STALLGUARD_DIAG_PIN=2
 # end of TMC Stepper Configuration
@@ -29,14 +58,14 @@ CONFIG_ROBOT_THETA_STALLGUARD_DIAG_PIN=2
 #
 # Theta Axis Hardware
 #
-# CONFIG_ROBOT_THETA_INVERT_DIRECTION is not set
+CONFIG_ROBOT_THETA_INVERT_DIRECTION=n
 CONFIG_ROBOT_THETA_HAS_ENDSTOP=y
 
 #
 # Theta Endstop Configuration
 #
 CONFIG_ROBOT_THETA_ENDSTOP_PIN=17
-# CONFIG_ROBOT_THETA_ENDSTOP_INVERT is not set
+CONFIG_ROBOT_THETA_ENDSTOP_INVERT=n
 CONFIG_ROBOT_THETA_ENDSTOP_PULLUP=y
 # end of Theta Endstop Configuration
 # end of Theta Axis Hardware
@@ -44,11 +73,14 @@ CONFIG_ROBOT_THETA_ENDSTOP_PULLUP=y
 #
 # Rho Axis Hardware
 #
-# CONFIG_ROBOT_RHO_INVERT_DIRECTION is not set
+# The base sdkconfig (Tranquil 5) sets this to y. Tranquil 4 ran with the
+# un-inverted DIR level as its baseline, so it must be forced off here.
+CONFIG_ROBOT_RHO_INVERT_DIRECTION=n
 # end of Rho Axis Hardware
 
 # end of Polar Robot Motion System
 
 # Note: Motion parameters (steps/rev, gear ratio, motor current, stallguard threshold,
-# velocities, acceleration, pinion diameter, LED count/type) are now stored in NVS.
-# Use the "tranquil4_tabletop" preset via ConfigManager to load these values.
+# velocities, acceleration, pinion diameter, LED count/type) are stored in NVS.
+# Use the "tranquil4_tabletop" / "tranquil4_coffee" presets via ConfigManager to
+# load these values (see components/sand_table/include/presets.h).

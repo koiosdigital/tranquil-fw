@@ -13,11 +13,13 @@
 #include <esp_heap_caps.h>
 
 #include <kd_common.h>
+#include <kd_crypto.h>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
 #include <atomic>
+#include <cstring>
 
 #include <koios/cloudlink.h>
 #include <kd/v1/tranquil.pb-c.h>
@@ -85,6 +87,59 @@ namespace {
         ESP_LOGI(TAG, "Cloud session lost");
     }
 
+    // Seamless certificate renewal (mTLS). When the server sends a
+    // cert.renew_required control frame, cloudlink calls on_cert_renew_csr:
+    // regenerate the CSR from the DS peripheral key (non-destructive — the
+    // private key never leaves the secure element) and hand back a malloc'd
+    // PEM copy that cloudlink takes ownership of and frees. Return nullptr to
+    // decline.
+    char* on_cert_renew_csr() {
+        esp_err_t err = kd_common_crypto_regenerate_csr();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "CSR regeneration failed: %s", esp_err_to_name(err));
+            return nullptr;
+        }
+
+        size_t csr_len = 0;
+        if (kd_common_get_csr(nullptr, &csr_len) != ESP_OK || csr_len == 0) {
+            ESP_LOGE(TAG, "No CSR available after regeneration");
+            return nullptr;
+        }
+
+        auto* csr = static_cast<char*>(malloc(csr_len + 1));
+        if (!csr) return nullptr;
+
+        if (kd_common_get_csr(csr, &csr_len) != ESP_OK) {
+            free(csr);
+            return nullptr;
+        }
+        csr[csr_len] = '\0';
+        return csr;
+    }
+
+    // cloudlink hands back the signed cert via cert.renew_response. Store the
+    // full chain (leaf + issuing intermediates), not just the leaf: edge mTLS
+    // validates the device against the platform root, so the device must
+    // present the intermediates in its TLS handshake to build a path to that
+    // root. chain_pem is leaf-first and complete; fall back to the bare leaf
+    // only if the server omitted it. After this returns, cloudlink clears its
+    // cached TLS material and reconnects on its own — no need to call
+    // sockets_invalidate_cert_cache() (that drives the unused protobuf path).
+    void on_cert_renewed(const char* cert_pem, const char* chain_pem) {
+        if (!cert_pem) return;
+
+        const char* to_store = (chain_pem && chain_pem[0]) ? chain_pem : cert_pem;
+        size_t len = strlen(to_store);
+
+        esp_err_t err = kd_common_set_device_cert(to_store, len);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to store renewed cert: %s", esp_err_to_name(err));
+            return;
+        }
+        ESP_LOGI(TAG, "Renewed certificate stored (%zu bytes, %s)", len,
+            to_store == chain_pem ? "fullchain" : "leaf only");
+    }
+
     // Restart policy. cloudlink escalates persistent cloud failures all the
     // way to a device restart (socket -> network reset -> reboot). A table
     // that someone is driving over the LAN must not reboot under them just
@@ -116,6 +171,8 @@ namespace {
         cfg.on_session_ready = on_session_ready;
         cfg.on_disconnect = on_disconnect;
         cfg.on_message = on_message;
+        cfg.on_cert_renew_csr = on_cert_renew_csr;
+        cfg.on_cert_renewed = on_cert_renewed;
         return cfg;
     }
 

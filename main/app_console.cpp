@@ -15,7 +15,12 @@
 #include "esp_system.h"
 #include "esp_task_wdt.h"
 
+#include <kd_crypto.h>
+#include <koios/cloudlink.h>
+#include <cJSON.h>
+
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -98,6 +103,68 @@ static int cmd_heap_status(int argc, char** argv) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// test_cert_renew — exercise the cloudlink JSON cert-renewal flow end to end
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Regenerate the CSR from the DS peripheral key and send a cert.renew_request
+// text control frame to the server. The server replies with cert.renew_response
+// which cloudlink dispatches to on_cert_renewed() in sockets.cpp (stores the
+// fullchain, then reconnects). For manual testing of seamless renewal.
+static int cmd_test_cert_renew(int argc, char** argv) {
+    if (!koios_cloudlink_is_ready()) {
+        printf("[ERROR] Not connected to cloud\n");
+        return 1;
+    }
+
+    esp_err_t err = kd_common_crypto_regenerate_csr();
+    if (err != ESP_OK) {
+        printf("[ERROR] CSR regeneration failed: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    size_t csr_len = 0;
+    if (kd_common_get_csr(nullptr, &csr_len) != ESP_OK || csr_len == 0) {
+        printf("[ERROR] No CSR available\n");
+        return 1;
+    }
+
+    auto* csr = static_cast<char*>(malloc(csr_len + 1));
+    if (!csr) {
+        printf("[ERROR] Allocation failed\n");
+        return 1;
+    }
+
+    if (kd_common_get_csr(csr, &csr_len) != ESP_OK) {
+        free(csr);
+        printf("[ERROR] Failed to read CSR\n");
+        return 1;
+    }
+    csr[csr_len] = '\0';
+
+    cJSON* req = cJSON_CreateObject();
+    if (!req) { free(csr); return 1; }
+    cJSON_AddStringToObject(req, "type", "cert.renew_request");
+    cJSON_AddStringToObject(req, "csr", csr);
+    free(csr);
+
+    char* json = cJSON_PrintUnformatted(req);
+    cJSON_Delete(req);
+    if (!json) {
+        printf("[ERROR] JSON serialization failed\n");
+        return 1;
+    }
+
+    bool sent = koios_cloudlink_send_text(json);
+    cJSON_free(json);
+    if (sent) {
+        printf("[OK] Cert renewal request sent; watch for cert.renew_response\n");
+    } else {
+        printf("[ERROR] Failed to queue renewal request\n");
+    }
+    return sent ? 0 : 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Registration
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -118,4 +185,8 @@ void app_console_register_commands() {
         "heap_status",
         "Log heap status per capability and run an integrity check",
         &cmd_heap_status);
+    kd_console_register_cmd(
+        "test_cert_renew",
+        "Send a cert renewal request to the server (requires active session)",
+        &cmd_test_cert_renew);
 }
